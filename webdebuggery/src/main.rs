@@ -600,8 +600,6 @@ async fn test_dns(host: &str, port: u16) -> Result<String, (Box<dyn std::error::
 
 
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("Starting Web Debugger application...");
-    
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 700.0]),
