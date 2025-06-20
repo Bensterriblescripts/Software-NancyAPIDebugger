@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::error::Error;
 use std::thread;
 
-pub async fn send_request(request_type: String, request_url: String) -> Result<(String, Vec<String>, String), (Box<dyn Error + Send + Sync>, String, Vec<String>, String)> {
+pub async fn send_request(request_type: String, request_url: String, request_headers: String, request_body: String) -> Result<(String, Vec<String>, String), (Box<dyn Error + Send + Sync>, String, Vec<String>, String)> {
     let method = match request_type.as_str() {
         "GET" => Method::GET,
         "POST" => Method::POST,
@@ -54,7 +54,7 @@ pub async fn send_request(request_type: String, request_url: String) -> Result<(
             
             if url.scheme() == "https" {
                 let mut buffer = [0; 1024];
-                let request = format!("GET / HTTP/1.1\r\nHost: {}\r\n\r\n", host);
+                let request = format!("GET / HTTP/1.1\r\nHost: {}\r\n{}\r\n\r\n", host, request_headers);
                 match stream.write_all(request.as_bytes()).await {
                     Ok(_) => (),
                     Err(e) => {
@@ -166,7 +166,7 @@ pub async fn send_request(request_type: String, request_url: String) -> Result<(
         }
     }
     
-    Err(("All client configurations failed".into(), "Failed".to_string(), Vec::new(), tracebuilder))
+    Err(("All Attempts Failed".into(), "Failed".to_string(), Vec::new(), tracebuilder))
 }
 
 fn create_standard_client() -> Result<Client, reqwest::Error> {
