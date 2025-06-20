@@ -1945,6 +1945,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nancywebdebug"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "reqwest",
+ "tokio",
+]
+
+[[package]]
 name = "native-tls"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3752,15 +3761,6 @@ dependencies = [
  "objc2-foundation 0.3.1",
  "url",
  "web-sys",
-]
-
-[[package]]
-name = "webdebuggery"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "reqwest",
- "tokio",
 ]
 
 [[package]]

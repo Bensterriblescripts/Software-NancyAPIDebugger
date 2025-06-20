@@ -8,6 +8,12 @@ use std::thread;
 #[derive(Debug, Clone)]
 struct RequestResult {
     index: usize,
+
+    // Request
+    req_headers: String,
+    req_body: String,
+
+    // Response
     url: String,
     status: String,
     headers: Vec<String>,
@@ -20,13 +26,15 @@ struct App {
     show_newrequest: bool,
     show_requestdetails: Arc<Mutex<String>>,
     show_requestheaders: Arc<Mutex<String>>,
+    show_responsedetails: Arc<Mutex<String>>,
+    show_responseheaders: Arc<Mutex<String>>,
     selected_response_index: Option<usize>,
     set_focus: String,
 
-    request_type: String,
-    request_url: String,
-    request_headers: String,
-    request_body: String,
+    request_type: Arc<Mutex<String>>,
+    request_url: Arc<Mutex<String>>,
+    request_headers: Arc<Mutex<String>>,
+    request_body: Arc<Mutex<String>>,
     request_responses: Arc<Mutex<Vec<RequestResult>>>,
     request_loading: Arc<Mutex<bool>>,
     next_index: Arc<Mutex<usize>>,
@@ -40,13 +48,15 @@ impl App {
             show_newrequest: false,
             show_requestdetails: Arc::new(Mutex::new(String::new())),
             show_requestheaders: Arc::new(Mutex::new(String::new())),
+            show_responsedetails: Arc::new(Mutex::new(String::new())),
+            show_responseheaders: Arc::new(Mutex::new(String::new())),
             selected_response_index: None,
             set_focus: String::new(),
 
-            request_type: "GET".to_string(),
-            request_url: String::new(),
-            request_headers: String::new(),
-            request_body: String::new(),
+            request_type: Arc::new(Mutex::new("GET".to_string())),
+            request_url: Arc::new(Mutex::new(String::new())),
+            request_headers: Arc::new(Mutex::new(String::new())),
+            request_body: Arc::new(Mutex::new(String::new())),
             request_responses: Arc::new(Mutex::new(Vec::new())),
             request_loading: Arc::new(Mutex::new(false)),
             next_index: Arc::new(Mutex::new(1)),
@@ -59,8 +69,10 @@ impl App {
         let responses = Arc::clone(&self.request_responses);
         let is_loading = Arc::clone(&self.request_loading);
         let next_index = Arc::clone(&self.next_index);
-        let details = Arc::clone(&self.show_requestdetails);
-        let headers = Arc::clone(&self.show_requestheaders);
+        let details = Arc::clone(&self.show_responsedetails);
+        let headers = Arc::clone(&self.show_responseheaders);
+        let req_headers = Arc::clone(&self.show_requestheaders);
+        let req_body = Arc::clone(&self.show_requestdetails);
 
         if request_url.is_empty() {
             return Err("URL is empty".into());
@@ -92,9 +104,11 @@ impl App {
                 current
             };
 
-            let response = match rt.block_on(async { request::send_request(request_type, request_url.clone(), request_headers.clone(), request_body.clone()).await }) {
+            let response = match rt.block_on(async { request::send_request(request_type.clone(), request_url.clone(), req_headers.lock().unwrap().clone(), req_body.lock().unwrap().clone()).await }) {
                 Ok((status, headers, body)) => RequestResult {
                     index: current_index,
+                    req_headers: request_headers,
+                    req_body: request_body,
                     url: request_url,
                     status,
                     headers: headers.clone(),
@@ -103,6 +117,8 @@ impl App {
                 },
                 Err((e, status, headers, tracebuilder)) => RequestResult {
                     index: current_index,
+                    req_headers: request_headers,
+                    req_body: request_body,
                     url: request_url,
                     status,
                     headers: headers.clone(),
@@ -113,11 +129,15 @@ impl App {
 
             let response_body = response.body.clone();
             let response_headers = response.headers.join("\n");
+            let request_headers = response.req_headers.clone();
+            let request_body = response.req_body.clone();
 
             responses.lock().unwrap().insert(0, response);
             *is_loading.lock().unwrap() = false;
             *details.lock().unwrap() = response_body;
             *headers.lock().unwrap() = response_headers;
+            *req_headers.lock().unwrap() = request_headers;
+            *req_body.lock().unwrap() = request_body;
         });
         
         Ok(())
@@ -139,23 +159,21 @@ impl eframe::App for App {
             ui.columns(2, |columns| {
 
                 /* Headings */
-                columns[0].heading("Web Debugger");
+                columns[0].heading("Nancy API Debugger");
                 egui::Frame::new().show(&mut columns[1], |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                         ui.add_space(20.0);
-                        if ui.add_sized([120.0, 25.0], egui::Button::new("Create Request")).clicked() {
+                        let buttontext = if is_loading { "Sending..." } else { "Create Request" };
+                        let button = egui::Button::new(buttontext);
+                        if ui.add_sized([120.0, 25.0], button).clicked() {
                             self.show_newrequest = true;
                             self.set_focus = "newrequest".to_string();
-
+                        }
+                        if is_loading {
+                            ui.add_space(10.0);
+                            ui.spinner();
                         }
                     });
-                    
-                    if is_loading {
-                        ui.add_space(10.0);
-                        ui.spinner();
-                        ui.label("Sending request...");
-                    }
-                    
                     if let Some(error) = &self.ui_error {
                         ui.add_space(10.0);
                         ui.colored_label(egui::Color32::RED, error);
@@ -175,9 +193,27 @@ impl eframe::App for App {
                                 ui.label(format!("{}", response.url));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                                     if ui.add_sized([120.0, 20.0], egui::Button::new("View Response")).clicked() {
-                                        *self.show_requestdetails.lock().unwrap() = response.body.clone();
-                                        *self.show_requestheaders.lock().unwrap() = response.headers.join("\n");
+                                        *self.show_requestheaders.lock().unwrap() = response.req_headers.clone();
+                                        *self.show_requestdetails.lock().unwrap() = response.req_body.clone();
+                                        *self.show_responsedetails.lock().unwrap() = response.body.clone();
+                                        *self.show_responseheaders.lock().unwrap() = response.headers.join("\n");
                                         self.selected_response_index = Some(response.index);
+                                    }
+                                    if ui.add_sized([80.0, 20.0], egui::Button::new("Resend")).clicked() {
+                                        match self.send_request(self.request_type.lock().unwrap().clone(), response.url.clone(), response.req_headers.clone(), response.req_body.clone()) {
+                                            Ok(_) => {
+                                                self.ui_error = None;
+                                                *self.show_requestheaders.lock().unwrap() = String::new();
+                                                *self.show_requestdetails.lock().unwrap() = String::new();
+                                                *self.show_responsedetails.lock().unwrap() = String::new();
+                                                *self.show_responseheaders.lock().unwrap() = String::new();
+                                                self.selected_response_index = None;
+                                            },
+                                            Err(e) => {
+                                                let error_msg = format!("Error sending request: {}", e);
+                                                eprintln!("{}", error_msg);
+                                            }
+                                        }
                                     }
                                 });
                             });
@@ -199,85 +235,93 @@ impl eframe::App for App {
                     }
                 });
 
-                /* Details Block */
-                if !self.show_requestdetails.lock().unwrap().is_empty() && !self.show_requestheaders.lock().unwrap().is_empty() {
+                /* Details */
+                if !self.show_responsedetails.lock().unwrap().is_empty() {
                     columns[1].add_space(40.0);
 
-                    /* Headers */
-                    egui::ScrollArea::vertical().id_salt("c2").show(&mut columns[1], |ui| {
-                        ui.heading("Details");
+
+                    /* Request */
+                    egui::ScrollArea::vertical().id_salt("c2_req").show(&mut columns[1], |ui| {
+                        ui.heading("Request");
+                        ui.add_space(10.0);
                         if let Some(index) = self.selected_response_index {
                             if let Some(response) = self.get_response_by_index(index) {
                                 ui.horizontal(|ui| {
-                                    ui.label("URL:");
-                                    ui.label(&response.url);
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Status:");
-                                    ui.label(&response.status);
+                                    ui.add_space(5.0);
+                                    ui.label(&response.req_headers);
                                 });
                             }
                         }
                     });
-
-                    /* Headers */
-                    egui::ScrollArea::vertical()
-                    .id_salt("headers")
-                    .max_height(150.0)
-                    .show(&mut columns[1], |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut *self.show_requestheaders.lock().unwrap())
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(10)
-                                .interactive(false)
-                        );
-                    });
-
                     columns[1].add_space(10.0);
 
-                    /* Body */
+                    // Headers
+                    if !self.show_requestheaders.lock().unwrap().is_empty() {
+                        columns[1].add(egui::Label::new("Headers"));
+                        egui::ScrollArea::vertical()
+                        .id_salt("req_headers")
+                        .max_height(150.0)
+                        .show(&mut columns[1], |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut *self.show_requestheaders.lock().unwrap())
+                                    .id_salt("req_headers_text")
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(10)
+                                    .interactive(false)
+                            );
+                        });
+                        columns[1].add_space(10.0);
+                    }
+
+                    // Body
+                    if !self.show_requestdetails.lock().unwrap().is_empty() {
+                        columns[1].add(egui::Label::new("Body"));
+                        egui::ScrollArea::vertical()
+                            .id_salt("req_body")
+                            .max_height(350.0)
+                            .show(&mut columns[1], |ui| {
+                                ui.add(
+                                egui::TextEdit::multiline(&mut *self.show_requestdetails.lock().unwrap())
+                                    .id_salt("req_body_text")
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(10)
+                                    .interactive(false)
+                            );
+                        });
+                    }
+
+                    /* Response */
+                    columns[1].add_space(20.0);
+                    columns[1].heading("Response");
+                    columns[1].add_space(10.0);
+
+                    // Headers
+                    if !self.show_responseheaders.lock().unwrap().is_empty() {
+                        columns[1].add(egui::Label::new("Headers"));
+                        egui::ScrollArea::vertical()
+                            .id_salt("res_headers")
+                            .max_height(80.0)
+                            .show(&mut columns[1], |ui| {
+                                ui.add(
+                                egui::TextEdit::multiline(&mut *self.show_responseheaders.lock().unwrap())
+                                    .id_salt("res_headers_text")
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(5)
+                                    .interactive(false)
+                            );
+                        });
+                        columns[1].add_space(10.0);
+                    }
+
+                    // Body
+                    columns[1].add(egui::Label::new("Body"));
                     egui::ScrollArea::vertical()
-                        .id_salt("body")
+                        .id_salt("res_body")
                         .max_height(350.0)
                         .show(&mut columns[1], |ui| {
                             ui.add(
-                            egui::TextEdit::multiline(&mut *self.show_requestdetails.lock().unwrap())
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(10)
-                                .interactive(false)
-                        );
-                    });
-                }
-                /* Error Block */
-                else if !self.show_requestdetails.lock().unwrap().is_empty() {
-                    columns[1].add_space(40.0);
-
-                    /* Status */
-                    egui::ScrollArea::vertical().id_salt("c2").show(&mut columns[1], |ui| {
-                        ui.heading("Details");
-                        if let Some(index) = self.selected_response_index {
-                            if let Some(response) = self.get_response_by_index(index) {
-                                ui.horizontal(|ui| {
-                                    ui.label("URL:");
-                                    ui.label(&response.url);
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Status:");
-                                    ui.label(&response.status);
-                                });
-                            }
-                        }
-                    });
-
-                    columns[1].add_space(10.0);
-
-                    /* Body */
-                    egui::ScrollArea::vertical()
-                        .id_salt("body")
-                        .max_height(600.0)
-                        .show(&mut columns[1], |ui| {
-                            ui.add(
-                            egui::TextEdit::multiline(&mut *self.show_requestdetails.lock().unwrap())
+                            egui::TextEdit::multiline(&mut *self.show_responsedetails.lock().unwrap())
+                                .id_salt("res_body_text")
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(10)
                                 .interactive(false)
@@ -303,13 +347,13 @@ impl eframe::App for App {
                         ui.horizontal(|ui| {
                             ui.label("Method:");
                             egui::ComboBox::from_id_salt("request_type_combo")
-                                .selected_text(&self.request_type)
+                                .selected_text(self.request_type.lock().unwrap().as_str())
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.request_type, "GET".to_string(), "GET");
-                                    ui.selectable_value(&mut self.request_type, "POST".to_string(), "POST");
-                                    ui.selectable_value(&mut self.request_type, "PUT".to_string(), "PUT");
-                                    ui.selectable_value(&mut self.request_type, "PATCH".to_string(), "PATCH");
-                                    ui.selectable_value(&mut self.request_type, "DELETE".to_string(), "DELETE");
+                                    ui.selectable_value(&mut *self.request_type.lock().unwrap(), "GET".to_string(), "GET");
+                                    ui.selectable_value(&mut *self.request_type.lock().unwrap(), "POST".to_string(), "POST");
+                                    ui.selectable_value(&mut *self.request_type.lock().unwrap(), "PUT".to_string(), "PUT");
+                                    ui.selectable_value(&mut *self.request_type.lock().unwrap(), "PATCH".to_string(), "PATCH");
+                                    ui.selectable_value(&mut *self.request_type.lock().unwrap(), "DELETE".to_string(), "DELETE");
                                 });
                         });
 
@@ -317,23 +361,29 @@ impl eframe::App for App {
                         ui.horizontal(|ui| {
                             ui.label("URL:");
                             let requesturl = ui.add(
-                                egui::TextEdit::singleline(&mut self.request_url)
+                                egui::TextEdit::singleline(&mut *self.request_url.lock().unwrap())
                                     .desired_width(330.0)
                                     .hint_text("api.example.com/endpoint")
                             );
-                            if !requesturl.has_focus() && self.set_focus == "newrequest" {
-                                requesturl.request_focus();
+                            if self.show_newrequest && self.set_focus == "newrequest" {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                                if !requesturl.has_focus() {
+                                    requesturl.request_focus();
+                                }
                             }
 
                             if requesturl.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                let send_enabled = !self.request_url.is_empty() && !is_loading;
+                                let send_enabled = !self.request_url.lock().unwrap().is_empty() && !is_loading;
                                 if send_enabled {
                                     self.show_newrequest = false;    
-                                    match self.send_request(self.request_type.clone(), self.request_url.trim().to_string(), self.request_headers.trim().to_string(), self.request_body.trim().to_string()) {
+                                    match self.send_request(self.request_type.lock().unwrap().clone(), self.request_url.lock().unwrap().clone(), self.request_headers.lock().unwrap().clone(), self.request_body.lock().unwrap().clone()) {
                                         Ok(_) => {
                                             self.ui_error = None;
-                                            *self.show_requestdetails.lock().unwrap() = String::new();
                                             *self.show_requestheaders.lock().unwrap() = String::new();
+                                            *self.show_requestdetails.lock().unwrap() = String::new();
+                                            *self.show_responsedetails.lock().unwrap() = String::new();
+                                            *self.show_responseheaders.lock().unwrap() = String::new();
+                                            self.selected_response_index = None;
                                         },
                                         Err(e) => {
                                             let error_msg = format!("Error sending request: {}", e);
@@ -341,7 +391,7 @@ impl eframe::App for App {
                                             self.ui_error = Some(error_msg);
                                         }
                                     }
-                                    self.request_url.clear();
+                                    *self.request_url.lock().unwrap() = String::new();
                                 }
                             }
                         });
@@ -353,7 +403,7 @@ impl eframe::App for App {
                             ui.label("Headers:");
                         });
                         ui.add(
-                            egui::TextEdit::multiline(&mut self.request_headers)
+                            egui::TextEdit::multiline(&mut *self.request_headers.lock().unwrap())
                                 .desired_width(330.0)
                                 .desired_rows(3)
                                 .hint_text("Content-Type: application/json")
@@ -366,7 +416,7 @@ impl eframe::App for App {
                             ui.label("Body:");
                         });
                         ui.add(
-                            egui::TextEdit::multiline(&mut self.request_body)
+                            egui::TextEdit::multiline(&mut *self.request_body.lock().unwrap())
                                 .desired_width(330.0)
                                 .desired_rows(10)
                                 .hint_text("{\"key\": \"value\"}")
@@ -376,11 +426,11 @@ impl eframe::App for App {
 
                         /* Send/Close Buttons */
                         ui.horizontal(|ui| {
-                            let send_enabled = !self.request_url.is_empty() && !is_loading;
+                            let send_enabled = !self.request_url.lock().unwrap().is_empty() && !is_loading;
                             
                             if ui.add_enabled(send_enabled, egui::Button::new("Send")).clicked() {
                                 self.show_newrequest = false;    
-                                match self.send_request( self.request_type.clone(), self.request_url.trim().to_string(), self.request_headers.trim().to_string(), self.request_body.trim().to_string()) {
+                                match self.send_request( self.request_type.lock().unwrap().clone(), self.request_url.lock().unwrap().clone(), self.request_headers.lock().unwrap().clone(), self.request_body.lock().unwrap().clone()) {
                                     Ok(_) => {
                                         self.ui_error = None;
                                     },
@@ -390,7 +440,7 @@ impl eframe::App for App {
                                         self.ui_error = Some(error_msg);
                                     }
                                 }
-                                self.request_url.clear();
+                                *self.request_url.lock().unwrap() = String::new();
                             }
 
                             if ui.button("Cancel").clicked() {
@@ -415,12 +465,13 @@ impl eframe::App for App {
 fn main() -> Result<(), Box<dyn Error>> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 700.0]),
+            .with_inner_size([1700.0, 900.0])
+            .with_active(true),
         ..Default::default()
     };
 
     match eframe::run_native(
-        "Web Debugger",
+        "Nancy Web Debugger",
         options,
         Box::new(|_cc| {
             println!("Initialising App...");
