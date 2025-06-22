@@ -74,6 +74,9 @@ impl App {
         let req_headers = Arc::clone(&self.show_requestheaders);
         let req_body = Arc::clone(&self.show_requestdetails);
 
+        println!("Sending request headers: {}", request_headers);
+        println!("Sending request body: {}", request_body);
+
         if request_url.is_empty() {
             return Err("URL is empty".into());
         }
@@ -104,7 +107,7 @@ impl App {
                 current
             };
 
-            let response = match rt.block_on(async { request::send_request(request_type.clone(), request_url.clone(), req_headers.lock().unwrap().clone(), req_body.lock().unwrap().clone()).await }) {
+            let response = match rt.block_on(async { request::send_request(request_type.clone(), request_url.clone(), request_headers.clone(), request_body.clone()).await }) {
                 Ok((status, headers, body)) => RequestResult {
                     index: current_index,
                     req_headers: request_headers,
@@ -203,10 +206,6 @@ impl eframe::App for App {
                                         match self.send_request(self.request_type.lock().unwrap().clone(), response.url.clone(), response.req_headers.clone(), response.req_body.clone()) {
                                             Ok(_) => {
                                                 self.ui_error = None;
-                                                *self.show_requestheaders.lock().unwrap() = String::new();
-                                                *self.show_requestdetails.lock().unwrap() = String::new();
-                                                *self.show_responsedetails.lock().unwrap() = String::new();
-                                                *self.show_responseheaders.lock().unwrap() = String::new();
                                                 self.selected_response_index = None;
                                             },
                                             Err(e) => {
@@ -247,8 +246,9 @@ impl eframe::App for App {
                         if let Some(index) = self.selected_response_index {
                             if let Some(response) = self.get_response_by_index(index) {
                                 ui.horizontal(|ui| {
+                                    ui.label(&response.url);
                                     ui.add_space(5.0);
-                                    ui.label(&response.req_headers);
+                                    ui.label(&response.status);
                                 });
                             }
                         }
@@ -266,7 +266,7 @@ impl eframe::App for App {
                                 egui::TextEdit::multiline(&mut *self.show_requestheaders.lock().unwrap())
                                     .id_salt("req_headers_text")
                                     .desired_width(f32::INFINITY)
-                                    .desired_rows(10)
+                                    .desired_rows(3)
                                     .interactive(false)
                             );
                         });
@@ -278,13 +278,13 @@ impl eframe::App for App {
                         columns[1].add(egui::Label::new("Body"));
                         egui::ScrollArea::vertical()
                             .id_salt("req_body")
-                            .max_height(350.0)
+                            .max_height(150.0)
                             .show(&mut columns[1], |ui| {
                                 ui.add(
                                 egui::TextEdit::multiline(&mut *self.show_requestdetails.lock().unwrap())
                                     .id_salt("req_body_text")
                                     .desired_width(f32::INFINITY)
-                                    .desired_rows(10)
+                                    .desired_rows(5)
                                     .interactive(false)
                             );
                         });
@@ -346,14 +346,15 @@ impl eframe::App for App {
                         /* Method Selector */
                         ui.horizontal(|ui| {
                             ui.label("Method:");
+                            let mut request_type = self.request_type.lock().unwrap();
                             egui::ComboBox::from_id_salt("request_type_combo")
-                                .selected_text(self.request_type.lock().unwrap().as_str())
+                                .selected_text(request_type.as_str())
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut *self.request_type.lock().unwrap(), "GET".to_string(), "GET");
-                                    ui.selectable_value(&mut *self.request_type.lock().unwrap(), "POST".to_string(), "POST");
-                                    ui.selectable_value(&mut *self.request_type.lock().unwrap(), "PUT".to_string(), "PUT");
-                                    ui.selectable_value(&mut *self.request_type.lock().unwrap(), "PATCH".to_string(), "PATCH");
-                                    ui.selectable_value(&mut *self.request_type.lock().unwrap(), "DELETE".to_string(), "DELETE");
+                                    ui.selectable_value(&mut *request_type, "GET".to_string(), "GET");
+                                    ui.selectable_value(&mut *request_type, "POST".to_string(), "POST");
+                                    ui.selectable_value(&mut *request_type, "PUT".to_string(), "PUT");
+                                    ui.selectable_value(&mut *request_type, "PATCH".to_string(), "PATCH");
+                                    ui.selectable_value(&mut *request_type, "DELETE".to_string(), "DELETE");
                                 });
                         });
 

@@ -27,7 +27,7 @@ pub async fn send_request(request_type: String, request_url: String, request_hea
             
             tracebuilder.push_str(&format!("URL Analysis:\n  Host: {}\n  Port: {}\n  Scheme: {}\n\n", host, port, url.scheme()));
             
-            // Test basic TCP
+            // Basic TCP / DNS
             match test_dns(host, port).await {
                 Ok(dns) => tracebuilder.push_str(&format!("Resolved DNS to: {}\n", dns.to_string())),
                 Err(e) => {
@@ -41,7 +41,7 @@ pub async fn send_request(request_type: String, request_url: String, request_hea
                 }
             }
             
-            // Test what the server actually sends
+            // Server Response
             tracebuilder.push_str("Testing server response...\n");
             let addr = format!("{}:{}", host, port);
             let mut stream = match TokioTcpStream::connect(&addr).await {
@@ -113,11 +113,11 @@ pub async fn send_request(request_type: String, request_url: String, request_hea
         }
     }
 
-    let clients_to_try = unsafe { vec![
+    let clients_to_try: Vec<(String, Result<Client, reqwest::Error>)> = vec![
         ("Standard".to_string(), create_standard_client()),
         ("Permissive".to_string(), create_permissive_client()),
         ("Legacy TLS".to_string(), create_legacy_tls_client()),
-    ]};
+    ];
     
     for (name, client_result) in clients_to_try {
         tracebuilder.push_str(&format!("\nTrying {}...\n", name));
@@ -129,12 +129,23 @@ pub async fn send_request(request_type: String, request_url: String, request_hea
                 continue;
             }
         };
-        
-        let req = match client.request(method.clone(), &request_url).build() {
-            Ok(req) => req,
-            Err(e) => {
-                tracebuilder.push_str(&format!("Failed to build request with {}: {}\n", name, e));
-                continue;
+
+        let req = if request_body.is_empty() {
+            match client.request(method.clone(), &request_url).build() {
+                Ok(req) => req,
+                Err(e) => {
+                    tracebuilder.push_str(&format!("Failed to build request with {}: {}\n", name, e));
+                    continue;
+                }
+            }
+        } 
+        else {
+            match client.request(method.clone(), &request_url).body(request_body.clone()).build() {
+                Ok(req) => req,
+                Err(e) => {
+                    tracebuilder.push_str(&format!("Failed to build request with {}: {}\n", name, e));
+                    continue;
+                }
             }
         };
         tracebuilder.push_str(&format!("Sending {} request to: {} with {}\n", request_type, request_url, name));
