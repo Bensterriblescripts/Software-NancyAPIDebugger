@@ -285,7 +285,7 @@ impl eframe::App for App {
                                     .id_salt("req_body_text")
                                     .desired_width(f32::INFINITY)
                                     .desired_rows(5)
-                                    .interactive(false)
+                                    .interactive(true)
                             );
                         });
                     }
