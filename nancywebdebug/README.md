@@ -1,6 +1,6 @@
 # Nancy API Debugger
 
-Nancy API Debugger is a desktop application for inspecting HTTP requests and their DNS, connection, TLS, header, and body details.
+Nancy API Debugger provides desktop and command-line clients for inspecting HTTP requests and their DNS, connection, TLS, header, and body details.
 
 ## Requirements
 
@@ -30,9 +30,31 @@ Build and run the application from the repository root:
 cargo run --locked
 ```
 
+Build the command-line client:
+
+```sh
+cargo build --locked --bin nancywebdebug-cli
+```
+
+Its syntax is:
+
+```text
+nancywebdebug-cli [OPTIONS] <URL>
+```
+
+For example:
+
+```sh
+nancywebdebug-cli https://example.com
+nancywebdebug-cli --protocol http2 --no-follow-redirects https://example.com
+nancywebdebug-cli -X POST -H "Content-Type: application/json" --body-file request.json https://example.com/api
+```
+
+Available request options are `-X, --method`, repeatable `-H, --header`, `--body-file`, `--protocol auto|http1.1|http2|http3`, and `--no-follow-redirects`. Redirects are followed by default. The report includes every redirect hop and all captured diagnostic stages. Press Ctrl+C to cancel an active diagnostic.
+
 Linux TLS verification uses the system CA certificates. Keep the `ca-certificates` package and its trust store current. DNS resolution depends on a valid `/etc/resolv.conf`. HTTP/3 uses QUIC and requires outbound UDP access, normally to the destination's HTTPS port. Firewalls or networks that block UDP can prevent HTTP/3 while HTTP/1.1 and HTTP/2 continue to work over TCP.
 
-The application must be launched from an X11 or Wayland graphical session with functional OpenGL/EGL/GLX drivers. Headless operation is not supported.
+The desktop application must be launched from an X11 or Wayland graphical session with functional OpenGL/EGL/GLX drivers. The command-line client can run headlessly.
 
 ## Windows
 

@@ -7,4 +7,6 @@ mod stages;
 mod tls;
 mod transport;
 
-pub use runner::run_diagnostic;
+pub(crate) use body::MAX_CAPTURE_BYTES;
+
+pub use runner::run_diagnostic_session;

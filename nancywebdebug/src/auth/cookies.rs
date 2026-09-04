@@ -28,6 +28,12 @@ pub fn capture_browser_cookies(
         return Err("Profile does not use browser cookies".to_owned());
     };
     validate_host(&target_url, &config.host_scope)?;
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("DISPLAY").is_none_or(|display| display.is_empty()) {
+        return Err(
+            "Browser cookie capture requires X11 or XWayland (DISPLAY is unavailable)".to_owned(),
+        );
+    }
     let executable = std::env::current_exe()
         .map_err(|error| format!("Unable to locate the application executable: {error}"))?;
     let mut command = Command::new(executable);
@@ -37,6 +43,11 @@ pub fn capture_browser_cookies(
         .arg(&target_url)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(target_os = "linux")]
+    command
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("WAYLAND_SOCKET")
+        .env("GDK_BACKEND", "x11");
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;

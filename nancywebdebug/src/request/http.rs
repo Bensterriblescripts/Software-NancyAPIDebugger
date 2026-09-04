@@ -1,6 +1,6 @@
 use crate::diagnostics::*;
 use bytes::Bytes;
-use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION};
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, USER_AGENT};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri, Version};
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -433,7 +433,12 @@ pub(super) fn parse_request_headers(input: &str) -> Result<(HeaderMap, Vec<Heade
     Ok((headers, trace))
 }
 
-pub(super) fn add_automatic_headers(url: &Url, headers: &mut HeaderMap, body_length: usize) {
+pub(super) fn add_automatic_headers(
+    url: &Url,
+    headers: &mut HeaderMap,
+    body_length: usize,
+    user_agent: UserAgentPreset,
+) {
     if !headers.contains_key(HOST)
         && let Ok(value) = HeaderValue::from_str(&authority(url))
     {
@@ -443,6 +448,11 @@ pub(super) fn add_automatic_headers(url: &Url, headers: &mut HeaderMap, body_len
         && let Ok(value) = HeaderValue::from_str(&body_length.to_string())
     {
         headers.insert(CONTENT_LENGTH, value);
+    }
+    if !headers.contains_key(USER_AGENT)
+        && let Some(value) = user_agent.header_value()
+    {
+        headers.insert(USER_AGENT, HeaderValue::from_static(value));
     }
 }
 

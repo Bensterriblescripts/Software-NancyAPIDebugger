@@ -1,5 +1,6 @@
 use crate::diagnostics::{
     ConnectionOutcome, DiagnosticProgress, DiagnosticTrace, StageKind, StageStatus,
+    format_byte_size,
 };
 use bytes::{Buf, Bytes};
 use h3::error::Code;
@@ -237,7 +238,7 @@ pub(super) async fn run(
                 StageKind::FirstByte,
                 StageStatus::Succeeded,
                 first_started,
-                format!("{length} byte(s)"),
+                format_byte_size(length),
                 &progress,
             );
         }

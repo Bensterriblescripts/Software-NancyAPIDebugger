@@ -1,5 +1,5 @@
 use crate::diagnostics::{
-    DiagnosticProgress, DiagnosticTrace, StageKind, StageStatus, TraceOutcome,
+    DiagnosticProgress, DiagnosticTrace, StageKind, StageStatus, TraceOutcome, format_byte_size,
 };
 use bytes::Bytes;
 use encoding_rs::{DecoderResult, Encoding};
@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use super::http::{apply_redirect_report, header_map_to_trace};
 use super::stages::{WaitError, begin_stage, fail_trace, finish_stage, set_stage, wait_for};
 
-pub(super) const MAX_CAPTURE_BYTES: usize = 50 * 1024 * 1024;
+pub(crate) const MAX_CAPTURE_BYTES: usize = 50 * 1024 * 1024;
 
 pub(super) struct BoundedCapture {
     bytes: Vec<u8>,
@@ -104,7 +104,7 @@ pub(super) async fn read_hyper_body(
                 StageKind::FirstByte,
                 StageStatus::Succeeded,
                 first_started,
-                format!("{} byte(s)", data.len()),
+                format_byte_size(data.len()),
                 &progress,
             );
         }

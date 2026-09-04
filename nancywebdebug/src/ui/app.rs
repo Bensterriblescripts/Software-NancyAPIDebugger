@@ -2,7 +2,6 @@ use crate::auth::{self, ProfileInput, SharedAuthStore};
 use crate::diagnostics::*;
 use crate::request;
 use eframe::egui;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -17,14 +16,9 @@ use super::widgets::normalized_url;
 use super::{auth_profiles, history};
 
 struct ActiveRequest {
-    index: usize,
     request_number: usize,
     cancel: CancellationToken,
-    redirects_followed: usize,
-    visited_urls: HashSet<String>,
 }
-
-const MAX_REDIRECTS: usize = 10;
 
 struct AuthEvent {
     profile_id: u64,
@@ -40,6 +34,7 @@ pub(super) struct App {
     pub(super) request_body: String,
     pub(super) request_protocol: ProtocolPreference,
     pub(super) request_follow_redirects: bool,
+    pub(super) request_user_agent: UserAgentPreset,
     pub(super) selected_auth_profile: Option<u64>,
     pub(super) timeout_inputs: TimeoutInputs,
     pub(super) auth_store: SharedAuthStore,
@@ -68,17 +63,21 @@ impl App {
     fn new() -> Self {
         let (progress_tx, progress_rx) = mpsc::channel();
         let (auth_event_tx, auth_event_rx) = mpsc::channel();
+        let request_defaults = DiagnosticRequest::default();
+        let timeout_inputs = TimeoutInputs::from_timeouts(&request_defaults.timeouts);
+        let request_body = String::from_utf8_lossy(&request_defaults.body).into_owned();
         Self {
             show_new_request: false,
             set_focus: false,
-            request_method: "GET".to_owned(),
-            request_url: String::new(),
-            request_headers: String::new(),
-            request_body: String::new(),
-            request_protocol: ProtocolPreference::Auto,
-            request_follow_redirects: false,
+            request_method: request_defaults.method,
+            request_url: request_defaults.url,
+            request_headers: request_defaults.headers,
+            request_body,
+            request_protocol: request_defaults.protocol,
+            request_follow_redirects: request_defaults.follow_redirects,
+            request_user_agent: request_defaults.user_agent,
             selected_auth_profile: None,
-            timeout_inputs: TimeoutInputs::default(),
+            timeout_inputs,
             auth_store: auth::AuthStore::shared(),
             show_auth_profiles: false,
             profile_editor_open: false,
@@ -115,15 +114,12 @@ impl App {
         self.next_request_number += 1;
         let cancel = CancellationToken::new();
         self.active = Some(ActiveRequest {
-            index,
             request_number,
             cancel: cancel.clone(),
-            redirects_followed: 0,
-            visited_urls: HashSet::new(),
         });
         self.selected_index = Some(index);
         self.detail_tab = DetailTab::Summary;
-        self.spawn_request(index, diagnostic_request, cancel);
+        self.spawn_session(index, diagnostic_request, cancel);
         Ok(())
     }
 
@@ -147,13 +143,14 @@ impl App {
             timeouts: self.timeout_inputs.to_timeouts(),
             auth: selected_auth,
             follow_redirects: self.request_follow_redirects,
+            user_agent: self.request_user_agent,
         };
         self.start_request(diagnostic_request)
     }
 
     fn process_progress(&mut self) {
         while let Ok(update) = self.progress_rx.try_recv() {
-            let (mut trace, completed) = match update {
+            let (trace, completed) = match update {
                 DiagnosticProgress::Running(trace) => (trace, false),
                 DiagnosticProgress::Finished(trace) => (trace, true),
             };
@@ -162,7 +159,6 @@ impl App {
             let request_number = self
                 .active
                 .as_ref()
-                .filter(|active| active.index == index)
                 .map(|active| active.request_number)
                 .or_else(|| {
                     self.history
@@ -171,15 +167,7 @@ impl App {
                         .map(|item| item.request_number)
                 })
                 .unwrap_or(index);
-            let mut redirect_request = None;
-            if completed
-                && self
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.index == index)
-            {
-                redirect_request = self.prepare_redirect(&mut trace);
-            }
+            let redirect_followed = trace.redirect_followed;
             if let Some(existing) = self
                 .history
                 .iter_mut()
@@ -187,6 +175,9 @@ impl App {
             {
                 existing.trace = trace;
             } else {
+                if self.active.is_some() {
+                    self.selected_index = Some(index);
+                }
                 self.history.insert(
                     0,
                     history::HistoryEntry {
@@ -195,67 +186,14 @@ impl App {
                     },
                 );
             }
-            if completed
-                && self
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.index == index)
-            {
-                if let Some(request) = redirect_request {
-                    let next_index = self.next_index;
-                    self.next_index += 1;
-                    if let Some(active) = &mut self.active {
-                        active.index = next_index;
-                        active.redirects_followed += 1;
-                        let cancel = active.cancel.clone();
-                        self.selected_index = Some(next_index);
-                        self.spawn_request(next_index, request, cancel);
-                    }
-                } else {
-                    self.active = None;
-                    self.selected_index = Some(index);
-                }
+            if completed && !redirect_followed && self.active.is_some() {
+                self.active = None;
+                self.selected_index = Some(index);
             }
         }
     }
 
-    fn prepare_redirect(&mut self, trace: &mut DiagnosticTrace) -> Option<DiagnosticRequest> {
-        let active = self.active.as_mut()?;
-        if !trace.url.normalized.is_empty() {
-            active.visited_urls.insert(trace.url.normalized.clone());
-        }
-        if !trace.request.follow_redirects {
-            return None;
-        }
-        let target = trace.redirect_target.as_ref()?.clone();
-        if trace.outcome != TraceOutcome::Success {
-            trace.redirect_stop_reason = Some(
-                "Redirect not followed because the request did not complete successfully"
-                    .to_owned(),
-            );
-            return None;
-        }
-        if !matches!(trace.http.status, Some(301 | 302 | 303 | 307 | 308)) {
-            trace.redirect_stop_reason = Some(format!(
-                "HTTP status {} is not followed automatically",
-                trace.http.status.unwrap_or_default()
-            ));
-            return None;
-        }
-        if active.redirects_followed >= MAX_REDIRECTS {
-            trace.redirect_stop_reason = Some(format!("Redirect limit of {MAX_REDIRECTS} reached"));
-            return None;
-        }
-        if active.visited_urls.contains(&target) {
-            trace.redirect_stop_reason = Some("Redirect loop detected".to_owned());
-            return None;
-        }
-        trace.redirect_followed = true;
-        trace.redirect_stop_reason = None;
-        Some(redirect_request(trace, target))
-    }
-
-    fn spawn_request(
+    fn spawn_session(
         &self,
         index: usize,
         diagnostic_request: DiagnosticRequest,
@@ -268,13 +206,15 @@ impl App {
                 .enable_all()
                 .build();
             match runtime {
-                Ok(runtime) => runtime.block_on(request::run_diagnostic(
-                    index,
-                    diagnostic_request,
-                    auth_store,
-                    cancel,
-                    progress,
-                )),
+                Ok(runtime) => {
+                    runtime.block_on(request::run_diagnostic_session(
+                        index,
+                        diagnostic_request,
+                        auth_store,
+                        cancel,
+                        Some(progress),
+                    ));
+                }
                 Err(error) => {
                     let mut trace = DiagnosticTrace::new(index, diagnostic_request);
                     trace.outcome = TraceOutcome::Failed;
@@ -364,53 +304,6 @@ impl App {
     }
 }
 
-fn redirect_request(trace: &DiagnosticTrace, target: String) -> DiagnosticRequest {
-    let mut request = trace.request.clone();
-    request.url = target.clone();
-    let mut removed_headers = vec!["host"];
-    let switch_to_get = matches!(trace.http.status, Some(303))
-        && !trace.request.method.eq_ignore_ascii_case("HEAD")
-        || matches!(trace.http.status, Some(301 | 302))
-            && trace.request.method.eq_ignore_ascii_case("POST");
-    if switch_to_get {
-        request.method = "GET".to_owned();
-        request.body = Arc::from([]);
-        removed_headers.extend([
-            "content-encoding",
-            "content-length",
-            "content-type",
-            "transfer-encoding",
-        ]);
-    }
-    if redirect_crosses_origin(&trace.url.normalized, &target) {
-        removed_headers.extend(["authorization", "cookie", "proxy-authorization"]);
-        request.auth = None;
-    }
-    request.headers = remove_headers(&request.headers, &removed_headers);
-    request
-}
-
-fn redirect_crosses_origin(source: &str, target: &str) -> bool {
-    match (url::Url::parse(source), url::Url::parse(target)) {
-        (Ok(source), Ok(target)) => source.origin() != target.origin(),
-        _ => true,
-    }
-}
-
-fn remove_headers(headers: &str, names: &[&str]) -> String {
-    headers
-        .lines()
-        .filter(|line| {
-            line.split_once(':').is_none_or(|(name, _)| {
-                !names
-                    .iter()
-                    .any(|removed| name.trim().eq_ignore_ascii_case(removed))
-            })
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 impl Drop for App {
     fn drop(&mut self) {
         if let Some(active) = &self.active {
@@ -428,7 +321,6 @@ impl eframe::App for App {
         self.process_auth_events();
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Nancy API Debugger");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(active) = &self.active {
                         if ui.button("Cancel Request").clicked() {

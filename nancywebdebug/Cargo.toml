@@ -3,11 +3,13 @@ name = "nancywebdebug"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+default-run = "nancywebdebug"
 
 [dependencies]
 base64 = "0.22.1"
 bytes = "1.10.1"
 brotli = "8.0.2"
+clap = { version = "4.5.47", features = ["derive"] }
 encoding_rs = "0.8.35"
 eframe = "0.31.1"
 flate2 = "1.1.2"
@@ -27,7 +29,7 @@ rustls-platform-verifier = "0.7.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"
-tokio = { version = "1.45.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1.45.1", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 tokio-util = "0.7.15"
 tokio-rustls = "0.26.4"
 url = "2.5.4"

@@ -1,5 +1,5 @@
 use crate::auth::ProfileSummary;
-use crate::diagnostics::{ProtocolPreference, StageTimeouts};
+use crate::diagnostics::{ProtocolPreference, StageTimeouts, UserAgentPreset};
 use eframe::egui;
 use std::time::Duration;
 
@@ -16,21 +16,19 @@ pub(super) struct TimeoutInputs {
     body: f64,
 }
 
-impl Default for TimeoutInputs {
-    fn default() -> Self {
+impl TimeoutInputs {
+    pub(super) fn from_timeouts(timeouts: &StageTimeouts) -> Self {
         Self {
-            authentication: 30.0,
-            dns: 5.0,
-            transport: 10.0,
-            tls: 10.0,
-            headers: 30.0,
-            first_byte: 30.0,
-            body: 30.0,
+            authentication: timeouts.authentication.as_secs_f64(),
+            dns: timeouts.dns.as_secs_f64(),
+            transport: timeouts.transport.as_secs_f64(),
+            tls: timeouts.tls.as_secs_f64(),
+            headers: timeouts.headers.as_secs_f64(),
+            first_byte: timeouts.first_byte.as_secs_f64(),
+            body: timeouts.body.as_secs_f64(),
         }
     }
-}
 
-impl TimeoutInputs {
     pub(super) fn to_timeouts(&self) -> StageTimeouts {
         StageTimeouts {
             authentication: duration(self.authentication),
@@ -105,7 +103,21 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App) -> bool {
                         .desired_width(f32::INFINITY)
                         .desired_rows(8),
                 );
-                ui.checkbox(&mut app.request_follow_redirects, "Follow All Redirects");
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut app.request_follow_redirects, "Follow All Redirects");
+                    ui.label("User-Agent");
+                    egui::ComboBox::from_id_salt("user_agent")
+                        .selected_text(app.request_user_agent.label())
+                        .show_ui(ui, |ui| {
+                            for preset in UserAgentPreset::ALL {
+                                ui.selectable_value(
+                                    &mut app.request_user_agent,
+                                    preset,
+                                    preset.label(),
+                                );
+                            }
+                        });
+                });
                 egui::CollapsingHeader::new("Advanced authentication").show(ui, |ui| {
                     let profiles: Vec<ProfileSummary> = app
                         .auth_store

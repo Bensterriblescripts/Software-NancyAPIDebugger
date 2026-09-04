@@ -4,6 +4,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::request::MAX_CAPTURE_BYTES;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolPreference {
     Auto,
@@ -24,6 +26,62 @@ impl fmt::Display for ProtocolPreference {
             Self::Http2 => "HTTP/2",
             Self::Http3 => "HTTP/3",
         })
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum UserAgentPreset {
+    #[default]
+    Nancywebdebug,
+    Firefox,
+    Chrome,
+    Edge,
+    Safari,
+    None,
+}
+
+impl UserAgentPreset {
+    pub const ALL: [Self; 6] = [
+        Self::Nancywebdebug,
+        Self::Firefox,
+        Self::Chrome,
+        Self::Edge,
+        Self::Safari,
+        Self::None,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Nancywebdebug => "nancywebdebug",
+            Self::Firefox => "firefox",
+            Self::Chrome => "chrome",
+            Self::Edge => "edge",
+            Self::Safari => "safari",
+            Self::None => "none",
+        }
+    }
+
+    pub const fn header_value(self) -> Option<&'static str> {
+        match self {
+            Self::Nancywebdebug => Some(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            )),
+            Self::Firefox => Some(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:138.0) Gecko/20100101 Firefox/138.0",
+            ),
+            Self::Chrome => Some(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            ),
+            Self::Edge => Some(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
+            ),
+            Self::Safari => Some(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+            ),
+            Self::None => None,
+        }
     }
 }
 
@@ -69,6 +127,32 @@ pub struct DiagnosticRequest {
     pub timeouts: StageTimeouts,
     pub auth: Option<RequestAuth>,
     pub follow_redirects: bool,
+    pub user_agent: UserAgentPreset,
+}
+
+impl Default for DiagnosticRequest {
+    fn default() -> Self {
+        Self {
+            method: "GET".to_owned(),
+            url: String::new(),
+            headers: String::new(),
+            body: Arc::from([]),
+            protocol: ProtocolPreference::Auto,
+            timeouts: StageTimeouts::default(),
+            auth: None,
+            follow_redirects: true,
+            user_agent: UserAgentPreset::default(),
+        }
+    }
+}
+
+impl DiagnosticRequest {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +360,16 @@ pub fn escaped_bytes(bytes: &[u8]) -> Cow<'_, str> {
     Cow::Owned(escaped)
 }
 
+pub(crate) fn format_byte_size(bytes: usize) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.2} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HttpTrace {
     pub requested_protocol: String,
@@ -321,9 +415,13 @@ impl BodyTrace {
 
 fn capture_status(length: usize, truncated: bool) -> String {
     if truncated {
-        format!("{length} bytes (truncated at 50 MiB)")
+        format!(
+            "{} (truncated at {})",
+            format_byte_size(length),
+            format_byte_size(MAX_CAPTURE_BYTES)
+        )
     } else {
-        format!("{length} bytes")
+        format_byte_size(length)
     }
 }
 
@@ -420,7 +518,7 @@ pub fn normalize_url_input(input: &str) -> String {
     if has_scheme {
         input.to_owned()
     } else {
-        format!("http://{input}")
+        format!("https://{input}")
     }
 }
 
