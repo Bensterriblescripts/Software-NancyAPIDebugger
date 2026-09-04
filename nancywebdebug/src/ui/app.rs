@@ -35,6 +35,7 @@ pub(super) struct App {
     pub(super) request_protocol: ProtocolPreference,
     pub(super) request_follow_redirects: bool,
     pub(super) request_user_agent: UserAgentPreset,
+    pub(super) request_fingerprint_server: bool,
     pub(super) selected_auth_profile: Option<u64>,
     pub(super) timeout_inputs: TimeoutInputs,
     pub(super) auth_store: SharedAuthStore,
@@ -76,6 +77,7 @@ impl App {
             request_protocol: request_defaults.protocol,
             request_follow_redirects: request_defaults.follow_redirects,
             request_user_agent: request_defaults.user_agent,
+            request_fingerprint_server: request_defaults.fingerprint_server,
             selected_auth_profile: None,
             timeout_inputs,
             auth_store: auth::AuthStore::shared(),
@@ -144,15 +146,21 @@ impl App {
             auth: selected_auth,
             follow_redirects: self.request_follow_redirects,
             user_agent: self.request_user_agent,
+            fingerprint_server: self.request_fingerprint_server,
         };
         self.start_request(diagnostic_request)
     }
 
     fn process_progress(&mut self) {
         while let Ok(update) = self.progress_rx.try_recv() {
-            let (trace, completed) = match update {
-                DiagnosticProgress::Running(trace) => (trace, false),
-                DiagnosticProgress::Finished(trace) => (trace, true),
+            let trace = match update {
+                DiagnosticProgress::HttpHopUpdated(trace)
+                | DiagnosticProgress::HttpHopCompleted(trace)
+                | DiagnosticProgress::FingerprintUpdated(trace) => trace,
+                DiagnosticProgress::SessionCompleted => {
+                    self.active = None;
+                    continue;
+                }
             };
             let index = trace.index;
             self.next_index = self.next_index.max(index + 1);
@@ -167,7 +175,6 @@ impl App {
                         .map(|item| item.request_number)
                 })
                 .unwrap_or(index);
-            let redirect_followed = trace.redirect_followed;
             if let Some(existing) = self
                 .history
                 .iter_mut()
@@ -185,10 +192,6 @@ impl App {
                         trace,
                     },
                 );
-            }
-            if completed && !redirect_followed && self.active.is_some() {
-                self.active = None;
-                self.selected_index = Some(index);
             }
         }
     }
@@ -227,7 +230,15 @@ impl App {
                         stage: StageKind::Url,
                         message: format!("Unable to create async runtime: {error}"),
                     });
-                    let _ = progress.send(DiagnosticProgress::Finished(trace));
+                    if trace.request.fingerprint_server {
+                        trace.fingerprint.status = FingerprintStatus::Unavailable;
+                        trace.fingerprint.evidence.push(
+                            "Fingerprinting could not start because the async runtime was unavailable"
+                                .to_owned(),
+                        );
+                    }
+                    let _ = progress.send(DiagnosticProgress::HttpHopCompleted(trace));
+                    let _ = progress.send(DiagnosticProgress::SessionCompleted);
                 }
             }
         });
@@ -323,7 +334,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(active) = &self.active {
-                        if ui.button("Cancel Request").clicked() {
+                        if ui.button("Cancel Session").clicked() {
                             active.cancel.cancel();
                         }
                         ui.spinner();

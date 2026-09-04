@@ -128,6 +128,7 @@ pub struct DiagnosticRequest {
     pub auth: Option<RequestAuth>,
     pub follow_redirects: bool,
     pub user_agent: UserAgentPreset,
+    pub fingerprint_server: bool,
 }
 
 impl Default for DiagnosticRequest {
@@ -142,6 +143,7 @@ impl Default for DiagnosticRequest {
             auth: None,
             follow_redirects: true,
             user_agent: UserAgentPreset::default(),
+            fingerprint_server: false,
         }
     }
 }
@@ -431,6 +433,64 @@ pub struct TraceError {
     pub message: String,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintStatus {
+    #[default]
+    Disabled,
+    Pending,
+    Running,
+    Detected,
+    Unknown,
+    TimedOut,
+    Cancelled,
+    Unavailable,
+}
+
+impl fmt::Display for FingerprintStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Disabled => "Disabled",
+            Self::Pending => "Pending",
+            Self::Running => "Running",
+            Self::Detected => "Detected",
+            Self::Unknown => "Unknown",
+            Self::TimedOut => "Timed out",
+            Self::Cancelled => "Cancelled",
+            Self::Unavailable => "Unavailable",
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FingerprintTrace {
+    pub status: FingerprintStatus,
+    pub web_server: String,
+    pub confidence: String,
+    pub evidence: Vec<String>,
+}
+
+impl FingerprintTrace {
+    fn new(enabled: bool) -> Self {
+        Self {
+            status: if enabled {
+                FingerprintStatus::Pending
+            } else {
+                FingerprintStatus::Disabled
+            },
+            web_server: "Unknown".to_owned(),
+            confidence: "None".to_owned(),
+            evidence: Vec::new(),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self.status,
+            FingerprintStatus::Pending | FingerprintStatus::Running
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiagnosticTrace {
     pub index: usize,
@@ -449,10 +509,12 @@ pub struct DiagnosticTrace {
     pub tls: Option<TlsTrace>,
     pub http: HttpTrace,
     pub body: BodyTrace,
+    pub fingerprint: FingerprintTrace,
 }
 
 impl DiagnosticTrace {
     pub fn new(index: usize, request: DiagnosticRequest) -> Self {
+        let fingerprint = FingerprintTrace::new(request.fingerprint_server);
         let mut stage_kinds = vec![StageKind::Url, StageKind::Authentication, StageKind::Dns];
         if request.protocol == ProtocolPreference::Http3 {
             stage_kinds.push(StageKind::QuicTls);
@@ -493,6 +555,7 @@ impl DiagnosticTrace {
             connections: Vec::new(),
             tls: None,
             body: BodyTrace::default(),
+            fingerprint,
         }
     }
 
@@ -524,6 +587,8 @@ pub fn normalize_url_input(input: &str) -> String {
 
 #[derive(Debug)]
 pub enum DiagnosticProgress {
-    Running(DiagnosticTrace),
-    Finished(DiagnosticTrace),
+    HttpHopUpdated(DiagnosticTrace),
+    HttpHopCompleted(DiagnosticTrace),
+    FingerprintUpdated(DiagnosticTrace),
+    SessionCompleted,
 }

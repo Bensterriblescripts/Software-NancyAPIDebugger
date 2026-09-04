@@ -97,7 +97,7 @@ pub(super) fn fail_trace(
 }
 
 pub(super) fn publish(trace: &DiagnosticTrace, progress: &Sender<DiagnosticProgress>) {
-    let _ = progress.send(DiagnosticProgress::Running(trace.clone()));
+    let _ = progress.send(DiagnosticProgress::HttpHopUpdated(trace.clone()));
 }
 
 pub(super) async fn wait_for<T, F>(

@@ -63,6 +63,13 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
                     trace.http.version.as_deref().unwrap_or("Pending"),
                 );
                 summary_row(ui, "Status", &trace.status_text());
+                summary_row(ui, "Web server", &trace.fingerprint.web_server);
+                summary_row(
+                    ui,
+                    "Fingerprint status",
+                    &trace.fingerprint.status.to_string(),
+                );
+                summary_row(ui, "Confidence", &trace.fingerprint.confidence);
                 summary_row(ui, "Final URL", &trace.http.final_url);
                 summary_row(ui, "Raw body capture", &trace.body.raw_capture_status());
                 summary_row(
@@ -71,6 +78,15 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
                     &trace.body.decoded_capture_status(),
                 );
             });
+        egui::CollapsingHeader::new("Evidence").show(ui, |ui| {
+            if trace.fingerprint.evidence.is_empty() {
+                ui.weak("None");
+            } else {
+                for evidence in &trace.fingerprint.evidence {
+                    ui.label(evidence);
+                }
+            }
+        });
         if let Some(error) = &trace.error {
             ui.add_space(12.0);
             ui.colored_label(
@@ -82,7 +98,7 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
             ui.add_space(12.0);
             ui.colored_label(egui::Color32::YELLOW, reason);
         }
-        if !trace.complete {
+        if !trace.complete || trace.fingerprint.is_active() {
             ui.add_space(12.0);
             ui.spinner();
         }

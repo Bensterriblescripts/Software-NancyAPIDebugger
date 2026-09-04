@@ -31,6 +31,8 @@ struct Arguments {
     protocol: CliProtocol,
     #[arg(long)]
     no_follow_redirects: bool,
+    #[arg(long)]
+    fingerprint_server: bool,
     #[arg(value_name = "URL")]
     url: String,
 }
@@ -79,6 +81,7 @@ pub(crate) fn run() -> ExitCode {
     request.body = body;
     request.protocol = arguments.protocol.into();
     request.follow_redirects = !arguments.no_follow_redirects;
+    request.fingerprint_server = arguments.fingerprint_server;
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -161,6 +164,17 @@ fn render_trace(output: &mut String, trace: &DiagnosticTrace) {
         "Complete: {}",
         if trace.complete { "Yes" } else { "No" }
     );
+    let _ = writeln!(output, "Web server: {}", trace.fingerprint.web_server);
+    let _ = writeln!(output, "Fingerprint status: {}", trace.fingerprint.status);
+    let _ = writeln!(output, "Confidence: {}", trace.fingerprint.confidence);
+    if trace.fingerprint.evidence.is_empty() {
+        let _ = writeln!(output, "Evidence: None");
+    } else {
+        let _ = writeln!(output, "Evidence:");
+        for evidence in &trace.fingerprint.evidence {
+            let _ = writeln!(output, "  {evidence}");
+        }
+    }
     if let Some(error) = &trace.error {
         let _ = writeln!(output, "Error: {}: {}", error.stage, error.message);
     } else {

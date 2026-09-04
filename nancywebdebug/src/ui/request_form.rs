@@ -118,6 +118,10 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App) -> bool {
                             }
                         });
                 });
+                ui.checkbox(
+                    &mut app.request_fingerprint_server,
+                    "Run intrusive server fingerprint scan (requires root and Nmap)",
+                );
                 egui::CollapsingHeader::new("Advanced authentication").show(ui, |ui| {
                     let profiles: Vec<ProfileSummary> = app
                         .auth_store

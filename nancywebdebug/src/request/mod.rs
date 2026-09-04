@@ -1,5 +1,6 @@
 mod body;
 mod dns;
+mod fingerprint;
 mod http;
 mod http3;
 mod runner;

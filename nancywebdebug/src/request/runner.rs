@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::dns::{finish_interrupted_dns_attempt, resolve_host};
+use super::fingerprint;
 use super::http::{self, add_automatic_headers, header_map_to_trace, parse_request_headers};
 use super::http3;
 use super::stages::*;
@@ -41,7 +42,8 @@ pub async fn run_diagnostic_session(
         )
         .await;
         let next_request = prepare_redirect(&mut trace, &mut visited_urls, redirects_followed);
-        let _ = progress.send(DiagnosticProgress::Finished(trace.clone()));
+        fingerprint::prepare_trace(&mut trace);
+        let _ = progress.send(DiagnosticProgress::HttpHopCompleted(trace.clone()));
         traces.push(trace);
         let Some(next_request) = next_request else {
             break;
@@ -50,6 +52,9 @@ pub async fn run_diagnostic_session(
         index += 1;
         request = next_request;
     }
+
+    fingerprint::run(&mut traces, cancel, &progress).await;
+    let _ = progress.send(DiagnosticProgress::SessionCompleted);
 
     traces
 }

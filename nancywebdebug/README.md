@@ -8,7 +8,7 @@ Nancy API Debugger provides desktop and command-line clients for inspecting HTTP
 - A graphical X11 or Wayland desktop session
 - Working OpenGL support through EGL or GLX
 
-### Ubuntu 24.04
+### Ubuntu 26.04
 
 Install the required build and runtime development packages:
 
@@ -47,10 +47,13 @@ For example:
 ```sh
 nancywebdebug-cli https://example.com
 nancywebdebug-cli --protocol http2 --no-follow-redirects https://example.com
+nancywebdebug-cli --fingerprint-server https://example.com
 nancywebdebug-cli -X POST -H "Content-Type: application/json" --body-file request.json https://example.com/api
 ```
 
-Available request options are `-X, --method`, repeatable `-H, --header`, `--body-file`, `--protocol auto|http1.1|http2|http3`, and `--no-follow-redirects`. Redirects are followed by default. The report includes every redirect hop and all captured diagnostic stages. Press Ctrl+C to cancel an active diagnostic.
+Available request options are `-X, --method`, repeatable `-H, --header`, `--body-file`, `--protocol auto|http1.1|http2|http3`, `--no-follow-redirects`, and `--fingerprint-server`. Redirects are followed by default. The report includes every redirect hop and all captured diagnostic stages. Press Ctrl+C to cancel an active diagnostic.
+
+Server fingerprinting is disabled by default. On Ubuntu, install Nmap with `sudo apt install nmap`, then run the GUI or CLI as root to permit its SYN scan. The scan probes every TCP port, performs service and OS detection, runs selected default or safe NSE scripts, and generates substantially more traffic than a normal request. Each distinct redirect origin is scanned at the remote IP selected by the connection diagnostics. On shared hosts, CDNs, load balancers, and shared IP addresses, the detected service may not belong exclusively to the requested hostname. Scanning can trigger network monitoring, rate limiting, or blocking even with the excluded intrusive script categories.
 
 Linux TLS verification uses the system CA certificates. Keep the `ca-certificates` package and its trust store current. DNS resolution depends on a valid `/etc/resolv.conf`. HTTP/3 uses QUIC and requires outbound UDP access, normally to the destination's HTTPS port. Firewalls or networks that block UDP can prevent HTTP/3 while HTTP/1.1 and HTTP/2 continue to work over TCP.
 
