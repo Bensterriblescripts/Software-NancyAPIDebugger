@@ -53,9 +53,6 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
         } else {
             "Prepared Request Header Fields"
         });
-        if !trace.http.request_header_representation.is_empty() {
-            ui.weak(&trace.http.request_header_representation);
-        }
         show_headers(ui, "sent_headers", &trace.http.request_headers);
         if let Some(serialized) = &trace.http.actual_http1_request_headers {
             egui::CollapsingHeader::new("Actual transmitted HTTP/1.1 header bytes").show(
@@ -65,8 +62,6 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
                     show_text(ui, text.as_ref());
                 },
             );
-        } else if matches!(trace.http.version.as_deref(), Some("HTTP/2" | "HTTP/3")) {
-            ui.weak("Decoded protocol fields are shown; compressed wire bytes are unavailable.");
         }
         ui.add_space(12.0);
         ui.heading("Response Headers");

@@ -1,0 +1,1267 @@
+use super::fingerprints::CapturedScriptResponse;
+use super::{
+    ConnectionRateLimiter, EndpointScan, ExposureScanRequest, HttpObservation, JavaScriptLibrary,
+    JavaScriptSource, JavaScriptVersionStatus, ProbeContext, ScanContext, non_public_reason,
+    single_http_request_with_limit,
+};
+use crate::diagnostics::DnsTrace;
+use crate::request::resolve_host;
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use html5ever::tendril::StrTendril;
+use html5ever::tokenizer::{
+    BufferQueue, StartTag, TagToken, Token, TokenSink, TokenSinkResult, Tokenizer,
+};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use regex::Regex;
+use semver::Version;
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
+use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex, OnceCell};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use url::Url;
+
+const CATALOG_URL: &str =
+    "https://raw.githubusercontent.com/RetireJS/retire.js/master/repository/jsrepository-v4.json";
+const MAX_SOURCES: usize = 256;
+const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CONCURRENT_FETCHES: usize = 8;
+const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOTAL_METADATA_BYTES: usize = 32 * 1024 * 1024;
+const ENRICHMENT_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub(super) const METADATA_LIMIT_ERROR: &str = "Technology metadata byte limit reached";
+pub(super) const ENRICHMENT_DEADLINE_ERROR: &str =
+    "Technology metadata enrichment deadline reached";
+pub(super) const ENRICHMENT_CANCELLED_ERROR: &str = "Technology analysis cancelled";
+
+type Resolution = Result<Vec<IpAddr>, String>;
+type ResolutionCell = Arc<OnceCell<Resolution>>;
+type ResolutionCache = Arc<Mutex<HashMap<String, ResolutionCell>>>;
+
+pub(super) struct AnalysisReport {
+    pub warnings: Vec<String>,
+    pub captured_responses: Vec<CapturedScriptResponse>,
+}
+
+#[derive(Clone)]
+struct CatalogEntry {
+    name: String,
+    npm_package: Option<String>,
+    uri: Vec<Regex>,
+    filename: Vec<Regex>,
+    content: Vec<Regex>,
+    replacements: Vec<ReplacementExtractor>,
+    hashes: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct ReplacementExtractor {
+    regex: Regex,
+    replacement: String,
+}
+
+#[derive(Clone)]
+pub(super) struct Fetched {
+    pub final_url: Option<Url>,
+    pub response: Option<HttpObservation>,
+    pub error: Option<String>,
+    pub captured_bytes: usize,
+}
+
+#[derive(Clone)]
+struct NpmResult {
+    latest: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+pub(super) struct MetadataFetchContext {
+    deadline: Instant,
+    resolutions: ResolutionCache,
+}
+
+pub(super) struct EnrichmentState {
+    deadline: Option<Instant>,
+    remaining_bytes: usize,
+    resolutions: ResolutionCache,
+    metadata: HashMap<String, Fetched>,
+}
+
+impl EnrichmentState {
+    pub(super) fn new() -> Self {
+        Self {
+            deadline: None,
+            remaining_bytes: MAX_TOTAL_METADATA_BYTES,
+            resolutions: Arc::new(Mutex::new(HashMap::new())),
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub(super) fn start(&mut self) {
+        self.deadline
+            .get_or_insert_with(|| Instant::now() + ENRICHMENT_TIMEOUT);
+    }
+
+    pub(super) fn fetch_context(&self) -> MetadataFetchContext {
+        MetadataFetchContext {
+            deadline: self
+                .deadline
+                .expect("metadata enrichment must be started before fetching"),
+            resolutions: self.resolutions.clone(),
+        }
+    }
+
+    pub(super) fn remaining_bytes(&self) -> usize {
+        self.remaining_bytes
+    }
+
+    pub(super) fn cached(&self, url: &str) -> Option<Fetched> {
+        self.metadata.get(url).cloned()
+    }
+
+    pub(super) fn store(&mut self, url: String, fetched: Fetched) {
+        if self.metadata.contains_key(&url) {
+            return;
+        }
+        self.remaining_bytes = self.remaining_bytes.saturating_sub(fetched.captured_bytes);
+        self.metadata.insert(url, fetched);
+    }
+
+    pub(super) fn stop_error(&self, cancel: &CancellationToken) -> Option<&'static str> {
+        if cancel.is_cancelled() {
+            Some(ENRICHMENT_CANCELLED_ERROR)
+        } else if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            Some(ENRICHMENT_DEADLINE_ERROR)
+        } else if self.remaining_bytes == 0 {
+            Some(METADATA_LIMIT_ERROR)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Default)]
+struct ScriptSink(RefCell<Vec<String>>);
+
+impl TokenSink for ScriptSink {
+    type Handle = ();
+
+    fn process_token(&self, token: Token, _: u64) -> TokenSinkResult<()> {
+        if let TagToken(tag) = token
+            && tag.kind == StartTag
+            && tag.name.as_ref().eq_ignore_ascii_case("script")
+            && let Some(source) = tag
+                .attrs
+                .iter()
+                .find(|attribute| attribute.name.local.as_ref().eq_ignore_ascii_case("src"))
+                .map(|attribute| attribute.value.to_string())
+                .filter(|source| !source.trim().is_empty())
+        {
+            self.0.borrow_mut().push(source);
+        }
+        TokenSinkResult::Continue
+    }
+}
+
+pub(super) fn discover_sources(root: &HttpObservation) -> Vec<String> {
+    if !(200..300).contains(&root.status) {
+        return Vec::new();
+    }
+    let Ok(base) = Url::parse(&root.url) else {
+        return Vec::new();
+    };
+    let input = BufferQueue::default();
+    input.push_back(StrTendril::from(
+        String::from_utf8_lossy(&root.body).as_ref(),
+    ));
+    let tokenizer = Tokenizer::new(ScriptSink::default(), Default::default());
+    let _ = tokenizer.feed(&input);
+    tokenizer.end();
+    let mut seen = HashSet::new();
+    let mut sources = Vec::new();
+    for reference in tokenizer.sink.0.into_inner() {
+        if let Ok(mut url) = base.join(&reference)
+            && matches!(url.scheme(), "http" | "https")
+        {
+            url.set_fragment(None);
+            let normalized = url.to_string();
+            if seen.insert(normalized.clone()) {
+                sources.push(normalized);
+            }
+        }
+    }
+    sources
+}
+
+pub(super) async fn analyze(
+    endpoints: &mut [EndpointScan],
+    request: &ExposureScanRequest,
+    cancel: &CancellationToken,
+    limiter: &ConnectionRateLimiter,
+    enrichment: &mut EnrichmentState,
+) -> AnalysisReport {
+    let catalog_result = load_catalog(request, cancel, limiter).await;
+    let (catalog, catalog_error) = match catalog_result {
+        Ok(catalog) => (catalog, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    let mut warnings = catalog_error
+        .as_ref()
+        .map(|error| vec![format!("JavaScript catalog unavailable: {error}")])
+        .unwrap_or_default();
+
+    let mut unique = Vec::new();
+    let mut seen = HashSet::new();
+    let mut source_locations: Vec<(usize, String)> = Vec::new();
+    for (endpoint_index, endpoint) in endpoints.iter_mut().enumerate() {
+        endpoint.javascript_sources.clear();
+        for source in std::mem::take(&mut endpoint.javascript_candidates) {
+            source_locations.push((endpoint_index, source.clone()));
+            if seen.insert(source.clone()) {
+                unique.push(source);
+            }
+        }
+    }
+
+    let skipped = unique.len().saturating_sub(MAX_SOURCES);
+    if skipped > 0 {
+        warnings.push(format!(
+            "JavaScript source limit reached: {skipped} unique source(s) were not fetched"
+        ));
+    }
+    let allowed = unique.iter().take(MAX_SOURCES).cloned().collect::<Vec<_>>();
+    let limited = unique
+        .iter()
+        .skip(MAX_SOURCES)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut source_cache = HashMap::new();
+    let mut capture_cache = HashMap::new();
+    let mut remaining = MAX_TOTAL_BYTES;
+    let mut reserved = 0usize;
+    let mut next_source = 0usize;
+    let mut pending = FuturesUnordered::new();
+    while next_source < allowed.len() || !pending.is_empty() {
+        if cancel.is_cancelled() {
+            pending.clear();
+            break;
+        }
+        while pending.len() < MAX_CONCURRENT_FETCHES && next_source < allowed.len() {
+            let available = remaining.saturating_sub(reserved);
+            if available == 0 {
+                break;
+            }
+            let body_limit = MAX_SOURCE_BYTES.min(available);
+            let source = allowed[next_source].clone();
+            next_source += 1;
+            reserved += body_limit;
+            pending.push(async move {
+                let fetched = fetch_url(&source, body_limit, &[], request, cancel, limiter).await;
+                (source, body_limit, fetched)
+            });
+        }
+        let Some((source, body_limit, fetched)) = pending.next().await else {
+            break;
+        };
+        reserved = reserved.saturating_sub(body_limit);
+        remaining = remaining.saturating_sub(fetched.captured_bytes);
+        if let Some(response) = fetched.response.as_ref() {
+            capture_cache.insert(source.clone(), response.clone());
+        }
+        let report = analyze_source(&source, fetched, &catalog, catalog_error.as_deref());
+        source_cache.insert(source, report);
+    }
+
+    if cancel.is_cancelled() {
+        let missing = allowed
+            .iter()
+            .filter(|source| !source_cache.contains_key(*source))
+            .cloned()
+            .collect::<Vec<_>>();
+        for source in missing {
+            source_cache.insert(
+                source.clone(),
+                unavailable_source(&source, "JavaScript analysis cancelled"),
+            );
+        }
+    } else if next_source < allowed.len() {
+        for source in &allowed[next_source..] {
+            source_cache.insert(
+                source.clone(),
+                unavailable_source(source, "32 MiB JavaScript scan limit reached"),
+            );
+        }
+    }
+    for source in &limited {
+        source_cache.insert(
+            source.clone(),
+            unavailable_source(source, "256-source JavaScript scan limit reached"),
+        );
+    }
+    enrich_libraries(
+        source_cache.values_mut(),
+        request,
+        cancel,
+        limiter,
+        enrichment,
+    )
+    .await;
+    let mut captured_responses = Vec::new();
+    for (endpoint_index, source) in source_locations {
+        if let Some(report) = source_cache.get(&source) {
+            endpoints[endpoint_index]
+                .javascript_sources
+                .push(report.clone());
+        }
+        if let Some(response) = capture_cache.get(&source) {
+            captured_responses.push(CapturedScriptResponse {
+                endpoint_index,
+                source_url: source,
+                response: response.clone(),
+            });
+        }
+    }
+    for endpoint in endpoints.iter_mut() {
+        endpoint
+            .javascript_sources
+            .sort_by(|left, right| left.source_url.cmp(&right.source_url));
+    }
+
+    AnalysisReport {
+        warnings,
+        captured_responses,
+    }
+}
+
+async fn enrich_libraries<'a>(
+    sources: impl Iterator<Item = &'a mut JavaScriptSource>,
+    request: &ExposureScanRequest,
+    cancel: &CancellationToken,
+    limiter: &ConnectionRateLimiter,
+    enrichment: &mut EnrichmentState,
+) {
+    enrichment.start();
+    let mut sources = sources.collect::<Vec<_>>();
+    let mut packages = HashMap::new();
+    for source in &sources {
+        for library in &source.libraries {
+            if library.installed_version.is_some()
+                && let Some(package) = &library.npm_package
+            {
+                packages
+                    .entry(package.to_ascii_lowercase())
+                    .or_insert_with(|| package.clone());
+            }
+        }
+    }
+    let mut requests = packages
+        .into_iter()
+        .map(|(key, package)| {
+            let url = npm_url(&package);
+            (key, package, url)
+        })
+        .collect::<Vec<_>>();
+    requests.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut results = HashMap::new();
+    let mut uncached = Vec::new();
+    for (key, package, url) in requests {
+        if let Some(fetched) = enrichment.cached(&url) {
+            results.insert(key, npm_result(fetched));
+        } else {
+            uncached.push((key, package, url));
+        }
+    }
+
+    let context = enrichment.fetch_context();
+    let mut pending = FuturesUnordered::new();
+    let mut next = 0usize;
+    let mut reserved = 0usize;
+    while next < uncached.len() || !pending.is_empty() {
+        while pending.len() < MAX_CONCURRENT_FETCHES && next < uncached.len() {
+            if enrichment.stop_error(cancel).is_some() {
+                break;
+            }
+            let available = enrichment.remaining_bytes().saturating_sub(reserved);
+            if available == 0 {
+                break;
+            }
+            let body_limit = MAX_METADATA_BYTES.min(available);
+            let (key, package, url) = uncached[next].clone();
+            next += 1;
+            reserved += body_limit;
+            let context = context.clone();
+            pending.push(async move {
+                let fetched = fetch_metadata_url(
+                    &url,
+                    body_limit,
+                    &[("Accept", "application/vnd.npm.install-v1+json")],
+                    request,
+                    cancel,
+                    limiter,
+                    context,
+                )
+                .await;
+                (key, package, url, body_limit, fetched)
+            });
+        }
+        let Some((key, _package, url, body_limit, fetched)) = pending.next().await else {
+            break;
+        };
+        reserved = reserved.saturating_sub(body_limit);
+        enrichment.store(url, fetched.clone());
+        results.insert(key, npm_result(fetched));
+    }
+    if next < uncached.len() {
+        let error = enrichment
+            .stop_error(cancel)
+            .unwrap_or(METADATA_LIMIT_ERROR)
+            .to_owned();
+        for (key, _, _) in &uncached[next..] {
+            results.insert(
+                key.clone(),
+                NpmResult {
+                    latest: None,
+                    error: Some(error.clone()),
+                },
+            );
+        }
+    }
+
+    for source in &mut sources {
+        for library in &mut source.libraries {
+            apply_npm_result(library, &results);
+        }
+    }
+}
+
+fn unavailable_source(source: &str, error: &str) -> JavaScriptSource {
+    JavaScriptSource {
+        source_url: source.to_owned(),
+        final_url: None,
+        http_status: None,
+        http_reason: None,
+        captured_size: 0,
+        truncated: false,
+        sha256: None,
+        libraries: Vec::new(),
+        retrieval_error: Some(error.to_owned()),
+        analysis_error: None,
+    }
+}
+
+async fn load_catalog(
+    request: &ExposureScanRequest,
+    cancel: &CancellationToken,
+    limiter: &ConnectionRateLimiter,
+) -> Result<Vec<CatalogEntry>, String> {
+    let fetched = fetch_url(
+        CATALOG_URL,
+        MAX_METADATA_BYTES,
+        &[("Accept", "application/json")],
+        request,
+        cancel,
+        limiter,
+    )
+    .await;
+    if let Some(error) = fetched.error {
+        return Err(error);
+    }
+    let response = fetched
+        .response
+        .ok_or_else(|| "catalog returned no response".to_owned())?;
+    if !(200..300).contains(&response.status) {
+        return Err(format!("catalog returned HTTP {}", response.status));
+    }
+    if response.body_truncated {
+        return Err("catalog response exceeded 4 MiB".to_owned());
+    }
+    parse_catalog(&response.body)
+}
+
+fn parse_catalog(bytes: &[u8]) -> Result<Vec<CatalogEntry>, String> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes)
+        .map_err(|error| format!("invalid catalog JSON: {error}"))?;
+    let root = value
+        .as_object()
+        .ok_or_else(|| "catalog root is not an object".to_owned())?;
+    let mut entries = Vec::new();
+    for (name, value) in root {
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let npm_package = object
+            .get("npmname")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let Some(extractors) = object
+            .get("extractors")
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        let uri = compile_extractors(extractors.get("uri"));
+        let filename = compile_extractors(extractors.get("filename"));
+        let content = compile_extractors(extractors.get("filecontent"));
+        let replacements = extractors
+            .get("filecontentreplace")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .filter_map(compile_replacement)
+            .collect();
+        let hashes = extractors
+            .get("hashes")
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flat_map(|hashes| hashes.iter())
+            .filter_map(|(hash, version)| {
+                version
+                    .as_str()
+                    .map(|version| (hash.to_ascii_lowercase(), version.to_owned()))
+            })
+            .collect();
+        entries.push(CatalogEntry {
+            name: name.clone(),
+            npm_package,
+            uri,
+            filename,
+            content,
+            replacements,
+            hashes,
+        });
+    }
+    Ok(entries)
+}
+
+fn compile_extractors(value: Option<&serde_json::Value>) -> Vec<Regex> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|pattern| {
+            let pattern = pattern.replace("§§version§§", "(?P<nancy_version>[0-9][0-9A-Za-z._-]*)");
+            Regex::new(&pattern).ok()
+        })
+        .collect()
+}
+
+fn compile_replacement(value: &str) -> Option<ReplacementExtractor> {
+    let inner = value.strip_prefix('/')?.strip_suffix('/')?;
+    let split = inner.rfind('/')?;
+    let (pattern, replacement) = inner.split_at(split);
+    let replacement = replacement.strip_prefix('/')?;
+    Some(ReplacementExtractor {
+        regex: Regex::new(pattern).ok()?,
+        replacement: replacement.to_owned(),
+    })
+}
+
+fn analyze_source(
+    source_url: &str,
+    fetched: Fetched,
+    catalog: &[CatalogEntry],
+    catalog_error: Option<&str>,
+) -> JavaScriptSource {
+    let final_url = fetched.final_url.as_ref().map(Url::to_string);
+    let Some(response) = fetched.response else {
+        return JavaScriptSource {
+            source_url: source_url.to_owned(),
+            final_url,
+            http_status: None,
+            http_reason: None,
+            captured_size: 0,
+            truncated: false,
+            sha256: None,
+            libraries: Vec::new(),
+            retrieval_error: fetched.error,
+            analysis_error: catalog_error.map(str::to_owned),
+        };
+    };
+    let sha256 = format!("{:x}", Sha256::digest(&response.body));
+    let captured_size = response.body.len();
+    let truncated = response.body_truncated;
+    let status = response.status;
+    let reason = response.reason.clone();
+    let retrieval_error = fetched
+        .error
+        .or_else(|| (!(200..300).contains(&status)).then(|| format!("HTTP {status} {reason}")));
+    let libraries = if retrieval_error.is_none() {
+        detect_libraries(
+            fetched.final_url.as_ref(),
+            source_url,
+            &response.body,
+            truncated,
+            catalog,
+        )
+    } else {
+        Vec::new()
+    };
+    JavaScriptSource {
+        source_url: source_url.to_owned(),
+        final_url,
+        http_status: Some(status),
+        http_reason: Some(reason),
+        captured_size,
+        truncated,
+        sha256: Some(sha256),
+        libraries,
+        retrieval_error,
+        analysis_error: catalog_error.map(str::to_owned),
+    }
+}
+
+fn detect_libraries(
+    final_url: Option<&Url>,
+    source_url: &str,
+    body: &[u8],
+    truncated: bool,
+    catalog: &[CatalogEntry],
+) -> Vec<JavaScriptLibrary> {
+    let effective_url = final_url.map(Url::as_str).unwrap_or(source_url).to_owned();
+    let parsed_source = Url::parse(source_url).ok();
+    let parsed_effective = final_url.cloned().or_else(|| parsed_source.clone());
+    let mut uris = vec![source_url];
+    if effective_url != source_url {
+        uris.push(&effective_url);
+    }
+    let filenames = parsed_source
+        .iter()
+        .chain(parsed_effective.iter())
+        .filter_map(|url| url.path_segments()?.next_back())
+        .collect::<HashSet<_>>();
+    let content = String::from_utf8_lossy(body);
+    let sha1 = (!truncated).then(|| format!("{:x}", Sha1::digest(body)));
+    let mut libraries = Vec::new();
+    for url in parsed_source.iter().chain(parsed_effective.iter()) {
+        for library in explicit_url_detection(Some(url)) {
+            merge_library(&mut libraries, library);
+        }
+    }
+
+    for entry in catalog {
+        let mut matches = Vec::new();
+        for regex in &entry.uri {
+            for uri in &uris {
+                if let Some(version) = regex_version(regex, uri) {
+                    matches.push((version, "RetireJS URI extractor".to_owned()));
+                }
+            }
+        }
+        for regex in &entry.filename {
+            for filename in &filenames {
+                if let Some(version) = regex_version(regex, filename) {
+                    matches.push((version, "RetireJS filename extractor".to_owned()));
+                }
+            }
+        }
+        for regex in &entry.content {
+            if let Some(version) = regex_version(regex, &content) {
+                matches.push((version, "RetireJS content extractor".to_owned()));
+            }
+        }
+        for extractor in &entry.replacements {
+            if let Some(captures) = extractor.regex.captures(&content) {
+                let mut version = String::new();
+                captures.expand(&extractor.replacement, &mut version);
+                if let Some(version) = normalize_extracted_version(version) {
+                    matches.push((version, "RetireJS replacement extractor".to_owned()));
+                }
+            }
+        }
+        if let Some(version) = sha1
+            .as_ref()
+            .and_then(|hash| entry.hashes.get(hash))
+            .cloned()
+        {
+            matches.push((version, "RetireJS SHA-1 hash extractor".to_owned()));
+        }
+        for (version, evidence) in matches {
+            merge_library(
+                &mut libraries,
+                JavaScriptLibrary {
+                    name: entry.name.clone(),
+                    npm_package: entry.npm_package.clone(),
+                    installed_version: Some(version),
+                    latest_version: None,
+                    status: JavaScriptVersionStatus::Unknown,
+                    evidence: vec![evidence],
+                    check_error: None,
+                },
+            );
+        }
+    }
+    libraries.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.installed_version.cmp(&right.installed_version))
+    });
+    libraries
+}
+
+fn regex_version(regex: &Regex, text: &str) -> Option<String> {
+    let version = regex
+        .captures(text)?
+        .name("nancy_version")?
+        .as_str()
+        .to_owned();
+    normalize_extracted_version(version)
+}
+
+fn normalize_extracted_version(mut version: String) -> Option<String> {
+    for suffix in [".min", "-min"] {
+        if let Some(candidate) = version.strip_suffix(suffix)
+            && Version::parse(candidate.trim_start_matches(['v', 'V'])).is_ok()
+        {
+            version.truncate(candidate.len());
+            break;
+        }
+    }
+    version_is_plausible(&version).then_some(version)
+}
+
+fn version_is_plausible(version: &str) -> bool {
+    !version.is_empty()
+        && version.starts_with(|character: char| character.is_ascii_digit())
+        && version.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+}
+
+fn merge_library(libraries: &mut Vec<JavaScriptLibrary>, incoming: JavaScriptLibrary) {
+    let matching = libraries.iter_mut().find(|existing| {
+        existing.installed_version == incoming.installed_version
+            && match (&existing.npm_package, &incoming.npm_package) {
+                (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                _ => existing.name.eq_ignore_ascii_case(&incoming.name),
+            }
+    });
+    if let Some(existing) = matching {
+        if existing.npm_package.is_none() {
+            existing.npm_package = incoming.npm_package;
+        }
+        existing.evidence.extend(incoming.evidence);
+        existing.evidence.sort();
+        existing.evidence.dedup();
+    } else {
+        libraries.push(incoming);
+    }
+}
+
+fn explicit_url_detection(url: Option<&Url>) -> Vec<JavaScriptLibrary> {
+    let Some(url) = url else {
+        return Vec::new();
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let segments = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let detected = match host.as_str() {
+        "cdn.jsdelivr.net" if segments.first() == Some(&"npm") => package_spec(&segments[1..])
+            .map(|(package, version)| (package, version, "jsDelivr npm URL".to_owned())),
+        "unpkg.com" | "www.unpkg.com" => package_spec(&segments)
+            .map(|(package, version)| (package, version, "unpkg URL".to_owned())),
+        "esm.sh" | "www.esm.sh" => {
+            let start = segments
+                .iter()
+                .position(|segment| !is_esm_prefix(segment))
+                .unwrap_or(segments.len());
+            package_spec(&segments[start..])
+                .map(|(package, version)| (package, version, "esm.sh URL".to_owned()))
+        }
+        "cdn.skypack.dev" => package_spec(&segments)
+            .map(|(package, version)| (package, version, "Skypack URL".to_owned())),
+        "cdnjs.cloudflare.com" if segments.get(0..2) == Some(&["ajax", "libs"]) => {
+            segments.get(2).zip(segments.get(3)).map(|(name, version)| {
+                (
+                    (*name).to_owned(),
+                    Some((*version).to_owned()),
+                    "cdnjs URL".to_owned(),
+                )
+            })
+        }
+        "ajax.googleapis.com" if segments.get(0..2) == Some(&["ajax", "libs"]) => {
+            segments.get(2).zip(segments.get(3)).map(|(name, version)| {
+                (
+                    (*name).to_owned(),
+                    Some((*version).to_owned()),
+                    "Google Hosted Libraries URL".to_owned(),
+                )
+            })
+        }
+        "code.jquery.com" => segments.last().and_then(|filename| {
+            Regex::new(r"^jquery-([0-9][0-9A-Za-z._-]*?)(?:\.min)?\.js$")
+                .ok()?
+                .captures(filename)
+                .map(|captures| {
+                    (
+                        "jquery".to_owned(),
+                        captures.get(1).map(|version| version.as_str().to_owned()),
+                        "jQuery CDN URL".to_owned(),
+                    )
+                })
+        }),
+        _ => None,
+    };
+    detected
+        .map(|(name, version, evidence)| JavaScriptLibrary {
+            npm_package: matches!(
+                host.as_str(),
+                "cdn.jsdelivr.net"
+                    | "unpkg.com"
+                    | "www.unpkg.com"
+                    | "esm.sh"
+                    | "www.esm.sh"
+                    | "cdn.skypack.dev"
+                    | "code.jquery.com"
+            )
+            .then(|| name.clone()),
+            name,
+            installed_version: version,
+            latest_version: None,
+            status: JavaScriptVersionStatus::Unknown,
+            evidence: vec![evidence],
+            check_error: None,
+        })
+        .into_iter()
+        .collect()
+}
+
+fn is_esm_prefix(segment: &str) -> bool {
+    segment.is_empty()
+        || segment
+            .strip_prefix('v')
+            .is_some_and(|value| value.chars().all(|character| character.is_ascii_digit()))
+}
+
+fn package_spec(segments: &[&str]) -> Option<(String, Option<String>)> {
+    let first = *segments.first()?;
+    if first.starts_with('@') {
+        let second = *segments.get(1)?;
+        let (name, version) = split_name_version(second);
+        return Some((format!("{first}/{name}"), version));
+    }
+    let (name, version) = split_name_version(first);
+    (!name.is_empty()).then(|| (name, version))
+}
+
+fn split_name_version(value: &str) -> (String, Option<String>) {
+    value
+        .rsplit_once('@')
+        .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+        .map_or_else(
+            || (value.to_owned(), None),
+            |(name, version)| (name.to_owned(), Some(version.to_owned())),
+        )
+}
+
+fn apply_npm_result(library: &mut JavaScriptLibrary, results: &HashMap<String, NpmResult>) {
+    let Some(installed) = library.installed_version.as_deref() else {
+        library.status = JavaScriptVersionStatus::Unverifiable;
+        library.check_error = Some("No exact installed version was detected".to_owned());
+        return;
+    };
+    let Some(package) = library.npm_package.clone() else {
+        library.status = JavaScriptVersionStatus::NotChecked;
+        library.check_error = Some("No verified npm package mapping".to_owned());
+        return;
+    };
+    let Some(result) = results.get(&package.to_ascii_lowercase()).cloned() else {
+        library.status = JavaScriptVersionStatus::NotChecked;
+        library.check_error = Some(METADATA_LIMIT_ERROR.to_owned());
+        return;
+    };
+    library.latest_version = result.latest.clone();
+    if let Some(error) = result.error {
+        library.status = JavaScriptVersionStatus::NotChecked;
+        library.check_error = Some(error);
+        return;
+    }
+    let Some(latest) = library.latest_version.as_deref() else {
+        library.status = JavaScriptVersionStatus::NotChecked;
+        library.check_error = Some("npm metadata has no stable release".to_owned());
+        return;
+    };
+    library.status = compare_versions(installed, latest);
+    if library.status == JavaScriptVersionStatus::Unverifiable {
+        library.check_error =
+            Some("Installed or latest version is not exact semantic versioning".to_owned());
+    }
+}
+
+fn npm_url(package: &str) -> String {
+    let package = package.to_ascii_lowercase();
+    let encoded = utf8_percent_encode(&package, NON_ALPHANUMERIC).to_string();
+    format!("https://registry.npmjs.org/{encoded}")
+}
+
+fn npm_result(fetched: Fetched) -> NpmResult {
+    let Some(response) = fetched.response else {
+        return NpmResult {
+            latest: None,
+            error: fetched
+                .error
+                .or_else(|| Some("npm returned no response".to_owned())),
+        };
+    };
+    if let Some(error) = fetched.error {
+        return NpmResult {
+            latest: None,
+            error: Some(error),
+        };
+    }
+    if !(200..300).contains(&response.status) {
+        return NpmResult {
+            latest: None,
+            error: Some(format!("npm returned HTTP {}", response.status)),
+        };
+    }
+    if response.body_truncated {
+        return NpmResult {
+            latest: None,
+            error: Some("npm metadata exceeded the remaining byte limit".to_owned()),
+        };
+    }
+    match serde_json::from_slice::<serde_json::Value>(&response.body) {
+        Ok(value) => NpmResult {
+            latest: value
+                .get("versions")
+                .and_then(serde_json::Value::as_object)
+                .into_iter()
+                .flat_map(|versions| versions.keys())
+                .filter_map(|version| Version::parse(version.trim_start_matches(['v', 'V'])).ok())
+                .filter(|version| version.pre.is_empty())
+                .max()
+                .map(|version| version.to_string())
+                .or_else(|| {
+                    value
+                        .get("dist-tags")
+                        .and_then(|tags| tags.get("latest"))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|version| Version::parse(version).ok())
+                        .filter(|version| version.pre.is_empty())
+                        .map(|version| version.to_string())
+                }),
+            error: None,
+        },
+        Err(error) => NpmResult {
+            latest: None,
+            error: Some(format!("invalid npm metadata: {error}")),
+        },
+    }
+}
+
+fn compare_versions(installed: &str, latest: &str) -> JavaScriptVersionStatus {
+    let Ok(installed) = Version::parse(installed.trim_start_matches(['v', 'V'])) else {
+        return JavaScriptVersionStatus::Unverifiable;
+    };
+    let Ok(latest) = Version::parse(latest.trim_start_matches(['v', 'V'])) else {
+        return JavaScriptVersionStatus::Unverifiable;
+    };
+    if !installed.pre.is_empty() || !latest.pre.is_empty() {
+        return JavaScriptVersionStatus::Prerelease;
+    }
+    match installed.cmp(&latest) {
+        Ordering::Equal => JavaScriptVersionStatus::Current,
+        Ordering::Greater => JavaScriptVersionStatus::NewerThanLatest,
+        Ordering::Less if installed.major != latest.major => JavaScriptVersionStatus::OutdatedMajor,
+        Ordering::Less if installed.minor != latest.minor => JavaScriptVersionStatus::OutdatedMinor,
+        Ordering::Less => JavaScriptVersionStatus::OutdatedPatch,
+    }
+}
+
+pub(super) async fn fetch_url(
+    initial_url: &str,
+    body_limit: usize,
+    headers: &[(&str, &str)],
+    request: &ExposureScanRequest,
+    cancel: &CancellationToken,
+    limiter: &ConnectionRateLimiter,
+) -> Fetched {
+    fetch_url_inner(
+        initial_url,
+        body_limit,
+        headers,
+        request,
+        cancel,
+        limiter,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn fetch_metadata_url(
+    initial_url: &str,
+    body_limit: usize,
+    headers: &[(&str, &str)],
+    request: &ExposureScanRequest,
+    cancel: &CancellationToken,
+    limiter: &ConnectionRateLimiter,
+    context: MetadataFetchContext,
+) -> Fetched {
+    if Instant::now() >= context.deadline {
+        return failed_fetch(initial_url, ENRICHMENT_DEADLINE_ERROR);
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => failed_fetch(initial_url, ENRICHMENT_CANCELLED_ERROR),
+        _ = tokio::time::sleep_until(context.deadline) => {
+            failed_fetch(initial_url, ENRICHMENT_DEADLINE_ERROR)
+        }
+        fetched = fetch_url_inner(
+            initial_url,
+            body_limit,
+            headers,
+            request,
+            cancel,
+            limiter,
+            Some(context.resolutions),
+        ) => fetched,
+    }
+}
+
+fn failed_fetch(initial_url: &str, error: &str) -> Fetched {
+    Fetched {
+        final_url: Url::parse(initial_url).ok(),
+        response: None,
+        error: Some(error.to_owned()),
+        captured_bytes: 0,
+    }
+}
+
+async fn fetch_url_inner(
+    initial_url: &str,
+    body_limit: usize,
+    headers: &[(&str, &str)],
+    request: &ExposureScanRequest,
+    cancel: &CancellationToken,
+    limiter: &ConnectionRateLimiter,
+    resolutions: Option<ResolutionCache>,
+) -> Fetched {
+    let mut url = match Url::parse(initial_url) {
+        Ok(mut url) => {
+            url.set_fragment(None);
+            url
+        }
+        Err(error) => {
+            return Fetched {
+                final_url: None,
+                response: None,
+                error: Some(format!("invalid URL: {error}")),
+                captured_bytes: 0,
+            };
+        }
+    };
+    let mut last_response = None;
+    let mut captured_bytes = 0usize;
+    for redirect_count in 0..=3 {
+        if cancel.is_cancelled() {
+            return Fetched {
+                final_url: Some(url),
+                response: last_response,
+                error: Some("Technology analysis cancelled".to_owned()),
+                captured_bytes,
+            };
+        }
+        if !matches!(url.scheme(), "http" | "https") {
+            return Fetched {
+                final_url: Some(url),
+                response: last_response,
+                error: Some("redirect destination is not HTTP(S)".to_owned()),
+                captured_bytes,
+            };
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Fetched {
+                final_url: Some(url),
+                response: last_response,
+                error: Some("URL credentials are not permitted".to_owned()),
+                captured_bytes,
+            };
+        }
+        let Some(hostname) = url.host_str().map(str::to_owned) else {
+            return Fetched {
+                final_url: Some(url),
+                response: last_response,
+                error: Some("URL has no hostname".to_owned()),
+                captured_bytes,
+            };
+        };
+        let addresses =
+            match resolve_public_addresses(&hostname, cancel, resolutions.as_ref()).await {
+                Ok(addresses) => addresses,
+                Err(error) => {
+                    return Fetched {
+                        final_url: Some(url),
+                        response: last_response,
+                        error: Some(error),
+                        captured_bytes,
+                    };
+                }
+            };
+        let port = match url.port_or_known_default() {
+            Some(port) => port,
+            None => {
+                return Fetched {
+                    final_url: Some(url),
+                    response: last_response,
+                    error: Some("URL has no usable port".to_owned()),
+                    captured_bytes,
+                };
+            }
+        };
+        let path = url_path(&url);
+        let scan = ScanContext {
+            hostname: &hostname,
+            request,
+            cancel,
+            limiter,
+        };
+        let mut response = None;
+        let mut errors = Vec::new();
+        let response_limit = body_limit.saturating_sub(captured_bytes);
+        if response_limit == 0 {
+            return Fetched {
+                final_url: Some(url),
+                response: last_response,
+                error: Some("Response metadata byte limit reached during redirects".to_owned()),
+                captured_bytes,
+            };
+        }
+        for ip in addresses {
+            let context = ProbeContext { ip, port, scan };
+            match single_http_request_with_limit(
+                context,
+                url.scheme(),
+                "GET",
+                &path,
+                headers,
+                response_limit,
+            )
+            .await
+            {
+                Ok(observation) => {
+                    response = Some(observation);
+                    break;
+                }
+                Err(error) => errors.push(format!("{ip}: {error}")),
+            }
+        }
+        let Some(mut response) = response else {
+            return Fetched {
+                final_url: Some(url),
+                response: last_response,
+                error: Some(errors.join("; ")),
+                captured_bytes,
+            };
+        };
+        captured_bytes = captured_bytes.saturating_add(response.body.len());
+        response.url = url.to_string();
+        let location = response.redirect_location.clone();
+        last_response = Some(response);
+        let Some(location) = location else {
+            return Fetched {
+                final_url: Some(url),
+                response: last_response,
+                error: None,
+                captured_bytes,
+            };
+        };
+        let next = match url.join(&location) {
+            Ok(mut next) => {
+                next.set_fragment(None);
+                next
+            }
+            Err(error) => {
+                return Fetched {
+                    final_url: Some(url),
+                    response: last_response,
+                    error: Some(format!("invalid redirect: {error}")),
+                    captured_bytes,
+                };
+            }
+        };
+        if redirect_count == 3 {
+            return Fetched {
+                final_url: Some(next),
+                response: last_response,
+                error: Some("redirect limit exceeded".to_owned()),
+                captured_bytes,
+            };
+        }
+        url = next;
+    }
+    unreachable!()
+}
+
+async fn resolve_public_addresses(
+    hostname: &str,
+    cancel: &CancellationToken,
+    cache: Option<&ResolutionCache>,
+) -> Result<Vec<IpAddr>, String> {
+    let Some(cache) = cache else {
+        return resolve_public_addresses_uncached(hostname, cancel).await;
+    };
+    let cell = {
+        let mut cache = cache.lock().await;
+        cache
+            .entry(hostname.to_ascii_lowercase())
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone()
+    };
+    cell.get_or_init(|| resolve_public_addresses_uncached(hostname, cancel))
+        .await
+        .clone()
+}
+
+async fn resolve_public_addresses_uncached(
+    hostname: &str,
+    cancel: &CancellationToken,
+) -> Result<Vec<IpAddr>, String> {
+    let addresses = if let Ok(address) = hostname.parse::<IpAddr>() {
+        vec![address]
+    } else {
+        let mut trace = DnsTrace::default();
+        tokio::select! {
+            _ = cancel.cancelled() => return Err("Technology analysis cancelled".to_owned()),
+            result = resolve_host(hostname, &mut trace) => result?,
+        }
+        trace.addresses
+    };
+    if addresses.is_empty() {
+        return Err(format!("{hostname} resolved to no addresses"));
+    }
+    if let Some((address, reason)) = addresses
+        .iter()
+        .find_map(|address| non_public_reason(*address).map(|reason| (*address, reason)))
+    {
+        return Err(format!(
+            "rejected non-public destination {address} for {hostname}: {reason}"
+        ));
+    }
+    let mut seen = HashSet::new();
+    Ok(addresses
+        .into_iter()
+        .filter(|address| seen.insert(*address))
+        .collect())
+}
+
+fn url_path(url: &Url) -> String {
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_owned(),
+    }
+}

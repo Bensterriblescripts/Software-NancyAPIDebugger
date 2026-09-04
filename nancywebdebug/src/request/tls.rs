@@ -12,7 +12,7 @@ use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
 
 #[derive(Debug, Default)]
-pub(super) struct CertificateCapture {
+pub(crate) struct CertificateCapture {
     pub(super) certificates: Vec<Vec<u8>>,
     validation_error: Option<String>,
 }
@@ -21,6 +21,63 @@ pub(super) struct CertificateCapture {
 struct CapturingVerifier {
     inner: PlatformVerifier,
     capture: Arc<Mutex<CertificateCapture>>,
+}
+
+#[derive(Debug)]
+struct PermissiveCapturingVerifier {
+    capture: Arc<Mutex<CertificateCapture>>,
+}
+
+impl ServerCertVerifier for PermissiveCapturingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let mut capture = self.capture.lock().unwrap();
+        capture.certificates.clear();
+        capture.certificates.push(end_entity.as_ref().to_vec());
+        capture
+            .certificates
+            .extend(intermediates.iter().map(|cert| cert.as_ref().to_vec()));
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
+    }
 }
 
 impl ServerCertVerifier for CapturingVerifier {
@@ -106,7 +163,39 @@ pub(super) fn make_tls_config(
     Ok(Arc::new(config))
 }
 
-pub(super) fn tls_trace_from_stream(
+pub(crate) fn make_exposure_tls_config(
+    tls13: Option<bool>,
+    permissive: bool,
+    offer_http2: bool,
+    capture: Arc<Mutex<CertificateCapture>>,
+) -> Result<Arc<ClientConfig>, String> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let builder = ClientConfig::builder_with_provider(provider.clone());
+    let builder = match tls13 {
+        Some(true) => builder.with_protocol_versions(&[&rustls::version::TLS13]),
+        Some(false) => builder.with_protocol_versions(&[&rustls::version::TLS12]),
+        None => builder.with_safe_default_protocol_versions(),
+    }
+    .map_err(|error| error.to_string())?;
+    let verifier: Arc<dyn ServerCertVerifier> = if permissive {
+        Arc::new(PermissiveCapturingVerifier { capture })
+    } else {
+        let inner = PlatformVerifier::new(provider).map_err(|error| error.to_string())?;
+        Arc::new(CapturingVerifier { inner, capture })
+    };
+    let mut config = builder
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    config.alpn_protocols = if offer_http2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
+    Ok(Arc::new(config))
+}
+
+pub(crate) fn tls_trace_from_stream(
     host: &str,
     stream: &TlsStream<TcpStream>,
     capture: &Arc<Mutex<CertificateCapture>>,
@@ -152,7 +241,7 @@ pub(super) fn tls_trace_from_quic(
     trace
 }
 
-pub(super) fn tls_trace_from_capture(
+pub(crate) fn tls_trace_from_capture(
     host: &str,
     capture: &Arc<Mutex<CertificateCapture>>,
 ) -> TlsTrace {
@@ -213,6 +302,8 @@ fn parse_certificate(der: &[u8]) -> CertificateTrace {
                 serial: certificate.raw_serial_as_string(),
                 not_before: certificate.validity().not_before.to_string(),
                 not_after: certificate.validity().not_after.to_string(),
+                not_before_unix: Some(certificate.validity().not_before.timestamp()),
+                not_after_unix: Some(certificate.validity().not_after.timestamp()),
                 subject_alt_names,
                 public_key_algorithm: certificate.public_key().algorithm.algorithm.to_id_string(),
                 signature_algorithm: certificate.signature_algorithm.algorithm.to_id_string(),
@@ -225,6 +316,8 @@ fn parse_certificate(der: &[u8]) -> CertificateTrace {
             serial: String::new(),
             not_before: String::new(),
             not_after: String::new(),
+            not_before_unix: None,
+            not_after_unix: None,
             subject_alt_names: Vec::new(),
             public_key_algorithm: String::new(),
             signature_algorithm: String::new(),

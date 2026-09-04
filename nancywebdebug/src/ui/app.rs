@@ -1,23 +1,30 @@
 use crate::auth::{self, ProfileInput, SharedAuthStore};
-use crate::diagnostics::*;
-use crate::request;
+use crate::exposure::fingerprints::{self, InitializationStatus};
+use crate::{
+    EndpointScan, ExposureScanProgress, ExposureScanReport, ExposureScanRequest,
+    ExposureScanStatus, ExposureScanTimings, PortState, run_exposure_scan_with_auth_store,
+};
 use eframe::egui;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use super::details::{
-    BodyView, DetailTab, show_body, show_http, show_network, show_summary, show_tls,
-};
-use super::request_form::{self, TimeoutInputs};
+use super::exposure_view::{self, DiagnosticViewState, ExposureDetailTab, ScanForm};
 use super::widgets::normalized_url;
 use super::{auth_profiles, history};
 
-struct ActiveRequest {
-    request_number: usize,
+struct ActiveScan {
+    scan_number: usize,
     cancel: CancellationToken,
+}
+
+pub(super) struct ExposureLiveState {
+    pub(super) message: String,
+    pub(super) completed: usize,
+    pub(super) total: usize,
+    pub(super) open_endpoints: Vec<EndpointScan>,
+    pub(super) last_endpoint: Option<EndpointScan>,
 }
 
 struct AuthEvent {
@@ -26,18 +33,7 @@ struct AuthEvent {
 }
 
 pub(super) struct App {
-    pub(super) show_new_request: bool,
-    pub(super) set_focus: bool,
-    pub(super) request_method: String,
-    pub(super) request_url: String,
-    pub(super) request_headers: String,
-    pub(super) request_body: String,
-    pub(super) request_protocol: ProtocolPreference,
-    pub(super) request_follow_redirects: bool,
-    pub(super) request_user_agent: UserAgentPreset,
-    pub(super) request_fingerprint_server: bool,
-    pub(super) selected_auth_profile: Option<u64>,
-    pub(super) timeout_inputs: TimeoutInputs,
+    pub(super) scan_form: ScanForm,
     pub(super) auth_store: SharedAuthStore,
     pub(super) show_auth_profiles: bool,
     pub(super) profile_editor_open: bool,
@@ -49,14 +45,16 @@ pub(super) struct App {
     auth_event_tx: Sender<AuthEvent>,
     auth_event_rx: Receiver<AuthEvent>,
     history: Vec<history::HistoryEntry>,
-    selected_index: Option<usize>,
-    active: Option<ActiveRequest>,
-    next_index: usize,
-    next_request_number: usize,
-    progress_tx: Sender<DiagnosticProgress>,
-    progress_rx: Receiver<DiagnosticProgress>,
-    detail_tab: DetailTab,
-    body_view: BodyView,
+    selected_scan: Option<usize>,
+    active: Option<ActiveScan>,
+    next_scan_number: usize,
+    progress_tx: Sender<ExposureScanProgress>,
+    progress_rx: Receiver<ExposureScanProgress>,
+    exposure_live: Option<ExposureLiveState>,
+    exposure_detail_tab: ExposureDetailTab,
+    diagnostic_view: DiagnosticViewState,
+    pub(super) show_exposure_scan: bool,
+    pub(super) scan_set_focus: bool,
     pub(super) ui_error: Option<String>,
 }
 
@@ -64,22 +62,8 @@ impl App {
     fn new() -> Self {
         let (progress_tx, progress_rx) = mpsc::channel();
         let (auth_event_tx, auth_event_rx) = mpsc::channel();
-        let request_defaults = DiagnosticRequest::default();
-        let timeout_inputs = TimeoutInputs::from_timeouts(&request_defaults.timeouts);
-        let request_body = String::from_utf8_lossy(&request_defaults.body).into_owned();
-        Self {
-            show_new_request: false,
-            set_focus: false,
-            request_method: request_defaults.method,
-            request_url: request_defaults.url,
-            request_headers: request_defaults.headers,
-            request_body,
-            request_protocol: request_defaults.protocol,
-            request_follow_redirects: request_defaults.follow_redirects,
-            request_user_agent: request_defaults.user_agent,
-            request_fingerprint_server: request_defaults.fingerprint_server,
-            selected_auth_profile: None,
-            timeout_inputs,
+        let app = Self {
+            scan_form: ScanForm::default(),
             auth_store: auth::AuthStore::shared(),
             show_auth_profiles: false,
             profile_editor_open: false,
@@ -91,155 +75,189 @@ impl App {
             auth_event_tx,
             auth_event_rx,
             history: Vec::new(),
-            selected_index: None,
+            selected_scan: None,
             active: None,
-            next_index: 1,
-            next_request_number: 1,
+            next_scan_number: 1,
             progress_tx,
             progress_rx,
-            detail_tab: DetailTab::Summary,
-            body_view: BodyView::Decoded,
+            exposure_live: None,
+            exposure_detail_tab: ExposureDetailTab::Diagnostics,
+            diagnostic_view: DiagnosticViewState::default(),
+            show_exposure_scan: true,
+            scan_set_focus: true,
             ui_error: None,
-        }
+        };
+        app.spawn_fingerprint_initialization(false);
+        app
     }
 
-    fn start_request(&mut self, diagnostic_request: DiagnosticRequest) -> Result<(), String> {
+    fn start_scan(&mut self, request: ExposureScanRequest) -> Result<(), String> {
+        if !matches!(
+            fingerprints::initialization_status(),
+            InitializationStatus::Ready { .. }
+        ) {
+            return Err("Web technology fingerprints are still initializing".to_owned());
+        }
         if self.active.is_some() {
-            return Err("A diagnostic request is already running".to_owned());
+            return Err("Another scan is already running".to_owned());
         }
-        if diagnostic_request.url.trim().is_empty() {
-            return Err("URL is empty".to_owned());
-        }
-        let index = self.next_index;
-        self.next_index += 1;
-        let request_number = self.next_request_number;
-        self.next_request_number += 1;
+        request.validate()?;
+        let scan_number = self.next_scan_number;
+        self.next_scan_number += 1;
         let cancel = CancellationToken::new();
-        self.active = Some(ActiveRequest {
-            request_number,
+        self.active = Some(ActiveScan {
+            scan_number,
             cancel: cancel.clone(),
         });
-        self.selected_index = Some(index);
-        self.detail_tab = DetailTab::Summary;
-        self.spawn_session(index, diagnostic_request, cancel);
+        self.selected_scan = Some(scan_number);
+        self.exposure_detail_tab = ExposureDetailTab::Diagnostics;
+        self.diagnostic_view = DiagnosticViewState::default();
+        self.exposure_live = Some(ExposureLiveState {
+            message: "Starting public exposure scan...".to_owned(),
+            completed: 0,
+            total: 0,
+            open_endpoints: Vec::new(),
+            last_endpoint: None,
+        });
+        self.spawn_scan(request, cancel);
         Ok(())
     }
 
-    fn start_form_request(&mut self) -> Result<(), String> {
-        let selected_auth = match self.selected_auth_profile {
-            Some(id) => Some(
-                self.auth_store
-                    .lock()
-                    .map_err(|_| "Authentication profile store is unavailable".to_owned())?
-                    .metadata(id)
-                    .ok_or_else(|| "Selected authentication profile no longer exists".to_owned())?,
-            ),
-            None => None,
-        };
-        let diagnostic_request = DiagnosticRequest {
-            method: self.request_method.clone(),
-            url: self.request_url.trim().to_owned(),
-            headers: self.request_headers.clone(),
-            body: Arc::from(self.request_body.as_bytes()),
-            protocol: self.request_protocol,
-            timeouts: self.timeout_inputs.to_timeouts(),
-            auth: selected_auth,
-            follow_redirects: self.request_follow_redirects,
-            user_agent: self.request_user_agent,
-            fingerprint_server: self.request_fingerprint_server,
-        };
-        self.start_request(diagnostic_request)
+    fn start_scan_form(&mut self) -> Result<(), String> {
+        let request = self.scan_form.to_request(&self.auth_store)?;
+        self.start_scan(request)
     }
 
     fn process_progress(&mut self) {
         while let Ok(update) = self.progress_rx.try_recv() {
-            let trace = match update {
-                DiagnosticProgress::HttpHopUpdated(trace)
-                | DiagnosticProgress::HttpHopCompleted(trace)
-                | DiagnosticProgress::FingerprintUpdated(trace) => trace,
-                DiagnosticProgress::SessionCompleted => {
+            match update {
+                ExposureScanProgress::Resolving { target } => {
+                    if let Some(live) = &mut self.exposure_live {
+                        live.message = format!("Resolving {target}...");
+                    }
+                }
+                ExposureScanProgress::Resolved {
+                    public_addresses,
+                    total_endpoints,
+                } => {
+                    if let Some(live) = &mut self.exposure_live {
+                        live.total = total_endpoints;
+                        live.message = format!(
+                            "Scanning {} public address{}...",
+                            public_addresses.len(),
+                            if public_addresses.len() == 1 {
+                                ""
+                            } else {
+                                "es"
+                            }
+                        );
+                    }
+                }
+                ExposureScanProgress::EndpointCompleted {
+                    completed,
+                    total,
+                    endpoint,
+                } => {
+                    if let Some(live) = &mut self.exposure_live {
+                        live.completed = completed;
+                        live.total = total;
+                        live.last_endpoint = Some(endpoint.clone());
+                        if endpoint.state == PortState::Open {
+                            live.open_endpoints.push(endpoint);
+                        }
+                        if completed == total {
+                            live.message = "Running endpoint diagnostics...".to_owned();
+                        }
+                    }
+                }
+                ExposureScanProgress::CrawlProgress {
+                    origin,
+                    queued,
+                    completed,
+                    current_url,
+                } => {
+                    if let Some(live) = &mut self.exposure_live {
+                        live.message =
+                            format!("Crawling {origin}: {completed}/{queued} — {current_url}");
+                    }
+                }
+                ExposureScanProgress::Completed(report) => {
+                    let scan_number = self
+                        .active
+                        .as_ref()
+                        .map(|active| active.scan_number)
+                        .unwrap_or_else(|| self.next_scan_number.saturating_sub(1));
+                    self.history.insert(
+                        0,
+                        history::HistoryEntry {
+                            scan_number,
+                            report,
+                        },
+                    );
+                    self.selected_scan = Some(scan_number);
+                    self.diagnostic_view = DiagnosticViewState::default();
                     self.active = None;
-                    continue;
+                    self.exposure_live = None;
                 }
-            };
-            let index = trace.index;
-            self.next_index = self.next_index.max(index + 1);
-            let request_number = self
-                .active
-                .as_ref()
-                .map(|active| active.request_number)
-                .or_else(|| {
-                    self.history
-                        .iter()
-                        .find(|item| item.trace.index == index)
-                        .map(|item| item.request_number)
-                })
-                .unwrap_or(index);
-            if let Some(existing) = self
-                .history
-                .iter_mut()
-                .find(|item| item.trace.index == trace.index)
-            {
-                existing.trace = trace;
-            } else {
-                if self.active.is_some() {
-                    self.selected_index = Some(index);
-                }
-                self.history.insert(
-                    0,
-                    history::HistoryEntry {
-                        request_number,
-                        trace,
-                    },
-                );
             }
         }
     }
 
-    fn spawn_session(
-        &self,
-        index: usize,
-        diagnostic_request: DiagnosticRequest,
-        cancel: CancellationToken,
-    ) {
+    fn spawn_scan(&self, request: ExposureScanRequest, cancel: CancellationToken) {
         let progress = self.progress_tx.clone();
         let auth_store = self.auth_store.clone();
         thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
+            match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
-                .build();
-            match runtime {
+                .build()
+            {
                 Ok(runtime) => {
-                    runtime.block_on(request::run_diagnostic_session(
-                        index,
-                        diagnostic_request,
+                    runtime.block_on(run_exposure_scan_with_auth_store(
+                        request,
                         auth_store,
                         cancel,
                         Some(progress),
                     ));
                 }
                 Err(error) => {
-                    let mut trace = DiagnosticTrace::new(index, diagnostic_request);
-                    trace.outcome = TraceOutcome::Failed;
-                    trace.complete = true;
-                    if let Some(stage) = trace.stages.first_mut() {
-                        stage.status = StageStatus::Failed;
-                        stage.detail = format!("Unable to create async runtime: {error}");
-                    }
-                    trace.error = Some(TraceError {
-                        stage: StageKind::Url,
-                        message: format!("Unable to create async runtime: {error}"),
-                    });
-                    if trace.request.fingerprint_server {
-                        trace.fingerprint.status = FingerprintStatus::Unavailable;
-                        trace.fingerprint.evidence.push(
-                            "Fingerprinting could not start because the async runtime was unavailable"
-                                .to_owned(),
-                        );
-                    }
-                    let _ = progress.send(DiagnosticProgress::HttpHopCompleted(trace));
-                    let _ = progress.send(DiagnosticProgress::SessionCompleted);
+                    let report = ExposureScanReport {
+                        request,
+                        hostname: String::new(),
+                        supplied_port: None,
+                        resolved_addresses: Vec::new(),
+                        ignored_addresses: Vec::new(),
+                        warnings: Vec::new(),
+                        endpoints: Vec::new(),
+                        findings: Vec::new(),
+                        crawl_observed_web_surfaces: Vec::new(),
+                        crawl_origins: Vec::new(),
+                        crawled_resources: Vec::new(),
+                        crawl_forms: Vec::new(),
+                        crawl_external_indicators: Vec::new(),
+                        crawl_skipped_urls: Vec::new(),
+                        timings: ExposureScanTimings::default(),
+                        status: ExposureScanStatus::Failed,
+                        error: Some(format!("Unable to create async runtime: {error}")),
+                    };
+                    let _ = progress.send(ExposureScanProgress::Completed(report));
                 }
+            }
+        });
+    }
+
+    fn spawn_fingerprint_initialization(&self, force: bool) {
+        if !fingerprints::start_initialization(force) {
+            return;
+        }
+        thread::spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(fingerprints::run_started_initialization()),
+                Err(error) => fingerprints::complete_runtime_failure(format!(
+                    "unable to create fingerprint initialization runtime: {error}"
+                )),
             }
         });
     }
@@ -286,9 +304,9 @@ impl App {
         if self.auth_busy.is_some() {
             return;
         }
-        let target = self.request_url.trim().to_owned();
+        let target = self.scan_form.diagnostic.url.trim().to_owned();
         if target.is_empty() {
-            self.ui_error = Some("Enter the request URL before capturing cookies".to_owned());
+            self.ui_error = Some("Enter the target URL before capturing cookies".to_owned());
             return;
         }
         self.auth_busy = Some(profile_id);
@@ -307,7 +325,7 @@ impl App {
 
     pub(super) fn new_profile_draft(&self) -> ProfileInput {
         let mut draft = ProfileInput::default();
-        if let Ok(url) = normalized_url(&self.request_url) {
+        if let Ok(url) = normalized_url(&self.scan_form.diagnostic.url) {
             draft.login_url = url.origin().ascii_serialization();
             draft.host_scope = url.host_str().unwrap_or_default().to_owned();
         }
@@ -330,17 +348,19 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_progress();
         self.process_auth_events();
+        let fingerprint_status = fingerprints::initialization_status();
+        let fingerprints_ready = matches!(fingerprint_status, InitializationStatus::Ready { .. });
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(active) = &self.active {
-                        if ui.button("Cancel Session").clicked() {
+                        if ui.button("Cancel Scan").clicked() {
                             active.cancel.cancel();
                         }
                         ui.spinner();
-                    } else if ui.button("Create Request").clicked() {
-                        self.show_new_request = true;
-                        self.set_focus = true;
+                    } else if ui.button("New Scan").clicked() {
+                        self.show_exposure_scan = true;
+                        self.scan_set_focus = true;
                     }
                 });
             });
@@ -350,70 +370,90 @@ impl eframe::App for App {
             if let Some(notice) = &self.auth_notice {
                 ui.weak(notice);
             }
+            match &fingerprint_status {
+                InitializationStatus::NotStarted | InitializationStatus::Pending => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading web technology fingerprints...");
+                    });
+                }
+                InitializationStatus::Ready {
+                    warning: Some(warning),
+                    using_curated_fallback,
+                } => {
+                    ui.colored_label(egui::Color32::YELLOW, warning);
+                    if *using_curated_fallback && ui.button("Retry fingerprint catalog").clicked() {
+                        self.spawn_fingerprint_initialization(true);
+                    }
+                }
+                InitializationStatus::Ready { warning: None, .. } => {}
+            }
         });
 
-        let resend = history::show(
+        let previous_scan = self.selected_scan;
+        let rescan = history::show(
             ctx,
             &self.history,
-            &mut self.selected_index,
-            self.active.is_some(),
+            &mut self.selected_scan,
+            self.active.is_some() || !fingerprints_ready,
         );
+        if self.selected_scan != previous_scan {
+            self.diagnostic_view = DiagnosticViewState::default();
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(index) = self.selected_index {
-                ui.horizontal_wrapped(|ui| {
-                    for tab in DetailTab::ALL {
-                        ui.selectable_value(&mut self.detail_tab, tab, tab.label());
-                    }
-                });
-                ui.separator();
-                if let Some(trace) = self
+            if let Some(scan_number) = self.selected_scan {
+                if let Some(report) = self
                     .history
                     .iter()
-                    .find(|item| item.trace.index == index)
-                    .map(|item| &item.trace)
+                    .find(|entry| entry.scan_number == scan_number)
+                    .map(|entry| &entry.report)
                 {
-                    match self.detail_tab {
-                        DetailTab::Summary => show_summary(ui, trace),
-                        DetailTab::Network => show_network(ui, trace),
-                        DetailTab::Tls => show_tls(ui, trace),
-                        DetailTab::Http => show_http(ui, trace),
-                        DetailTab::Body => show_body(ui, trace, &mut self.body_view),
-                    }
+                    ui.horizontal_wrapped(|ui| {
+                        for tab in ExposureDetailTab::ALL {
+                            ui.selectable_value(&mut self.exposure_detail_tab, tab, tab.label());
+                        }
+                    });
+                    ui.separator();
+                    exposure_view::show_report(
+                        ui,
+                        report,
+                        self.exposure_detail_tab,
+                        &mut self.diagnostic_view,
+                    );
+                } else if let Some(live) = &self.exposure_live {
+                    exposure_view::show_live(ui, live);
                 } else {
                     ui.spinner();
-                    ui.label("Waiting for the first trace stage...");
                 }
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.weak("Create a request to begin diagnostics.");
+                    ui.weak("Configure an advanced public exposure scan to begin.");
                 });
             }
         });
 
-        let send_form = request_form::show(ctx, self);
-
+        let start = exposure_view::show_dialog(ctx, self);
         if self.show_auth_profiles {
             auth_profiles::show(ctx, self);
         }
-
-        if send_form && self.active.is_none() {
-            match self.start_form_request() {
+        if start && self.active.is_none() {
+            match self.start_scan_form() {
                 Ok(()) => {
-                    self.show_new_request = false;
+                    self.show_exposure_scan = false;
                     self.ui_error = None;
                 }
                 Err(error) => self.ui_error = Some(error),
             }
         }
-        if let Some(request) = resend {
-            if let Err(error) = self.start_request(request) {
+        if let Some(request) = rescan {
+            if let Err(error) = self.start_scan(request) {
                 self.ui_error = Some(error);
             } else {
                 self.ui_error = None;
             }
         }
-        if self.active.is_some() || self.auth_busy.is_some() {
+        if self.active.is_some() || self.auth_busy.is_some() || !fingerprints_ready {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
@@ -441,6 +481,7 @@ pub fn run() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1700.0, 900.0])
+            .with_maximized(true)
             .with_active(true),
         ..Default::default()
     };

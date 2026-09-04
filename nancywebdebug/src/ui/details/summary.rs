@@ -1,10 +1,26 @@
 use crate::diagnostics::DiagnosticTrace;
 use eframe::egui;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::timeline;
 use crate::ui::widgets::display_url;
 
-pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
+pub(in crate::ui) fn show(
+    ui: &mut egui::Ui,
+    trace: &DiagnosticTrace,
+    request_chain: &[&DiagnosticTrace],
+) {
+    let urls = request_chain
+        .iter()
+        .map(|trace| display_url(trace))
+        .collect::<Vec<_>>();
+    let start_url = urls.first().copied().unwrap_or_else(|| display_url(trace));
+    let final_url = urls.last().copied().unwrap_or_else(|| display_url(trace));
+    let additional_redirects = if urls.len() > 2 {
+        urls[1..urls.len() - 1].join("\n")
+    } else {
+        "None".to_owned()
+    };
     let redirect_location = trace
         .http
         .response_headers
@@ -12,14 +28,17 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
         .find(|header| header.name.eq_ignore_ascii_case("location"))
         .map(|header| header.display_value().into_owned())
         .unwrap_or_else(|| "None".to_owned());
+    let (certificate_expiry, certificate_expiry_color) = certificate_expiry(trace);
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading("Diagnostic Summary");
-        ui.monospace(display_url(trace));
         egui::Grid::new("summary_grid")
             .striped(true)
             .show(ui, |ui| {
                 summary_row(ui, "Outcome", &trace.outcome.to_string());
                 summary_row(ui, "Method", &trace.request.method);
+                summary_row(ui, "Start URL", start_url);
+                summary_row(ui, "Additional Redirects", &additional_redirects);
+                summary_row(ui, "Final URL", final_url);
                 summary_row(
                     ui,
                     "Authentication",
@@ -63,6 +82,12 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
                     trace.http.version.as_deref().unwrap_or("Pending"),
                 );
                 summary_row(ui, "Status", &trace.status_text());
+                colored_summary_row(
+                    ui,
+                    "Certificate expiry",
+                    &certificate_expiry,
+                    certificate_expiry_color,
+                );
                 summary_row(ui, "Web server", &trace.fingerprint.web_server);
                 summary_row(
                     ui,
@@ -70,7 +95,6 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
                     &trace.fingerprint.status.to_string(),
                 );
                 summary_row(ui, "Confidence", &trace.fingerprint.confidence);
-                summary_row(ui, "Final URL", &trace.http.final_url);
                 summary_row(ui, "Raw body capture", &trace.body.raw_capture_status());
                 summary_row(
                     ui,
@@ -108,7 +132,36 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
 }
 
 pub(super) fn summary_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    colored_summary_row(ui, label, value, None);
+}
+
+fn colored_summary_row(ui: &mut egui::Ui, label: &str, value: &str, color: Option<egui::Color32>) {
     ui.strong(label);
-    ui.label(value);
+    if let Some(color) = color {
+        ui.colored_label(color, value);
+    } else {
+        ui.label(value);
+    }
     ui.end_row();
+}
+
+fn certificate_expiry(trace: &DiagnosticTrace) -> (String, Option<egui::Color32>) {
+    let days = trace
+        .tls
+        .as_ref()
+        .and_then(|tls| tls.certificates.first())
+        .and_then(|certificate| certificate.not_after_unix)
+        .and_then(|not_after| {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+            let now = i64::try_from(now.as_secs()).ok()?;
+            not_after.checked_sub(now)
+        })
+        .map(|seconds| seconds.div_euclid(86_400));
+
+    match days {
+        Some(days) if days < 7 => (format!("{days} days"), Some(egui::Color32::RED)),
+        Some(days) if days <= 30 => (format!("{days} days"), Some(egui::Color32::YELLOW)),
+        Some(days) => (format!("{days} days"), None),
+        None => ("Unknown".to_owned(), None),
+    }
 }

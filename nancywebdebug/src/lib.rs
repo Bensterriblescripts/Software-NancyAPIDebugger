@@ -1,15 +1,14 @@
 pub mod auth;
-mod cli;
 pub mod diagnostics;
+mod exposure;
+mod persistence;
 mod request;
 mod ui;
+mod web_server;
 
+pub use exposure::*;
 pub use request::run_diagnostic_session;
 
 pub fn run_gui() -> Result<(), eframe::Error> {
     ui::run()
-}
-
-pub fn run_cli() -> std::process::ExitCode {
-    cli::run()
 }

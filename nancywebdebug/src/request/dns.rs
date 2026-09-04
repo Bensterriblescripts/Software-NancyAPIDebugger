@@ -1,4 +1,5 @@
 use crate::diagnostics::{DnsAttempt, DnsRecord, DnsTrace};
+use futures_util::{StreamExt, stream};
 use hickory_resolver::config::ProtocolConfig;
 use hickory_resolver::proto::op::{Message, Query};
 use hickory_resolver::proto::rr::{Name, RData, RecordType};
@@ -11,7 +12,91 @@ use tokio::net::{TcpStream, UdpSocket};
 
 use super::stages::elapsed_ms;
 
-pub(super) async fn resolve_host(host: &str, trace: &mut DnsTrace) -> Result<(), String> {
+const LIMITED_RECORD_TYPES: &[RecordType] = &[RecordType::A, RecordType::AAAA, RecordType::CNAME];
+
+const EXHAUSTIVE_RECORD_TYPES: &[RecordType] = &[
+    RecordType::A,
+    RecordType::AAAA,
+    RecordType::ANAME,
+    RecordType::CAA,
+    RecordType::CDS,
+    RecordType::CDNSKEY,
+    RecordType::CERT,
+    RecordType::CNAME,
+    RecordType::CSYNC,
+    RecordType::DNSKEY,
+    RecordType::DS,
+    RecordType::HINFO,
+    RecordType::HTTPS,
+    RecordType::KEY,
+    RecordType::MX,
+    RecordType::NAPTR,
+    RecordType::NS,
+    RecordType::NSEC,
+    RecordType::NSEC3,
+    RecordType::NSEC3PARAM,
+    RecordType::NULL,
+    RecordType::OPENPGPKEY,
+    RecordType::PTR,
+    RecordType::RRSIG,
+    RecordType::SIG,
+    RecordType::SMIMEA,
+    RecordType::SOA,
+    RecordType::SRV,
+    RecordType::SSHFP,
+    RecordType::SVCB,
+    RecordType::TLSA,
+    RecordType::TXT,
+];
+
+pub(crate) async fn resolve_host(host: &str, trace: &mut DnsTrace) -> Result<(), String> {
+    let Some((name, name_servers, query_timeout)) = prepare_lookup(host, trace)? else {
+        return Ok(());
+    };
+    let mut seen_records = existing_record_keys(trace);
+    let mut seen_addresses = trace.addresses.iter().copied().collect();
+    for record_type in LIMITED_RECORD_TYPES.iter().copied() {
+        let result = lookup_record_type(&name, record_type, &name_servers, query_timeout).await;
+        merge_lookup_result(trace, result, &mut seen_records, &mut seen_addresses);
+    }
+    Ok(())
+}
+
+pub(crate) async fn resolve_host_exhaustive(
+    host: &str,
+    trace: &mut DnsTrace,
+) -> Result<(), String> {
+    let Some((name, name_servers, query_timeout)) = prepare_lookup(host, trace)? else {
+        return Ok(());
+    };
+    trace.incomplete_record_types = EXHAUSTIVE_RECORD_TYPES
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut seen_records = existing_record_keys(trace);
+    let mut seen_addresses = trace.addresses.iter().copied().collect();
+    let lookups = stream::iter(EXHAUSTIVE_RECORD_TYPES.iter().copied())
+        .map(|record_type| lookup_record_type(&name, record_type, &name_servers, query_timeout))
+        .buffer_unordered(EXHAUSTIVE_RECORD_TYPES.len());
+    tokio::pin!(lookups);
+    while let Some(result) = lookups.next().await {
+        merge_lookup_result(trace, result, &mut seen_records, &mut seen_addresses);
+    }
+    Ok(())
+}
+
+fn prepare_lookup(
+    host: &str,
+    trace: &mut DnsTrace,
+) -> Result<
+    Option<(
+        Name,
+        Vec<hickory_resolver::config::NameServerConfig>,
+        Duration,
+    )>,
+    String,
+> {
+    trace.incomplete_record_types.clear();
     if let Ok(ip) = IpAddr::from_str(host.trim_matches(['[', ']'])) {
         trace.configured_resolvers = vec!["Not used (IP literal)".to_owned()];
         trace.attempts = vec![DnsAttempt {
@@ -30,7 +115,7 @@ pub(super) async fn resolve_host(host: &str, trace: &mut DnsTrace) -> Result<(),
             value: ip.to_string(),
         }];
         trace.addresses = vec![ip];
-        return Ok(());
+        return Ok(None);
     }
 
     let (config, options) = hickory_resolver::system_conf::read_system_conf()
@@ -46,126 +131,116 @@ pub(super) async fn resolve_host(host: &str, trace: &mut DnsTrace) -> Result<(),
 
     let query_timeout = options.timeout.min(Duration::from_secs(2));
     let name = Name::from_ascii(host).map_err(|error| error.to_string())?;
+    Ok(Some((name, config.name_servers().to_vec(), query_timeout)))
+}
+
+struct DnsLookupResult {
+    record_type: RecordType,
+    trace: DnsTrace,
+}
+
+async fn lookup_record_type(
+    name: &Name,
+    record_type: RecordType,
+    name_servers: &[hickory_resolver::config::NameServerConfig],
+    query_timeout: Duration,
+) -> DnsLookupResult {
+    let mut trace = DnsTrace::default();
     let mut seen_records = HashSet::new();
     let mut seen_addresses = HashSet::new();
-    for record_type in [RecordType::A, RecordType::AAAA, RecordType::CNAME] {
-        for server in config.name_servers() {
-            let configured = configured_resolver_label(server);
-            let udp = server
-                .connections
-                .iter()
-                .find(|connection| connection.protocol == ProtocolConfig::Udp);
-            let tcp = server
-                .connections
-                .iter()
-                .find(|connection| connection.protocol == ProtocolConfig::Tcp);
-            let query = dns_query(&name, record_type)?;
-            if let Some(connection) = udp {
-                let remote = SocketAddr::new(server.ip, connection.port);
-                let (attempt_index, started) =
-                    start_dns_attempt(trace, record_type, configured.clone(), "UDP");
-                match tokio::time::timeout(query_timeout, query_dns_udp(remote, &query)).await {
-                    Ok(Ok((message, responder))) => {
-                        let truncated = message.metadata.truncation;
-                        finish_dns_attempt(
-                            trace,
-                            attempt_index,
-                            started,
-                            Some(responder),
-                            Some(message.metadata.response_code.to_string()),
-                            truncated.then(|| "Truncated response; retrying over TCP".to_owned()),
-                        );
-                        if truncated {
-                            let tcp_port = tcp.map_or(connection.port, |tcp| tcp.port);
-                            let remote = SocketAddr::new(server.ip, tcp_port);
-                            let (attempt_index, started) = start_dns_attempt(
-                                trace,
-                                record_type,
-                                configured.clone(),
-                                "TCP fallback",
-                            );
-                            match tokio::time::timeout(query_timeout, query_dns_tcp(remote, &query))
-                                .await
-                            {
-                                Ok(Ok((message, responder))) => {
-                                    let successful = dns_response_is_final(&message);
-                                    finish_dns_attempt(
-                                        trace,
-                                        attempt_index,
-                                        started,
-                                        Some(responder),
-                                        Some(message.metadata.response_code.to_string()),
-                                        None,
-                                    );
-                                    collect_dns_records(
-                                        trace,
-                                        &message,
-                                        &mut seen_records,
-                                        &mut seen_addresses,
-                                    );
-                                    if successful {
-                                        break;
-                                    }
-                                }
-                                Ok(Err(error)) => finish_dns_attempt(
-                                    trace,
-                                    attempt_index,
-                                    started,
-                                    None,
-                                    None,
-                                    Some(error),
-                                ),
-                                Err(_) => finish_dns_attempt(
-                                    trace,
-                                    attempt_index,
-                                    started,
-                                    None,
-                                    None,
-                                    Some("Resolver attempt timed out".to_owned()),
-                                ),
-                            }
-                        } else {
-                            let successful = dns_response_is_final(&message);
-                            collect_dns_records(
-                                trace,
-                                &message,
-                                &mut seen_records,
-                                &mut seen_addresses,
-                            );
-                            if successful {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        finish_dns_attempt(trace, attempt_index, started, None, None, Some(error))
-                    }
-                    Err(_) => finish_dns_attempt(
-                        trace,
+    let query = match dns_query(name, record_type) {
+        Ok(query) => query,
+        Err(error) => {
+            trace.attempts.push(DnsAttempt {
+                record_type: record_type.to_string(),
+                configured_resolver: "Not sent".to_owned(),
+                responder: None,
+                transport: "Unsupported".to_owned(),
+                response_code: None,
+                duration_ms: 0.0,
+                error: Some(error),
+            });
+            return DnsLookupResult { record_type, trace };
+        }
+    };
+    for server in name_servers {
+        let configured = configured_resolver_label(server);
+        let udp = server
+            .connections
+            .iter()
+            .find(|connection| connection.protocol == ProtocolConfig::Udp);
+        let tcp = server
+            .connections
+            .iter()
+            .find(|connection| connection.protocol == ProtocolConfig::Tcp);
+        if let Some(connection) = udp {
+            let remote = SocketAddr::new(server.ip, connection.port);
+            let (attempt_index, started) =
+                start_dns_attempt(&mut trace, record_type, configured.clone(), "UDP");
+            match tokio::time::timeout(query_timeout, query_dns_udp(remote, &query)).await {
+                Ok(Ok((message, responder))) => {
+                    let truncated = message.metadata.truncation;
+                    finish_dns_attempt(
+                        &mut trace,
                         attempt_index,
                         started,
-                        None,
-                        None,
-                        Some("Resolver attempt timed out".to_owned()),
-                    ),
-                }
-            } else if let Some(connection) = tcp {
-                let remote = SocketAddr::new(server.ip, connection.port);
-                let (attempt_index, started) =
-                    start_dns_attempt(trace, record_type, configured.clone(), "TCP");
-                match tokio::time::timeout(query_timeout, query_dns_tcp(remote, &query)).await {
-                    Ok(Ok((message, responder))) => {
-                        let successful = dns_response_is_final(&message);
-                        finish_dns_attempt(
-                            trace,
-                            attempt_index,
-                            started,
-                            Some(responder),
-                            Some(message.metadata.response_code.to_string()),
-                            None,
+                        Some(responder),
+                        Some(message.metadata.response_code.to_string()),
+                        truncated.then(|| "Truncated response; retrying over TCP".to_owned()),
+                    );
+                    if truncated {
+                        let tcp_port = tcp.map_or(connection.port, |tcp| tcp.port);
+                        let remote = SocketAddr::new(server.ip, tcp_port);
+                        let (attempt_index, started) = start_dns_attempt(
+                            &mut trace,
+                            record_type,
+                            configured.clone(),
+                            "TCP fallback",
                         );
+                        match tokio::time::timeout(query_timeout, query_dns_tcp(remote, &query))
+                            .await
+                        {
+                            Ok(Ok((message, responder))) => {
+                                let successful = dns_response_is_final(&message);
+                                finish_dns_attempt(
+                                    &mut trace,
+                                    attempt_index,
+                                    started,
+                                    Some(responder),
+                                    Some(message.metadata.response_code.to_string()),
+                                    None,
+                                );
+                                collect_dns_records(
+                                    &mut trace,
+                                    &message,
+                                    &mut seen_records,
+                                    &mut seen_addresses,
+                                );
+                                if successful {
+                                    break;
+                                }
+                            }
+                            Ok(Err(error)) => finish_dns_attempt(
+                                &mut trace,
+                                attempt_index,
+                                started,
+                                None,
+                                None,
+                                Some(error),
+                            ),
+                            Err(_) => finish_dns_attempt(
+                                &mut trace,
+                                attempt_index,
+                                started,
+                                None,
+                                None,
+                                Some("Resolver attempt timed out".to_owned()),
+                            ),
+                        }
+                    } else {
+                        let successful = dns_response_is_final(&message);
                         collect_dns_records(
-                            trace,
+                            &mut trace,
                             &message,
                             &mut seen_records,
                             &mut seen_addresses,
@@ -174,32 +249,118 @@ pub(super) async fn resolve_host(host: &str, trace: &mut DnsTrace) -> Result<(),
                             break;
                         }
                     }
-                    Ok(Err(error)) => {
-                        finish_dns_attempt(trace, attempt_index, started, None, None, Some(error))
-                    }
-                    Err(_) => finish_dns_attempt(
-                        trace,
+                }
+                Ok(Err(error)) => {
+                    finish_dns_attempt(&mut trace, attempt_index, started, None, None, Some(error))
+                }
+                Err(_) => finish_dns_attempt(
+                    &mut trace,
+                    attempt_index,
+                    started,
+                    None,
+                    None,
+                    Some("Resolver attempt timed out".to_owned()),
+                ),
+            }
+        } else if let Some(connection) = tcp {
+            let remote = SocketAddr::new(server.ip, connection.port);
+            let (attempt_index, started) =
+                start_dns_attempt(&mut trace, record_type, configured.clone(), "TCP");
+            match tokio::time::timeout(query_timeout, query_dns_tcp(remote, &query)).await {
+                Ok(Ok((message, responder))) => {
+                    let successful = dns_response_is_final(&message);
+                    finish_dns_attempt(
+                        &mut trace,
                         attempt_index,
                         started,
+                        Some(responder),
+                        Some(message.metadata.response_code.to_string()),
                         None,
-                        None,
-                        Some("Resolver attempt timed out".to_owned()),
-                    ),
+                    );
+                    collect_dns_records(
+                        &mut trace,
+                        &message,
+                        &mut seen_records,
+                        &mut seen_addresses,
+                    );
+                    if successful {
+                        break;
+                    }
                 }
-            } else {
-                trace.attempts.push(DnsAttempt {
-                    record_type: record_type.to_string(),
-                    configured_resolver: configured,
-                    responder: None,
-                    transport: "Unsupported".to_owned(),
-                    response_code: None,
-                    duration_ms: 0.0,
-                    error: Some("Resolver has no UDP or TCP connection".to_owned()),
-                });
+                Ok(Err(error)) => {
+                    finish_dns_attempt(&mut trace, attempt_index, started, None, None, Some(error))
+                }
+                Err(_) => finish_dns_attempt(
+                    &mut trace,
+                    attempt_index,
+                    started,
+                    None,
+                    None,
+                    Some("Resolver attempt timed out".to_owned()),
+                ),
+            }
+        } else {
+            trace.attempts.push(DnsAttempt {
+                record_type: record_type.to_string(),
+                configured_resolver: configured,
+                responder: None,
+                transport: "Unsupported".to_owned(),
+                response_code: None,
+                duration_ms: 0.0,
+                error: Some("Resolver has no UDP or TCP connection".to_owned()),
+            });
+        }
+    }
+    DnsLookupResult { record_type, trace }
+}
+
+fn existing_record_keys(trace: &DnsTrace) -> HashSet<(String, String, u32, String)> {
+    trace
+        .records
+        .iter()
+        .map(|record| {
+            (
+                record.name.clone(),
+                record.record_type.clone(),
+                record.ttl,
+                record.value.clone(),
+            )
+        })
+        .collect()
+}
+
+fn merge_lookup_result(
+    trace: &mut DnsTrace,
+    result: DnsLookupResult,
+    seen_records: &mut HashSet<(String, String, u32, String)>,
+    seen_addresses: &mut HashSet<IpAddr>,
+) {
+    let record_type = result.record_type.to_string();
+    trace
+        .incomplete_record_types
+        .retain(|pending| pending != &record_type);
+    trace.attempts.extend(result.trace.attempts);
+    for record in result.trace.records {
+        let key = (
+            record.name.clone(),
+            record.record_type.clone(),
+            record.ttl,
+            record.value.clone(),
+        );
+        if seen_records.insert(key) {
+            trace.records.push(record);
+        }
+    }
+    if matches!(
+        result.record_type,
+        RecordType::A | RecordType::AAAA | RecordType::CNAME
+    ) {
+        for address in result.trace.addresses {
+            if seen_addresses.insert(address) {
+                trace.addresses.push(address);
             }
         }
     }
-    Ok(())
 }
 
 fn start_dns_attempt(
@@ -328,18 +489,15 @@ fn dns_response_is_final(message: &Message) -> bool {
 fn collect_dns_records(
     trace: &mut DnsTrace,
     message: &Message,
-    seen_records: &mut HashSet<(String, RecordType, u32, String)>,
+    seen_records: &mut HashSet<(String, String, u32, String)>,
     seen_addresses: &mut HashSet<IpAddr>,
 ) {
     for record in message.all_sections() {
         let data = &record.data;
-        if !matches!(data, RData::A(_) | RData::AAAA(_) | RData::CNAME(_)) {
-            continue;
-        }
         let value = data.to_string();
         let key = (
             record.name.to_string(),
-            record.record_type(),
+            record.record_type().to_string(),
             record.ttl,
             value.clone(),
         );

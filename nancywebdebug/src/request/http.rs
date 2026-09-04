@@ -1,4 +1,5 @@
 use crate::diagnostics::*;
+use crate::exposure::ConnectionRateLimiter;
 use bytes::Bytes;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, USER_AGENT};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri, Version};
@@ -29,6 +30,7 @@ pub(super) async fn run(
     addresses: Vec<IpAddr>,
     cancel: CancellationToken,
     progress: Sender<DiagnosticProgress>,
+    limiter: Option<Arc<ConnectionRateLimiter>>,
 ) -> DiagnosticTrace {
     let tcp_started = begin_stage(&mut trace, StageKind::Tcp, &progress);
     let mut candidates = connect_tcp_all(
@@ -36,6 +38,7 @@ pub(super) async fn run(
         trace.url.port,
         trace.request.timeouts.transport,
         &cancel,
+        limiter.as_deref(),
     )
     .await;
     let selected = select_tcp_candidate(&mut candidates);

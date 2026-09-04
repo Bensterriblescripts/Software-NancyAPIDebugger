@@ -2,10 +2,12 @@ use crate::diagnostics::{
     ConnectionOutcome, DiagnosticProgress, DiagnosticTrace, StageKind, StageStatus,
     format_byte_size,
 };
+use crate::exposure::ConnectionRateLimiter;
 use bytes::{Buf, Bytes};
 use h3::error::Code;
 use http::{HeaderMap, Method, Version};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
@@ -22,6 +24,7 @@ pub(super) async fn run(
     addresses: Vec<IpAddr>,
     cancel: CancellationToken,
     progress: Sender<DiagnosticProgress>,
+    limiter: Option<Arc<ConnectionRateLimiter>>,
 ) -> DiagnosticTrace {
     let quic_started = begin_stage(&mut trace, StageKind::QuicTls, &progress);
     let mut candidates = connect_quic_all(
@@ -34,6 +37,7 @@ pub(super) async fn run(
             .transport
             .saturating_add(trace.request.timeouts.tls),
         &cancel,
+        limiter.as_deref(),
     )
     .await;
     let selected_index = candidates

@@ -255,6 +255,7 @@ pub struct DnsTrace {
     pub attempts: Vec<DnsAttempt>,
     pub records: Vec<DnsRecord>,
     pub addresses: Vec<IpAddr>,
+    pub incomplete_record_types: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +326,8 @@ pub struct CertificateTrace {
     pub serial: String,
     pub not_before: String,
     pub not_after: String,
+    pub not_before_unix: Option<i64>,
+    pub not_after_unix: Option<i64>,
     pub subject_alt_names: Vec<String>,
     pub public_key_algorithm: String,
     pub signature_algorithm: String,

@@ -1,4 +1,5 @@
 use crate::diagnostics::{ConnectionAttempt, ConnectionOutcome, ProtocolPreference};
+use crate::exposure::ConnectionRateLimiter;
 use futures_util::future::join_all;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -13,9 +14,9 @@ use tokio_util::sync::CancellationToken;
 use super::stages::{WaitError, address_family, elapsed_ms, wait_for};
 use super::tls::{CertificateCapture, make_tls_config};
 
-pub(super) struct TcpCandidate {
-    pub(super) attempt: ConnectionAttempt,
-    pub(super) stream: Option<TcpStream>,
+pub(crate) struct TcpCandidate {
+    pub(crate) attempt: ConnectionAttempt,
+    pub(crate) stream: Option<TcpStream>,
 }
 
 pub(super) struct QuicCandidate {
@@ -118,12 +119,30 @@ pub(super) async fn connect_tcp_all(
     port: u16,
     timeout: Duration,
     cancel: &CancellationToken,
+    limiter: Option<&ConnectionRateLimiter>,
 ) -> Vec<TcpCandidate> {
     let futures = addresses.iter().copied().map(|ip| {
         let cancel = cancel.clone();
         async move {
             let remote = SocketAddr::new(ip, port);
             let started = Instant::now();
+            if let Some(limiter) = limiter
+                && limiter.wait(&cancel).await.is_err()
+            {
+                return TcpCandidate {
+                    attempt: ConnectionAttempt {
+                        remote,
+                        local: None,
+                        family: address_family(ip),
+                        duration_ms: elapsed_ms(started),
+                        outcome: ConnectionOutcome::Cancelled,
+                        error: Some("Scan cancelled".to_owned()),
+                        os_error: None,
+                        selected: false,
+                    },
+                    stream: None,
+                };
+            }
             let socket = if ip.is_ipv4() {
                 TcpSocket::new_v4()
             } else {
@@ -228,6 +247,18 @@ pub(super) async fn connect_tcp_all(
     join_all(futures).await
 }
 
+pub(crate) async fn connect_tcp_endpoint(
+    ip: IpAddr,
+    port: u16,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> TcpCandidate {
+    connect_tcp_all(&[ip], port, timeout, cancel, None)
+        .await
+        .pop()
+        .expect("one TCP candidate")
+}
+
 pub(super) fn select_tcp_candidate(candidates: &mut [TcpCandidate]) -> Option<TcpStream> {
     let index = candidates
         .iter()
@@ -245,6 +276,7 @@ pub(super) async fn connect_quic_all(
     host: &str,
     timeout: Duration,
     cancel: &CancellationToken,
+    limiter: Option<&ConnectionRateLimiter>,
 ) -> Vec<QuicCandidate> {
     let futures = addresses.iter().copied().map(|ip| {
         let host = host.to_owned();
@@ -253,6 +285,25 @@ pub(super) async fn connect_quic_all(
             let remote = SocketAddr::new(ip, port);
             let started = Instant::now();
             let capture = Arc::new(Mutex::new(CertificateCapture::default()));
+            if let Some(limiter) = limiter
+                && limiter.wait(&cancel).await.is_err()
+            {
+                return QuicCandidate {
+                    attempt: ConnectionAttempt {
+                        remote,
+                        local: None,
+                        family: address_family(ip),
+                        duration_ms: elapsed_ms(started),
+                        outcome: ConnectionOutcome::Cancelled,
+                        error: Some("Scan cancelled".to_owned()),
+                        os_error: None,
+                        selected: false,
+                    },
+                    endpoint: None,
+                    connection: None,
+                    capture,
+                };
+            }
             let bind = if ip.is_ipv4() {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
             } else {

@@ -3,8 +3,6 @@ use eframe::egui;
 
 pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
     egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.heading("DNS");
-        ui.strong("Resolver configuration");
         if trace.dns.configured_resolvers.is_empty() {
             ui.weak("Pending");
         } else {
@@ -13,7 +11,13 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
             }
         }
         ui.add_space(8.0);
-        ui.strong("Resolver attempts and actual responders");
+        if !trace.dns.incomplete_record_types.is_empty() {
+            ui.strong(format!(
+                "DNS record inventory incomplete. Unfinished queries: {}",
+                trace.dns.incomplete_record_types.join(", ")
+            ));
+            ui.add_space(8.0);
+        }
         egui::Grid::new("dns_attempts")
             .striped(true)
             .show(ui, |ui| {
@@ -59,7 +63,6 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
 
         ui.add_space(18.0);
         ui.heading("Connection Attempts");
-        ui.label(format!("Mode: {}", trace.connection_mode));
         egui::Grid::new("connections").striped(true).show(ui, |ui| {
             ui.strong("Selected");
             ui.strong("Family");

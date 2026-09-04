@@ -1,13 +1,15 @@
 use crate::auth::{self, SharedAuthStore};
 use crate::diagnostics::*;
+use crate::exposure::{ConnectionRateLimiter, non_public_reason};
 use ::http::{HeaderName, HeaderValue, Method};
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use super::dns::{finish_interrupted_dns_attempt, resolve_host};
+use super::dns::{finish_interrupted_dns_attempt, resolve_host, resolve_host_exhaustive};
 use super::fingerprint;
 use super::http::{self, add_automatic_headers, header_map_to_trace, parse_request_headers};
 use super::http3;
@@ -17,10 +19,54 @@ const MAX_REDIRECTS: usize = 10;
 
 pub async fn run_diagnostic_session(
     initial_index: usize,
+    request: DiagnosticRequest,
+    auth_store: SharedAuthStore,
+    cancel: CancellationToken,
+    progress: Option<Sender<DiagnosticProgress>>,
+) -> Vec<DiagnosticTrace> {
+    run_diagnostic_session_inner(
+        initial_index,
+        request,
+        auth_store,
+        cancel,
+        progress,
+        None,
+        false,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_diagnostic_session_for_exposure(
+    initial_index: usize,
+    request: DiagnosticRequest,
+    auth_store: SharedAuthStore,
+    cancel: CancellationToken,
+    pinned_ip: IpAddr,
+    limiter: Arc<ConnectionRateLimiter>,
+) -> Vec<DiagnosticTrace> {
+    run_diagnostic_session_inner(
+        initial_index,
+        request,
+        auth_store,
+        cancel,
+        None,
+        Some(pinned_ip),
+        true,
+        Some(limiter),
+    )
+    .await
+}
+
+async fn run_diagnostic_session_inner(
+    initial_index: usize,
     mut request: DiagnosticRequest,
     auth_store: SharedAuthStore,
     cancel: CancellationToken,
     progress: Option<Sender<DiagnosticProgress>>,
+    mut pinned_ip: Option<IpAddr>,
+    public_only: bool,
+    limiter: Option<Arc<ConnectionRateLimiter>>,
 ) -> Vec<DiagnosticTrace> {
     let progress = progress.unwrap_or_else(|| {
         let (progress, receiver) = mpsc::channel();
@@ -39,10 +85,13 @@ pub async fn run_diagnostic_session(
             auth_store.clone(),
             cancel.clone(),
             progress.clone(),
+            pinned_ip.take(),
+            public_only,
+            limiter.clone(),
         )
         .await;
         let next_request = prepare_redirect(&mut trace, &mut visited_urls, redirects_followed);
-        fingerprint::prepare_trace(&mut trace);
+        fingerprint::analyze(&mut trace);
         let _ = progress.send(DiagnosticProgress::HttpHopCompleted(trace.clone()));
         traces.push(trace);
         let Some(next_request) = next_request else {
@@ -53,7 +102,6 @@ pub async fn run_diagnostic_session(
         request = next_request;
     }
 
-    fingerprint::run(&mut traces, cancel, &progress).await;
     let _ = progress.send(DiagnosticProgress::SessionCompleted);
 
     traces
@@ -65,8 +113,14 @@ async fn run_diagnostic_inner(
     auth_store: SharedAuthStore,
     cancel: CancellationToken,
     progress: Sender<DiagnosticProgress>,
+    pinned_ip: Option<IpAddr>,
+    public_only: bool,
+    limiter: Option<Arc<ConnectionRateLimiter>>,
 ) -> DiagnosticTrace {
     let mut trace = DiagnosticTrace::new(index, request);
+    if let Some(ip) = pinned_ip {
+        trace.connection_mode = format!("Pinned exposure endpoint ({ip})");
+    }
     let url_started = begin_stage(&mut trace, StageKind::Url, &progress);
     let normalized = normalize_url_input(&trace.request.url);
     let mut url = match Url::parse(&normalized) {
@@ -268,35 +322,23 @@ async fn run_diagnostic_inner(
     }
 
     let dns_started = begin_stage(&mut trace, StageKind::Dns, &progress);
-    let dns_result = wait_for(
-        trace.request.timeouts.dns,
-        &cancel,
-        resolve_host(&host, &mut trace.dns),
-    )
-    .await;
-    let addresses = match dns_result {
-        Ok(Ok(())) => {
-            let addresses = trace.dns.addresses.clone();
-            if addresses.is_empty() {
-                return fail_trace(
-                    trace,
-                    StageKind::Dns,
-                    StageStatus::Failed,
-                    dns_started,
-                    "DNS returned no A or AAAA addresses".to_owned(),
-                    &progress,
-                );
-            }
-            finish_stage(
-                &mut trace,
-                StageKind::Dns,
-                StageStatus::Succeeded,
-                dns_started,
-                format!("{} address(es)", addresses.len()),
-                &progress,
-            );
-            addresses
-        }
+    let dns_result = if public_only {
+        wait_for(
+            trace.request.timeouts.dns,
+            &cancel,
+            resolve_host(&host, &mut trace.dns),
+        )
+        .await
+    } else {
+        wait_for(
+            trace.request.timeouts.dns,
+            &cancel,
+            resolve_host_exhaustive(&host, &mut trace.dns),
+        )
+        .await
+    };
+    let inventory_timed_out = match dns_result {
+        Ok(Ok(())) => false,
         Ok(Err(error)) => {
             return fail_trace(
                 trace,
@@ -309,14 +351,17 @@ async fn run_diagnostic_inner(
         }
         Err(WaitError::TimedOut) => {
             finish_interrupted_dns_attempt(&mut trace.dns, dns_started, "DNS stage timed out");
-            return fail_trace(
-                trace,
-                StageKind::Dns,
-                StageStatus::TimedOut,
-                dns_started,
-                "DNS stage timed out".to_owned(),
-                &progress,
-            );
+            if public_only || trace.dns.addresses.is_empty() {
+                return fail_trace(
+                    trace,
+                    StageKind::Dns,
+                    StageStatus::TimedOut,
+                    dns_started,
+                    "DNS stage timed out".to_owned(),
+                    &progress,
+                );
+            }
+            true
         }
         Err(WaitError::Cancelled) => {
             finish_interrupted_dns_attempt(&mut trace.dns, dns_started, "Request cancelled");
@@ -330,11 +375,69 @@ async fn run_diagnostic_inner(
             );
         }
     };
+    let mut addresses = trace.dns.addresses.clone();
+    if let Some(ip) = pinned_ip {
+        if public_only && non_public_reason(ip).is_some() {
+            return fail_trace(
+                trace,
+                StageKind::Dns,
+                StageStatus::Failed,
+                dns_started,
+                format!("Pinned destination {ip} is not publicly routable"),
+                &progress,
+            );
+        }
+        addresses.clear();
+        addresses.push(ip);
+    } else {
+        if addresses.is_empty() {
+            return fail_trace(
+                trace,
+                StageKind::Dns,
+                StageStatus::Failed,
+                dns_started,
+                "DNS returned no A or AAAA addresses".to_owned(),
+                &progress,
+            );
+        }
+        if public_only {
+            addresses.retain(|address| non_public_reason(*address).is_none());
+            if addresses.is_empty() {
+                return fail_trace(
+                    trace,
+                    StageKind::Dns,
+                    StageStatus::Failed,
+                    dns_started,
+                    "Destination has no publicly routable A or AAAA address".to_owned(),
+                    &progress,
+                );
+            }
+        }
+    }
+    let mut dns_detail = if pinned_ip.is_some() {
+        format!("Pinned to {}", addresses[0])
+    } else {
+        format!("{} public address(es)", addresses.len())
+    };
+    if inventory_timed_out {
+        dns_detail.push_str(&format!(
+            "; record inventory incomplete ({} query type(s) unfinished)",
+            trace.dns.incomplete_record_types.len()
+        ));
+    }
+    finish_stage(
+        &mut trace,
+        StageKind::Dns,
+        StageStatus::Succeeded,
+        dns_started,
+        dns_detail,
+        &progress,
+    );
 
     if trace.request.protocol == ProtocolPreference::Http3 {
-        http3::run(trace, method, headers, addresses, cancel, progress).await
+        http3::run(trace, method, headers, addresses, cancel, progress, limiter).await
     } else {
-        http::run(trace, method, headers, addresses, cancel, progress).await
+        http::run(trace, method, headers, addresses, cancel, progress, limiter).await
     }
 }
 

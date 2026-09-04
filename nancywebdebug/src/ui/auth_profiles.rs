@@ -226,7 +226,7 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App) {
             .and_then(|mut store| store.save(app.editing_auth_profile, &app.profile_draft));
         match result {
             Ok(id) => {
-                app.selected_auth_profile = Some(id);
+                app.scan_form.diagnostic.selected_auth_profile = Some(id);
                 app.profile_draft = ProfileInput::default();
                 app.editing_auth_profile = None;
                 app.profile_editor_open = false;
@@ -248,8 +248,8 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App) {
             .map(|mut store| store.delete(id))
             .unwrap_or(false);
         if deleted {
-            if app.selected_auth_profile == Some(id) {
-                app.selected_auth_profile = None;
+            if app.scan_form.diagnostic.selected_auth_profile == Some(id) {
+                app.scan_form.diagnostic.selected_auth_profile = None;
             }
             if app.editing_auth_profile == Some(id) {
                 app.profile_draft = ProfileInput::default();
