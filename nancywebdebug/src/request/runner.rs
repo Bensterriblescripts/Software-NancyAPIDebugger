@@ -1,6 +1,6 @@
 use crate::auth::{self, SharedAuthStore};
 use crate::diagnostics::*;
-use crate::exposure::{ConnectionRateLimiter, non_public_reason};
+use crate::network::{ConnectionRateLimiter, non_public_reason};
 use ::http::{HeaderName, HeaderValue, Method};
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -194,10 +194,32 @@ async fn run_diagnostic_inner(
     );
 
     let authentication_started = begin_stage(&mut trace, StageKind::Authentication, &progress);
+    let client_certificate = if let Some(profile_id) = trace
+        .request
+        .client_certificate
+        .as_ref()
+        .map(|profile| profile.profile_id)
+    {
+        match auth::resolve_client_certificate(auth_store.clone(), profile_id, url.as_str()) {
+            Ok(certificate) => Some(certificate),
+            Err(error) => {
+                return fail_trace(
+                    trace,
+                    StageKind::Authentication,
+                    StageStatus::Failed,
+                    authentication_started,
+                    error,
+                    &progress,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let resolved_auth =
         if let Some(profile_id) = trace.request.auth.as_ref().map(|auth| auth.profile_id) {
             match auth::resolve(
-                auth_store,
+                auth_store.clone(),
                 profile_id,
                 url.as_str(),
                 trace.request.timeouts.authentication,
@@ -211,7 +233,14 @@ async fn run_diagnostic_inner(
                         StageKind::Authentication,
                         StageStatus::Succeeded,
                         authentication_started,
-                        resolved.detail.clone(),
+                        if let Some(certificate) = &client_certificate {
+                            format!(
+                                "{}; mTLS identity '{}'",
+                                resolved.detail, certificate.profile_name
+                            )
+                        } else {
+                            resolved.detail.clone()
+                        },
                         &progress,
                     );
                     Some(resolved)
@@ -240,7 +269,10 @@ async fn run_diagnostic_inner(
                 StageKind::Authentication,
                 StageStatus::Skipped,
                 authentication_started,
-                "No authentication profile".to_owned(),
+                client_certificate.as_ref().map_or_else(
+                    || "No authentication profile".to_owned(),
+                    |certificate| format!("mTLS identity '{}'", certificate.profile_name),
+                ),
                 &progress,
             );
             None
@@ -435,9 +467,29 @@ async fn run_diagnostic_inner(
     );
 
     if trace.request.protocol == ProtocolPreference::Http3 {
-        http3::run(trace, method, headers, addresses, cancel, progress, limiter).await
+        http3::run(
+            trace,
+            method,
+            headers,
+            addresses,
+            cancel,
+            progress,
+            limiter,
+            client_certificate,
+        )
+        .await
     } else {
-        http::run(trace, method, headers, addresses, cancel, progress, limiter).await
+        http::run(
+            trace,
+            method,
+            headers,
+            addresses,
+            cancel,
+            progress,
+            limiter,
+            client_certificate,
+        )
+        .await
     }
 }
 
@@ -501,8 +553,21 @@ fn redirect_request(trace: &DiagnosticTrace, target: String) -> DiagnosticReques
         removed_headers.extend(["authorization", "cookie", "proxy-authorization"]);
         request.auth = None;
     }
+    if redirect_crosses_host(&trace.url.normalized, &target) {
+        request.client_certificate = None;
+    }
     request.headers = remove_headers(&request.headers, &removed_headers);
     request
+}
+
+fn redirect_crosses_host(source: &str, target: &str) -> bool {
+    match (Url::parse(source), Url::parse(target)) {
+        (Ok(source), Ok(target)) => source
+            .host_str()
+            .zip(target.host_str())
+            .is_none_or(|(source, target)| !source.eq_ignore_ascii_case(target)),
+        _ => true,
+    }
 }
 
 fn redirect_crosses_origin(source: &str, target: &str) -> bool {

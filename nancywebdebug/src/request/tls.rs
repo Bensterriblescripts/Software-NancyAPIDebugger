@@ -1,6 +1,11 @@
-use crate::diagnostics::{CertificateTrace, ProtocolPreference, TlsTrace};
+use crate::auth::LoadedClientCertificate;
+use crate::diagnostics::{
+    CertificateTrace, ClientAuthObservation, ClientAuthStatus, ProtocolPreference, TlsTrace,
+};
+use rustls::client::ResolvesClientCert;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_platform_verifier::Verifier as PlatformVerifier;
 use sha2::{Digest, Sha256};
@@ -14,7 +19,31 @@ use x509_parser::parse_x509_certificate;
 #[derive(Debug, Default)]
 pub(crate) struct CertificateCapture {
     pub(super) certificates: Vec<Vec<u8>>,
+    pub(super) ocsp_response: Vec<u8>,
     validation_error: Option<String>,
+    client_certificate_requested: bool,
+    client_certificate_profile: Option<String>,
+}
+
+#[derive(Debug)]
+struct TrackingClientCertResolver {
+    capture: Arc<Mutex<CertificateCapture>>,
+    certified_key: Option<Arc<CertifiedKey>>,
+}
+
+impl ResolvesClientCert for TrackingClientCertResolver {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        self.capture.lock().unwrap().client_certificate_requested = true;
+        self.certified_key.clone()
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -34,7 +63,7 @@ impl ServerCertVerifier for PermissiveCapturingVerifier {
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
+        ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         let mut capture = self.capture.lock().unwrap();
@@ -43,6 +72,7 @@ impl ServerCertVerifier for PermissiveCapturingVerifier {
         capture
             .certificates
             .extend(intermediates.iter().map(|cert| cert.as_ref().to_vec()));
+        capture.ocsp_response = ocsp_response.to_vec();
         Ok(ServerCertVerified::assertion())
     }
 
@@ -96,6 +126,8 @@ impl ServerCertVerifier for CapturingVerifier {
             capture
                 .certificates
                 .extend(intermediates.iter().map(|cert| cert.as_ref().to_vec()));
+            capture.ocsp_response = ocsp_response.to_vec();
+            capture.validation_error = None;
         }
         let result = self.inner.verify_server_cert(
             end_entity,
@@ -137,19 +169,28 @@ pub(super) fn make_tls_config(
     protocol: ProtocolPreference,
     capture: Arc<Mutex<CertificateCapture>>,
     http3: bool,
+    client_certificate: Option<&LoadedClientCertificate>,
 ) -> Result<Arc<ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let verifier = PlatformVerifier::new(provider.clone()).map_err(|error| error.to_string())?;
     let verifier = CapturingVerifier {
         inner: verifier,
-        capture,
+        capture: capture.clone(),
+    };
+    if let Some(client_certificate) = client_certificate {
+        capture.lock().unwrap().client_certificate_profile =
+            Some(client_certificate.profile_name.clone());
+    }
+    let resolver = TrackingClientCertResolver {
+        capture: capture.clone(),
+        certified_key: client_certificate.map(|certificate| certificate.certified_key.clone()),
     };
     let mut config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|error| error.to_string())?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
+        .with_client_cert_resolver(Arc::new(resolver));
     config.alpn_protocols = if http3 {
         vec![b"h3".to_vec()]
     } else {
@@ -168,6 +209,7 @@ pub(crate) fn make_exposure_tls_config(
     permissive: bool,
     offer_http2: bool,
     capture: Arc<Mutex<CertificateCapture>>,
+    client_certificate: Option<&LoadedClientCertificate>,
 ) -> Result<Arc<ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let builder = ClientConfig::builder_with_provider(provider.clone());
@@ -178,15 +220,28 @@ pub(crate) fn make_exposure_tls_config(
     }
     .map_err(|error| error.to_string())?;
     let verifier: Arc<dyn ServerCertVerifier> = if permissive {
-        Arc::new(PermissiveCapturingVerifier { capture })
+        Arc::new(PermissiveCapturingVerifier {
+            capture: capture.clone(),
+        })
     } else {
         let inner = PlatformVerifier::new(provider).map_err(|error| error.to_string())?;
-        Arc::new(CapturingVerifier { inner, capture })
+        Arc::new(CapturingVerifier {
+            inner,
+            capture: capture.clone(),
+        })
+    };
+    if let Some(client_certificate) = client_certificate {
+        capture.lock().unwrap().client_certificate_profile =
+            Some(client_certificate.profile_name.clone());
+    }
+    let resolver = TrackingClientCertResolver {
+        capture: capture.clone(),
+        certified_key: client_certificate.map(|certificate| certificate.certified_key.clone()),
     };
     let mut config = builder
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+        .with_client_cert_resolver(Arc::new(resolver));
     config.alpn_protocols = if offer_http2 {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     } else {
@@ -215,6 +270,7 @@ pub(crate) fn tls_trace_from_stream(
         .map(|protocol| String::from_utf8_lossy(protocol).into_owned())
         .or_else(|| Some("Unavailable (server did not negotiate ALPN)".to_owned()));
     trace.validation = Some("Valid".to_owned());
+    trace.client_auth = client_auth_observation(capture, true);
     trace
 }
 
@@ -238,6 +294,7 @@ pub(super) fn tls_trace_from_quic(
     trace.alpn.get_or_insert_with(|| {
         "Unavailable (QUIC library did not expose negotiated ALPN)".to_owned()
     });
+    trace.client_auth = client_auth_observation(capture, true);
     trace
 }
 
@@ -245,6 +302,7 @@ pub(crate) fn tls_trace_from_capture(
     host: &str,
     capture: &Arc<Mutex<CertificateCapture>>,
 ) -> TlsTrace {
+    let client_auth = client_auth_observation(capture, false);
     let capture = capture.lock().unwrap();
     TlsTrace {
         server_name: host.to_owned(),
@@ -260,15 +318,47 @@ pub(crate) fn tls_trace_from_capture(
             .to_owned(),
         ),
         validation_error: capture.validation_error.clone(),
+        ocsp_response: capture.ocsp_response.clone(),
         certificates: capture
             .certificates
             .iter()
             .map(|der| parse_certificate(der))
             .collect(),
+        client_auth,
     }
 }
 
-fn parse_certificate(der: &[u8]) -> CertificateTrace {
+fn client_auth_observation(
+    capture: &Arc<Mutex<CertificateCapture>>,
+    handshake_succeeded: bool,
+) -> ClientAuthObservation {
+    let capture = capture.lock().unwrap();
+    let requested = capture.client_certificate_requested;
+    let profile_name = capture.client_certificate_profile.clone();
+    let status = match (requested, profile_name.is_some(), handshake_succeeded) {
+        (false, _, true) => ClientAuthStatus::Absent,
+        (false, _, false) => ClientAuthStatus::Inconclusive,
+        (true, false, true) => ClientAuthStatus::Optional,
+        (true, false, false) => ClientAuthStatus::Required,
+        (true, true, true) => ClientAuthStatus::Accepted,
+        (true, true, false) => ClientAuthStatus::Rejected,
+    };
+    let evidence = if requested {
+        vec!["The server sent a TLS CertificateRequest".to_owned()]
+    } else if handshake_succeeded {
+        vec!["The server did not send a TLS CertificateRequest".to_owned()]
+    } else {
+        vec!["The handshake ended before client-auth requirements could be established".to_owned()]
+    };
+    ClientAuthObservation {
+        certificate_requested: requested,
+        status,
+        profile_name,
+        evidence,
+    }
+}
+
+pub(crate) fn parse_certificate(der: &[u8]) -> CertificateTrace {
     let fingerprint = Sha256::digest(der);
     let sha256 = fingerprint
         .iter()
@@ -296,6 +386,52 @@ fn parse_certificate(der: &[u8]) -> CertificateTrace {
                         .collect()
                 })
                 .unwrap_or_default();
+            let public_key_bits = certificate
+                .public_key()
+                .parsed()
+                .ok()
+                .map(|key| key.key_size())
+                .filter(|bits| *bits > 0);
+            let basic_constraints = certificate.basic_constraints().ok().flatten();
+            let is_ca = basic_constraints.as_ref().map(|value| value.value.ca);
+            let basic_constraints_critical = basic_constraints.as_ref().map(|value| value.critical);
+            let key_usage = certificate
+                .key_usage()
+                .ok()
+                .flatten()
+                .map(|value| {
+                    value
+                        .value
+                        .to_string()
+                        .split(", ")
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let extended_key_usage = certificate
+                .extended_key_usage()
+                .ok()
+                .flatten()
+                .map(|value| {
+                    let value = value.value;
+                    let mut usages = Vec::new();
+                    for (present, name) in [
+                        (value.any, "Any"),
+                        (value.server_auth, "Server authentication"),
+                        (value.client_auth, "Client authentication"),
+                        (value.code_signing, "Code signing"),
+                        (value.email_protection, "Email protection"),
+                        (value.time_stamping, "Time stamping"),
+                        (value.ocsp_signing, "OCSP signing"),
+                    ] {
+                        if present {
+                            usages.push(name.to_owned());
+                        }
+                    }
+                    usages.extend(value.other.iter().map(ToString::to_string));
+                    usages
+                })
+                .unwrap_or_default();
             CertificateTrace {
                 subject: certificate.subject().to_string(),
                 issuer: certificate.issuer().to_string(),
@@ -306,7 +442,12 @@ fn parse_certificate(der: &[u8]) -> CertificateTrace {
                 not_after_unix: Some(certificate.validity().not_after.timestamp()),
                 subject_alt_names,
                 public_key_algorithm: certificate.public_key().algorithm.algorithm.to_id_string(),
+                public_key_bits,
                 signature_algorithm: certificate.signature_algorithm.algorithm.to_id_string(),
+                is_ca,
+                basic_constraints_critical,
+                key_usage,
+                extended_key_usage,
                 sha256,
             }
         }
@@ -320,7 +461,12 @@ fn parse_certificate(der: &[u8]) -> CertificateTrace {
             not_after_unix: None,
             subject_alt_names: Vec::new(),
             public_key_algorithm: String::new(),
+            public_key_bits: None,
             signature_algorithm: String::new(),
+            is_ca: None,
+            basic_constraints_critical: None,
+            key_usage: Vec::new(),
+            extended_key_usage: Vec::new(),
             sha256,
         },
     }

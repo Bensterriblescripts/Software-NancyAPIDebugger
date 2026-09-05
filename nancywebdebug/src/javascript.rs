@@ -1,9 +1,12 @@
+use super::crawl::hostname_in_scope;
 use super::fingerprints::CapturedScriptResponse;
 use super::{
-    ConnectionRateLimiter, EndpointScan, ExposureScanRequest, HttpObservation, JavaScriptLibrary,
-    JavaScriptSource, JavaScriptVersionStatus, ProbeContext, ScanContext, non_public_reason,
-    single_http_request_with_limit,
+    ConnectionRateLimiter, EndpointScan, ExposureScanPhase, ExposureScanPhaseState,
+    ExposureScanProgress, ExposureScanRequest, HttpObservation, JavaScriptLibrary,
+    JavaScriptSource, ProbeContext, ScanContext, TechnologyVersionStatus, non_public_reason,
+    send_phase_progress, single_http_request_with_limit, url_path,
 };
+use crate::auth::{LoadedClientCertificate, ResolvedAuth};
 use crate::diagnostics::DnsTrace;
 use crate::request::resolve_host;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -20,7 +23,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, mpsc::Sender};
 use std::time::Duration;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::time::Instant;
@@ -36,6 +39,9 @@ const MAX_CONCURRENT_FETCHES: usize = 8;
 const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOTAL_METADATA_BYTES: usize = 32 * 1024 * 1024;
 const ENRICHMENT_TIMEOUT: Duration = Duration::from_secs(60);
+static JQUERY_CDN_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^jquery-([0-9][0-9A-Za-z._-]*?)(?:\.min)?\.js$").expect("valid regex")
+});
 
 pub(super) const METADATA_LIMIT_ERROR: &str = "Technology metadata byte limit reached";
 pub(super) const ENRICHMENT_DEADLINE_ERROR: &str =
@@ -193,6 +199,10 @@ pub(super) fn discover_sources(root: &HttpObservation) -> Vec<String> {
     for reference in tokenizer.sink.0.into_inner() {
         if let Ok(mut url) = base.join(&reference)
             && matches!(url.scheme(), "http" | "https")
+            && base
+                .host_str()
+                .zip(url.host_str())
+                .is_some_and(|(root_hostname, hostname)| hostname_in_scope(root_hostname, hostname))
         {
             url.set_fragment(None);
             let normalized = url.to_string();
@@ -210,7 +220,18 @@ pub(super) async fn analyze(
     cancel: &CancellationToken,
     limiter: &ConnectionRateLimiter,
     enrichment: &mut EnrichmentState,
+    progress: &Option<Sender<ExposureScanProgress>>,
+    http_auth: Option<&ResolvedAuth>,
+    auth_hostname: &str,
+    client_certificate: Option<&LoadedClientCertificate>,
 ) -> AnalysisReport {
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::JavaScriptAnalysis,
+        ExposureScanPhaseState::Running,
+        0.0,
+        "Loading JavaScript catalog",
+    );
     let catalog_result = load_catalog(request, cancel, limiter).await;
     let (catalog, catalog_error) = match catalog_result {
         Ok(catalog) => (catalog, None),
@@ -220,6 +241,15 @@ pub(super) async fn analyze(
         .as_ref()
         .map(|error| vec![format!("JavaScript catalog unavailable: {error}")])
         .unwrap_or_default();
+    if !cancel.is_cancelled() {
+        send_phase_progress(
+            progress,
+            ExposureScanPhase::JavaScriptAnalysis,
+            ExposureScanPhaseState::Running,
+            0.10,
+            "JavaScript catalog loaded",
+        );
+    }
 
     let mut unique = Vec::new();
     let mut seen = HashSet::new();
@@ -251,6 +281,7 @@ pub(super) async fn analyze(
     let mut remaining = MAX_TOTAL_BYTES;
     let mut reserved = 0usize;
     let mut next_source = 0usize;
+    let mut completed_sources = 0usize;
     let mut pending = FuturesUnordered::new();
     while next_source < allowed.len() || !pending.is_empty() {
         if cancel.is_cancelled() {
@@ -267,7 +298,18 @@ pub(super) async fn analyze(
             next_source += 1;
             reserved += body_limit;
             pending.push(async move {
-                let fetched = fetch_url(&source, body_limit, &[], request, cancel, limiter).await;
+                let fetched = fetch_url_authenticated(
+                    &source,
+                    body_limit,
+                    &[],
+                    request,
+                    cancel,
+                    limiter,
+                    http_auth,
+                    auth_hostname,
+                    client_certificate,
+                )
+                .await;
                 (source, body_limit, fetched)
             });
         }
@@ -276,11 +318,23 @@ pub(super) async fn analyze(
         };
         reserved = reserved.saturating_sub(body_limit);
         remaining = remaining.saturating_sub(fetched.captured_bytes);
-        if let Some(response) = fetched.response.as_ref() {
-            capture_cache.insert(source.clone(), response.clone());
+        let (report, response) =
+            analyze_source(&source, fetched, &catalog, catalog_error.as_deref());
+        if let Some(response) = response {
+            capture_cache.insert(source.clone(), response);
         }
-        let report = analyze_source(&source, fetched, &catalog, catalog_error.as_deref());
         source_cache.insert(source, report);
+        completed_sources += 1;
+        send_phase_progress(
+            progress,
+            ExposureScanPhase::JavaScriptAnalysis,
+            ExposureScanPhaseState::Running,
+            0.10 + 0.55 * completed_sources as f32 / allowed.len().max(1) as f32,
+            format!(
+                "Analyzed {completed_sources} / {} JavaScript sources",
+                allowed.len()
+            ),
+        );
     }
 
     if cancel.is_cancelled() {
@@ -309,33 +363,77 @@ pub(super) async fn analyze(
             unavailable_source(source, "256-source JavaScript scan limit reached"),
         );
     }
+    if !cancel.is_cancelled() {
+        send_phase_progress(
+            progress,
+            ExposureScanPhase::JavaScriptAnalysis,
+            ExposureScanPhaseState::Running,
+            0.65,
+            format!("Analyzed {} JavaScript sources", allowed.len()),
+        );
+    }
     enrich_libraries(
         source_cache.values_mut(),
         request,
         cancel,
         limiter,
         enrichment,
+        progress,
     )
     .await;
-    let mut captured_responses = Vec::new();
-    for (endpoint_index, source) in source_locations {
+    let mut captured_responses: Vec<CapturedScriptResponse> = Vec::new();
+    let attachment_total = source_locations.len();
+    if !cancel.is_cancelled() {
+        send_phase_progress(
+            progress,
+            ExposureScanPhase::JavaScriptAnalysis,
+            ExposureScanPhaseState::Running,
+            0.90,
+            format!("Attaching 0 / {attachment_total} source results"),
+        );
+    }
+    for (attachment_index, (endpoint_index, source)) in source_locations.into_iter().enumerate() {
         if let Some(report) = source_cache.get(&source) {
             endpoints[endpoint_index]
                 .javascript_sources
                 .push(report.clone());
         }
-        if let Some(response) = capture_cache.get(&source) {
+        if let Some(captured) = captured_responses
+            .iter_mut()
+            .find(|captured| captured.source_url == source)
+        {
+            captured.endpoint_indices.push(endpoint_index);
+        } else if let Some(response) = capture_cache.remove(&source) {
             captured_responses.push(CapturedScriptResponse {
-                endpoint_index,
+                endpoint_indices: vec![endpoint_index],
                 source_url: source,
-                response: response.clone(),
+                response,
             });
+        }
+        if !cancel.is_cancelled() {
+            let attached = attachment_index + 1;
+            send_phase_progress(
+                progress,
+                ExposureScanPhase::JavaScriptAnalysis,
+                ExposureScanPhaseState::Running,
+                0.90 + 0.10 * attached as f32 / attachment_total.max(1) as f32,
+                format!("Attached {attached} / {attachment_total} source results"),
+            );
         }
     }
     for endpoint in endpoints.iter_mut() {
         endpoint
             .javascript_sources
             .sort_by(|left, right| left.source_url.cmp(&right.source_url));
+    }
+    if !cancel.is_cancelled() {
+        send_phase_progress(
+            progress,
+            ExposureScanPhase::JavaScriptAnalysis,
+            ExposureScanPhaseState::Complete,
+            1.0,
+            format!("Analyzed {} JavaScript sources", allowed.len()),
+        );
     }
 
     AnalysisReport {
@@ -350,6 +448,7 @@ async fn enrich_libraries<'a>(
     cancel: &CancellationToken,
     limiter: &ConnectionRateLimiter,
     enrichment: &mut EnrichmentState,
+    progress: &Option<Sender<ExposureScanProgress>>,
 ) {
     enrichment.start();
     let mut sources = sources.collect::<Vec<_>>();
@@ -384,6 +483,20 @@ async fn enrich_libraries<'a>(
         }
     }
 
+    let metadata_total = results.len() + uncached.len();
+    if !cancel.is_cancelled() {
+        send_phase_progress(
+            progress,
+            ExposureScanPhase::JavaScriptAnalysis,
+            ExposureScanPhaseState::Running,
+            0.65 + 0.25 * results.len() as f32 / metadata_total.max(1) as f32,
+            format!(
+                "Checked {} / {metadata_total} library metadata records",
+                results.len()
+            ),
+        );
+    }
+
     let context = enrichment.fetch_context();
     let mut pending = FuturesUnordered::new();
     let mut next = 0usize;
@@ -400,6 +513,15 @@ async fn enrich_libraries<'a>(
             let body_limit = MAX_METADATA_BYTES.min(available);
             let (key, package, url) = uncached[next].clone();
             next += 1;
+            if !cancel.is_cancelled() {
+                send_phase_progress(
+                    progress,
+                    ExposureScanPhase::JavaScriptAnalysis,
+                    ExposureScanPhaseState::Running,
+                    0.65 + 0.25 * results.len() as f32 / metadata_total.max(1) as f32,
+                    format!("Fetching metadata for {package}"),
+                );
+            }
             reserved += body_limit;
             let context = context.clone();
             pending.push(async move {
@@ -422,6 +544,18 @@ async fn enrich_libraries<'a>(
         reserved = reserved.saturating_sub(body_limit);
         enrichment.store(url, fetched.clone());
         results.insert(key, npm_result(fetched));
+        if !cancel.is_cancelled() {
+            send_phase_progress(
+                progress,
+                ExposureScanPhase::JavaScriptAnalysis,
+                ExposureScanPhaseState::Running,
+                0.65 + 0.25 * results.len() as f32 / metadata_total.max(1) as f32,
+                format!(
+                    "Checked {} / {metadata_total} library metadata records",
+                    results.len()
+                ),
+            );
+        }
     }
     if next < uncached.len() {
         let error = enrichment
@@ -437,6 +571,16 @@ async fn enrich_libraries<'a>(
                 },
             );
         }
+    }
+
+    if !cancel.is_cancelled() {
+        send_phase_progress(
+            progress,
+            ExposureScanPhase::JavaScriptAnalysis,
+            ExposureScanPhaseState::Running,
+            0.90,
+            format!("Checked {metadata_total} library metadata records"),
+        );
     }
 
     for source in &mut sources {
@@ -575,21 +719,24 @@ fn analyze_source(
     fetched: Fetched,
     catalog: &[CatalogEntry],
     catalog_error: Option<&str>,
-) -> JavaScriptSource {
+) -> (JavaScriptSource, Option<HttpObservation>) {
     let final_url = fetched.final_url.as_ref().map(Url::to_string);
     let Some(response) = fetched.response else {
-        return JavaScriptSource {
-            source_url: source_url.to_owned(),
-            final_url,
-            http_status: None,
-            http_reason: None,
-            captured_size: 0,
-            truncated: false,
-            sha256: None,
-            libraries: Vec::new(),
-            retrieval_error: fetched.error,
-            analysis_error: catalog_error.map(str::to_owned),
-        };
+        return (
+            JavaScriptSource {
+                source_url: source_url.to_owned(),
+                final_url,
+                http_status: None,
+                http_reason: None,
+                captured_size: 0,
+                truncated: false,
+                sha256: None,
+                libraries: Vec::new(),
+                retrieval_error: fetched.error,
+                analysis_error: catalog_error.map(str::to_owned),
+            },
+            None,
+        );
     };
     let sha256 = format!("{:x}", Sha256::digest(&response.body));
     let captured_size = response.body.len();
@@ -610,18 +757,21 @@ fn analyze_source(
     } else {
         Vec::new()
     };
-    JavaScriptSource {
-        source_url: source_url.to_owned(),
-        final_url,
-        http_status: Some(status),
-        http_reason: Some(reason),
-        captured_size,
-        truncated,
-        sha256: Some(sha256),
-        libraries,
-        retrieval_error,
-        analysis_error: catalog_error.map(str::to_owned),
-    }
+    (
+        JavaScriptSource {
+            source_url: source_url.to_owned(),
+            final_url,
+            http_status: Some(status),
+            http_reason: Some(reason),
+            captured_size,
+            truncated,
+            sha256: Some(sha256),
+            libraries,
+            retrieval_error,
+            analysis_error: catalog_error.map(str::to_owned),
+        },
+        Some(response),
+    )
 }
 
 fn detect_libraries(
@@ -697,7 +847,7 @@ fn detect_libraries(
                     npm_package: entry.npm_package.clone(),
                     installed_version: Some(version),
                     latest_version: None,
-                    status: JavaScriptVersionStatus::Unknown,
+                    status: TechnologyVersionStatus::Unknown,
                     evidence: vec![evidence],
                     check_error: None,
                 },
@@ -804,16 +954,13 @@ fn explicit_url_detection(url: Option<&Url>) -> Vec<JavaScriptLibrary> {
             })
         }
         "code.jquery.com" => segments.last().and_then(|filename| {
-            Regex::new(r"^jquery-([0-9][0-9A-Za-z._-]*?)(?:\.min)?\.js$")
-                .ok()?
-                .captures(filename)
-                .map(|captures| {
-                    (
-                        "jquery".to_owned(),
-                        captures.get(1).map(|version| version.as_str().to_owned()),
-                        "jQuery CDN URL".to_owned(),
-                    )
-                })
+            JQUERY_CDN_PATTERN.captures(filename).map(|captures| {
+                (
+                    "jquery".to_owned(),
+                    captures.get(1).map(|version| version.as_str().to_owned()),
+                    "jQuery CDN URL".to_owned(),
+                )
+            })
         }),
         _ => None,
     };
@@ -833,7 +980,7 @@ fn explicit_url_detection(url: Option<&Url>) -> Vec<JavaScriptLibrary> {
             name,
             installed_version: version,
             latest_version: None,
-            status: JavaScriptVersionStatus::Unknown,
+            status: TechnologyVersionStatus::Unknown,
             evidence: vec![evidence],
             check_error: None,
         })
@@ -856,7 +1003,7 @@ fn package_spec(segments: &[&str]) -> Option<(String, Option<String>)> {
         return Some((format!("{first}/{name}"), version));
     }
     let (name, version) = split_name_version(first);
-    (!name.is_empty()).then(|| (name, version))
+    (!name.is_empty()).then_some((name, version))
 }
 
 fn split_name_version(value: &str) -> (String, Option<String>) {
@@ -871,33 +1018,33 @@ fn split_name_version(value: &str) -> (String, Option<String>) {
 
 fn apply_npm_result(library: &mut JavaScriptLibrary, results: &HashMap<String, NpmResult>) {
     let Some(installed) = library.installed_version.as_deref() else {
-        library.status = JavaScriptVersionStatus::Unverifiable;
+        library.status = TechnologyVersionStatus::Unverifiable;
         library.check_error = Some("No exact installed version was detected".to_owned());
         return;
     };
     let Some(package) = library.npm_package.clone() else {
-        library.status = JavaScriptVersionStatus::NotChecked;
+        library.status = TechnologyVersionStatus::NotChecked;
         library.check_error = Some("No verified npm package mapping".to_owned());
         return;
     };
     let Some(result) = results.get(&package.to_ascii_lowercase()).cloned() else {
-        library.status = JavaScriptVersionStatus::NotChecked;
+        library.status = TechnologyVersionStatus::NotChecked;
         library.check_error = Some(METADATA_LIMIT_ERROR.to_owned());
         return;
     };
     library.latest_version = result.latest.clone();
     if let Some(error) = result.error {
-        library.status = JavaScriptVersionStatus::NotChecked;
+        library.status = TechnologyVersionStatus::NotChecked;
         library.check_error = Some(error);
         return;
     }
     let Some(latest) = library.latest_version.as_deref() else {
-        library.status = JavaScriptVersionStatus::NotChecked;
+        library.status = TechnologyVersionStatus::NotChecked;
         library.check_error = Some("npm metadata has no stable release".to_owned());
         return;
     };
     library.status = compare_versions(installed, latest);
-    if library.status == JavaScriptVersionStatus::Unverifiable {
+    if library.status == TechnologyVersionStatus::Unverifiable {
         library.check_error =
             Some("Installed or latest version is not exact semantic versioning".to_owned());
     }
@@ -965,22 +1112,22 @@ fn npm_result(fetched: Fetched) -> NpmResult {
     }
 }
 
-fn compare_versions(installed: &str, latest: &str) -> JavaScriptVersionStatus {
+fn compare_versions(installed: &str, latest: &str) -> TechnologyVersionStatus {
     let Ok(installed) = Version::parse(installed.trim_start_matches(['v', 'V'])) else {
-        return JavaScriptVersionStatus::Unverifiable;
+        return TechnologyVersionStatus::Unverifiable;
     };
     let Ok(latest) = Version::parse(latest.trim_start_matches(['v', 'V'])) else {
-        return JavaScriptVersionStatus::Unverifiable;
+        return TechnologyVersionStatus::Unverifiable;
     };
     if !installed.pre.is_empty() || !latest.pre.is_empty() {
-        return JavaScriptVersionStatus::Prerelease;
+        return TechnologyVersionStatus::Prerelease;
     }
     match installed.cmp(&latest) {
-        Ordering::Equal => JavaScriptVersionStatus::Current,
-        Ordering::Greater => JavaScriptVersionStatus::NewerThanLatest,
-        Ordering::Less if installed.major != latest.major => JavaScriptVersionStatus::OutdatedMajor,
-        Ordering::Less if installed.minor != latest.minor => JavaScriptVersionStatus::OutdatedMinor,
-        Ordering::Less => JavaScriptVersionStatus::OutdatedPatch,
+        Ordering::Equal => TechnologyVersionStatus::Current,
+        Ordering::Greater => TechnologyVersionStatus::NewerThanLatest,
+        Ordering::Less if installed.major != latest.major => TechnologyVersionStatus::OutdatedMajor,
+        Ordering::Less if installed.minor != latest.minor => TechnologyVersionStatus::OutdatedMinor,
+        Ordering::Less => TechnologyVersionStatus::OutdatedPatch,
     }
 }
 
@@ -1000,6 +1147,33 @@ pub(super) async fn fetch_url(
         cancel,
         limiter,
         None,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn fetch_url_authenticated(
+    initial_url: &str,
+    body_limit: usize,
+    headers: &[(&str, &str)],
+    request: &ExposureScanRequest,
+    cancel: &CancellationToken,
+    limiter: &ConnectionRateLimiter,
+    http_auth: Option<&ResolvedAuth>,
+    auth_hostname: &str,
+    client_certificate: Option<&LoadedClientCertificate>,
+) -> Fetched {
+    fetch_url_inner(
+        initial_url,
+        body_limit,
+        headers,
+        request,
+        cancel,
+        limiter,
+        None,
+        http_auth.map(|auth| (auth, auth_hostname)),
+        client_certificate,
     )
     .await
 }
@@ -1029,6 +1203,8 @@ pub(super) async fn fetch_metadata_url(
             cancel,
             limiter,
             Some(context.resolutions),
+            None,
+            None,
         ) => fetched,
     }
 }
@@ -1050,6 +1226,8 @@ async fn fetch_url_inner(
     cancel: &CancellationToken,
     limiter: &ConnectionRateLimiter,
     resolutions: Option<ResolutionCache>,
+    http_auth: Option<(&ResolvedAuth, &str)>,
+    client_certificate: Option<&LoadedClientCertificate>,
 ) -> Fetched {
     let mut url = match Url::parse(initial_url) {
         Ok(mut url) => {
@@ -1129,6 +1307,8 @@ async fn fetch_url_inner(
             request,
             cancel,
             limiter,
+            client_certificate: client_certificate
+                .filter(|certificate| certificate.applies_to(&hostname)),
         };
         let mut response = None;
         let mut errors = Vec::new();
@@ -1141,6 +1321,12 @@ async fn fetch_url_inner(
                 captured_bytes,
             };
         }
+        let mut request_headers = headers.to_vec();
+        if let Some((auth, auth_hostname)) = http_auth
+            && hostname.eq_ignore_ascii_case(auth_hostname)
+        {
+            request_headers.push((auth.header_name, auth.header_value.as_str()));
+        }
         for ip in addresses {
             let context = ProbeContext { ip, port, scan };
             match single_http_request_with_limit(
@@ -1148,7 +1334,7 @@ async fn fetch_url_inner(
                 url.scheme(),
                 "GET",
                 &path,
-                headers,
+                &request_headers,
                 response_limit,
             )
             .await
@@ -1257,11 +1443,4 @@ async fn resolve_public_addresses_uncached(
         .into_iter()
         .filter(|address| seen.insert(*address))
         .collect())
-}
-
-fn url_path(url: &Url) -> String {
-    match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_owned(),
-    }
 }

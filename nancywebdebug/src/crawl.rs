@@ -1,11 +1,14 @@
 use super::technology::{self, CapturedTechnologyResource};
 use super::{
-    Confidence, ConnectionRateLimiter, CrawlExternalIndicator, CrawlFormAction,
-    CrawlObservedWebSurface, CrawlOrigin, CrawlSkippedUrl, CrawledResource, EndpointScan,
-    ExposureFinding, ExposureScanProgress, ExposureScanRequest, HttpObservation, ProbeContext,
-    ScanContext, ServiceKind, TechnologyFileType, WebSurfaceType, header_values,
-    looks_like_soft_404, non_public_reason, single_http_request_with_limit, url_host,
+    Confidence, ConnectionRateLimiter, CrawlContact, CrawlContactType, CrawlExternalIndicator,
+    CrawlFormAction, CrawlFormControl, CrawlObservedWebSurface, CrawlOrigin, CrawlSkippedUrl,
+    CrawledResource, EndpointScan, ExposureFinding, ExposureScanPhase, ExposureScanPhaseState,
+    ExposureScanProgress, ExposureScanRequest, HttpObservation, ProbeContext, ScanContext,
+    ServiceKind, StreamObservation, TechnologyFileType, TransportProtocol, WebSurfaceType,
+    header_values, looks_like_soft_404, non_public_reason, send_phase_progress,
+    single_http_request_with_limit, url_host, url_path,
 };
+use crate::auth::{LoadedClientCertificate, ResolvedAuth};
 use crate::diagnostics::DnsTrace;
 use crate::request::resolve_host;
 use base64::Engine;
@@ -21,7 +24,7 @@ use regex::Regex;
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{LazyLock, mpsc::Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
@@ -70,14 +73,6 @@ static PATH_HINT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"[\"'`]((?:/|\./|\.\./)[A-Za-z0-9_~!$&()*+,;=:@%?./-]{1,2047})[\"'`]"#)
         .expect("valid path regex")
 });
-static DOMAIN_HINT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b")
-        .expect("valid domain regex")
-});
-static IPV4_HINT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b").expect("valid IPv4 regex"));
-static IPV6_HINT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[[0-9A-Fa-f:]{2,45}\]").expect("valid IPv6 regex"));
 static BASE64_HINT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/]{16,}={0,2}").expect("valid Base64 regex"));
 static VERSION_HINT: LazyLock<Regex> = LazyLock::new(|| {
@@ -101,10 +96,6 @@ static PHONE_HINT: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid telephone regex")
 });
 
-const PERSONAL_INFORMATION_TITLE: &str = "Personal information exposure";
-const PERSONAL_INFORMATION_DESCRIPTION: &str =
-    "Publicly accessible content exposes email addresses or telephone numbers";
-
 #[derive(Default)]
 pub(super) struct CrawlReport {
     pub findings: Vec<ExposureFinding>,
@@ -112,12 +103,25 @@ pub(super) struct CrawlReport {
     pub origins: Vec<CrawlOrigin>,
     pub resources: Vec<CrawledResource>,
     pub forms: Vec<CrawlFormAction>,
+    pub contacts: Vec<CrawlContact>,
     pub external_indicators: Vec<CrawlExternalIndicator>,
     pub skipped_urls: Vec<CrawlSkippedUrl>,
+    pub stream_observations: Vec<StreamObservation>,
     pub technology_resources: Vec<CapturedTechnologyResource>,
     pub javascript_candidates: Vec<(IpAddr, u16, String)>,
     technology_bytes: usize,
     resource_records: Vec<CrawlResourceRecord>,
+    contact_records: BTreeMap<ContactKey, CrawlContactRecord>,
+    technology_version_disclosures: HashSet<TechnologyVersionDisclosureKey>,
+    csp_nonce_sources: BTreeMap<Vec<u8>, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TechnologyVersionDisclosureKey {
+    ip: IpAddr,
+    port: u16,
+    header: &'static str,
+    value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -182,15 +186,25 @@ struct FormKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ExternalIndicatorKey {
-    kind: String,
     value: String,
-    evidence: String,
+    source_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SkippedUrlKey {
     url: String,
     reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ContactKey {
+    contact_type: CrawlContactType,
+    normalized_value: String,
+}
+
+struct CrawlContactRecord {
+    value: String,
+    urls: HashSet<String>,
 }
 
 struct OriginState {
@@ -229,6 +243,10 @@ impl CrawlScope {
                     .strip_suffix(&self.hostname)
                     .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1))
     }
+}
+
+pub(super) fn hostname_in_scope(root_hostname: &str, hostname: &str) -> bool {
+    CrawlScope::new(root_hostname).allows(hostname)
 }
 
 fn canonical_hostname(hostname: &str) -> String {
@@ -337,7 +355,9 @@ struct HtmlReference {
 struct HtmlForm {
     action: String,
     method: String,
+    encoding: String,
     password: bool,
+    controls: Vec<CrawlFormControl>,
 }
 
 #[derive(Default)]
@@ -375,6 +395,9 @@ impl TokenSink for HtmlSink {
                         html_ref(&mut state.result, attr("src"), "script", true);
                         state.in_script = true;
                     }
+                    "video" | "audio" | "source" => {
+                        html_ref(&mut state.result, attr("src"), &name, true);
+                    }
                     "link" => {
                         let rel = attr("rel").unwrap_or_default().to_ascii_lowercase();
                         if rel
@@ -410,16 +433,53 @@ impl TokenSink for HtmlSink {
                             method: attr("method")
                                 .unwrap_or_else(|| "GET".to_owned())
                                 .to_ascii_uppercase(),
+                            encoding: attr("enctype")
+                                .unwrap_or_else(|| "application/x-www-form-urlencoded".to_owned()),
                             password: false,
+                            controls: Vec::new(),
                         });
                         state.forms.push(index);
                     }
                     "input" => {
-                        if attr("type").is_some_and(|value| value.eq_ignore_ascii_case("password"))
-                            && let Some(index) = state.forms.last().copied()
+                        if let Some(index) = state.forms.last().copied()
                             && let Some(form) = state.result.forms.get_mut(index)
                         {
-                            form.password = true;
+                            let control_type = attr("type")
+                                .unwrap_or_else(|| "text".to_owned())
+                                .to_ascii_lowercase();
+                            form.password |= control_type == "password";
+                            if let Some(control_name) =
+                                attr("name").filter(|value| !value.trim().is_empty())
+                            {
+                                form.controls.push(CrawlFormControl {
+                                    name: control_name,
+                                    default_value: attr("value")
+                                        .map(|value| value.chars().take(512).collect::<String>()),
+                                    submit_control: matches!(
+                                        control_type.as_str(),
+                                        "submit" | "image" | "button"
+                                    ),
+                                    control_type,
+                                });
+                            }
+                        }
+                    }
+                    "button" => {
+                        if let Some(index) = state.forms.last().copied()
+                            && let Some(form) = state.result.forms.get_mut(index)
+                            && let Some(control_name) =
+                                attr("name").filter(|value| !value.trim().is_empty())
+                        {
+                            let control_type = attr("type")
+                                .unwrap_or_else(|| "submit".to_owned())
+                                .to_ascii_lowercase();
+                            form.controls.push(CrawlFormControl {
+                                name: control_name,
+                                default_value: attr("value")
+                                    .map(|value| value.chars().take(512).collect::<String>()),
+                                submit_control: control_type == "submit",
+                                control_type,
+                            });
                         }
                     }
                     _ => {}
@@ -439,14 +499,14 @@ impl TokenSink for HtmlSink {
                     state.in_script = false;
                 }
             }
-            CharacterTokens(value) if state.in_script => {
-                if state.result.javascript.len() < BODY_LIMIT {
-                    let remaining = BODY_LIMIT - state.result.javascript.len();
-                    state
-                        .result
-                        .javascript
-                        .push_str(&value.chars().take(remaining).collect::<String>());
-                }
+            CharacterTokens(value)
+                if state.in_script && state.result.javascript.len() < BODY_LIMIT =>
+            {
+                let remaining = BODY_LIMIT - state.result.javascript.len();
+                state
+                    .result
+                    .javascript
+                    .push_str(&value.chars().take(remaining).collect::<String>());
             }
             _ => {}
         }
@@ -461,7 +521,16 @@ pub(super) async fn run(
     endpoints: &[EndpointScan],
     cancel: &CancellationToken,
     progress: &Option<Sender<ExposureScanProgress>>,
+    http_auth: Option<&ResolvedAuth>,
+    client_certificate: Option<&LoadedClientCertificate>,
 ) -> CrawlReport {
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::Crawl,
+        ExposureScanPhaseState::Running,
+        0.0,
+        "Preparing crawl queue",
+    );
     let mut report = CrawlReport::default();
     let hostname = canonical_hostname(hostname);
     let mut origins = BTreeMap::new();
@@ -584,6 +653,7 @@ pub(super) async fn run(
             }
         }
     }
+    send_global_progress(progress, &origins, None, ExposureScanPhaseState::Running);
     let limiter = ConnectionRateLimiter::new(request.crawl_requests_per_second);
     let mut pending = FuturesUnordered::new();
     while (!queue.is_empty() || !pending.is_empty()) && !cancel.is_cancelled() {
@@ -597,11 +667,20 @@ pub(super) async fn run(
                 EndpointState::Queued,
                 EndpointState::InFlight,
             );
-            pending.push(fetch(job, request, cancel, &limiter));
+            pending.push(fetch(
+                job,
+                request,
+                cancel,
+                &limiter,
+                http_auth,
+                client_certificate,
+                &hostname,
+            ));
         }
         let Some(result) = pending.next().await else {
             break;
         };
+        let current_url = safe_url(&result.job.url);
         transition_endpoint(
             &mut session,
             &result.job.url,
@@ -610,7 +689,7 @@ pub(super) async fn run(
         );
         if let Some(origin) = origins.get_mut(&result.job.origin) {
             origin.report.completed += 1;
-            send_progress(progress, &origin.report, result.job.url.as_str());
+            send_origin_progress(progress, &origin.report, result.job.url.as_str());
         }
         if matches!(result.job.provenance, JobProvenance::BaselineCheck) {
             let deferred = complete_origin_baseline(result, &mut origins);
@@ -643,9 +722,18 @@ pub(super) async fn run(
         } else if let Some(origin) = origins.get_mut(&result.job.origin) {
             origin.deferred.push(result);
         }
+        send_global_progress(
+            progress,
+            &origins,
+            Some(&current_url),
+            ExposureScanPhaseState::Running,
+        );
     }
     if cancel.is_cancelled() {
         pending.clear();
+    }
+    if !cancel.is_cancelled() {
+        send_global_progress(progress, &origins, None, ExposureScanPhaseState::Complete);
     }
     report.origins = origins.into_values().map(|origin| origin.report).collect();
     finish(&mut report, &session.reportable_urls);
@@ -657,6 +745,9 @@ async fn fetch(
     request: &ExposureScanRequest,
     cancel: &CancellationToken,
     limiter: &ConnectionRateLimiter,
+    http_auth: Option<&ResolvedAuth>,
+    client_certificate: Option<&LoadedClientCertificate>,
+    auth_hostname: &str,
 ) -> FetchResult {
     let hostname = job.origin.hostname.clone();
     let context = ProbeContext {
@@ -667,12 +758,24 @@ async fn fetch(
             request,
             cancel,
             limiter,
+            client_certificate: client_certificate
+                .filter(|certificate| certificate.applies_to(&hostname)),
         },
     };
-    let path = path_query(&job.url);
-    let mut response =
-        single_http_request_with_limit(context, &job.origin.scheme, "GET", &path, &[], BODY_LIMIT)
-            .await;
+    let path = url_path(&job.url);
+    let auth = http_auth.filter(|_| hostname.eq_ignore_ascii_case(auth_hostname));
+    let auth_headers = auth
+        .map(|auth| vec![(auth.header_name, auth.header_value.as_str())])
+        .unwrap_or_default();
+    let mut response = single_http_request_with_limit(
+        context,
+        &job.origin.scheme,
+        "GET",
+        &path,
+        &auth_headers,
+        BODY_LIMIT,
+    )
+    .await;
     if let Ok(response) = &mut response {
         response.url = job.url.to_string();
     }
@@ -768,6 +871,11 @@ async fn process_result(
     let content_type = header_values(&response, "content-type")
         .next()
         .map(str::to_owned);
+    report
+        .stream_observations
+        .extend(super::stream_inventory::observations_for_response(
+            &response,
+        ));
     let baseline = origins
         .get(&job.origin)
         .and_then(|origin| origin.baseline.clone());
@@ -816,7 +924,7 @@ async fn process_result(
         }
         return;
     }
-    if (200..300).contains(&response.status)
+    let capture_technology = (200..300).contains(&response.status)
         && !response.body.is_empty()
         && technology::should_capture(
             &job.url,
@@ -825,23 +933,8 @@ async fn process_result(
             &detected_file_types,
         )
         && report.technology_resources.len() < TECHNOLOGY_CAPTURE_LIMIT
-        && report.technology_bytes.saturating_add(response.body.len()) <= TECHNOLOGY_CAPTURE_BYTES
-    {
-        report.technology_bytes += response.body.len();
-        report
-            .technology_resources
-            .push(CapturedTechnologyResource {
-                ip: job.origin.ip,
-                port: job.origin.port,
-                url: displayed_url.clone(),
-                fetch_url: job.url.to_string(),
-                headers: response.headers.clone(),
-                body: response.body.clone(),
-                truncated: response.body_truncated,
-                detected_file_types: detected_file_types.clone(),
-            });
-    }
-    response_checks(&job, &response, report);
+        && report.technology_bytes.saturating_add(response.body.len()) <= TECHNOLOGY_CAPTURE_BYTES;
+    response_checks(&job, &response, baseline.as_ref(), report);
     if let Some((surface_type, confidence, evidence)) =
         detect_surface(&job.url, &response, baseline.as_ref())
     {
@@ -863,126 +956,144 @@ async fn process_result(
         )
         .await;
     }
-    if !is_textual(&job.url, content_type.as_deref()) {
-        return;
-    }
-    let text = String::from_utf8_lossy(&response.body);
-    collect_personal_information(&text, &job, report);
-    let lower_start = text.trim_start().to_ascii_lowercase();
-    let html = content_type
-        .as_deref()
-        .is_some_and(|value| value.to_ascii_lowercase().contains("html"))
-        || lower_start.starts_with("<!doctype html")
-        || lower_start.starts_with("<html");
-    let javascript = content_type.as_deref().is_some_and(|value| {
-        let value = value.to_ascii_lowercase();
-        value.contains("javascript") || value.contains("ecmascript")
-    }) || job.url.path().to_ascii_lowercase().ends_with(".js");
-    if job.url.path().eq_ignore_ascii_case("/robots.txt") {
-        process_robots(
-            &job, &text, request, cancel, session, origins, queue, report,
-        )
-        .await;
-    }
-    if content_type
-        .as_deref()
-        .is_some_and(|value| value.to_ascii_lowercase().contains("xml"))
-        || job.url.path().to_ascii_lowercase().contains("sitemap")
-    {
-        for location in sitemap_locations(&text).into_iter().take(REFERENCE_LIMIT) {
-            if enqueue_reference(
-                origins,
-                queue,
-                report,
-                &job,
-                &job.url,
-                &location,
-                job.depth.saturating_add(1),
-                JobProvenance::DiscoveredReference,
-                request,
-                cancel,
-                session,
+    if is_textual(&job.url, content_type.as_deref()) {
+        let text = String::from_utf8_lossy(&response.body);
+        collect_personal_information(&text, &job, report);
+        let lower_start = text.trim_start().to_ascii_lowercase();
+        let html = content_type
+            .as_deref()
+            .is_some_and(|value| value.to_ascii_lowercase().contains("html"))
+            || lower_start.starts_with("<!doctype html")
+            || lower_start.starts_with("<html");
+        let javascript = content_type.as_deref().is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("javascript") || value.contains("ecmascript")
+        }) || job.url.path().to_ascii_lowercase().ends_with(".js");
+        if job.url.path().eq_ignore_ascii_case("/robots.txt") {
+            process_robots(
+                &job, &text, request, cancel, session, origins, queue, report,
             )
-            .await
-                && let Some(origin) = origins.get_mut(&job.origin)
-            {
-                origin.report.sitemap_urls.push(location);
-            }
+            .await;
         }
-    }
-    if html {
-        let discovery = parse_html(&text);
-        let base_url = html_base_url(&job.url, &discovery.base_hrefs);
-        for reference in discovery.references.into_iter().take(REFERENCE_LIMIT) {
-            if reference.kind == "script"
-                && report.javascript_candidates.len() < 256
-                && let Ok(url) = base_url.join(&reference.value)
-                && let Ok(url) = normalize_url(url)
-            {
-                report.javascript_candidates.push((
-                    job.origin.ip,
-                    job.origin.port,
-                    url.to_string(),
-                ));
-            }
-            if job.origin.scheme == "https"
-                && reference.active
-                && base_url
-                    .join(&reference.value)
-                    .is_ok_and(|url| url.scheme() == "http")
-            {
-                finding(
+        if content_type
+            .as_deref()
+            .is_some_and(|value| value.to_ascii_lowercase().contains("xml"))
+            || job.url.path().to_ascii_lowercase().contains("sitemap")
+        {
+            for location in sitemap_locations(&text).into_iter().take(REFERENCE_LIMIT) {
+                if enqueue_reference(
+                    origins,
+                    queue,
                     report,
                     &job,
-                    "Mixed active content",
-                    "An HTTPS document references active content over cleartext HTTP",
-                    format!(
-                        "{} references cleartext {} content",
-                        job.url, reference.kind
-                    ),
-                );
+                    &job.url,
+                    &location,
+                    job.depth.saturating_add(1),
+                    JobProvenance::DiscoveredReference,
+                    request,
+                    cancel,
+                    session,
+                )
+                .await
+                    && let Some(origin) = origins.get_mut(&job.origin)
+                {
+                    origin.report.sitemap_urls.push(location);
+                }
             }
-            enqueue_reference(
-                origins,
-                queue,
-                report,
-                &job,
-                &base_url,
-                &reference.value,
-                job.depth.saturating_add(1),
-                JobProvenance::DiscoveredReference,
-                request,
-                cancel,
-                session,
-            )
-            .await;
         }
-        for form in discovery.forms {
-            process_form(
-                form, &job, &base_url, request, cancel, session, origins, queue, report,
-            )
-            .await;
+        if html {
+            let discovery = parse_html(&text);
+            let base_url = html_base_url(&job.url, &discovery.base_hrefs);
+            for reference in discovery.references.into_iter().take(REFERENCE_LIMIT) {
+                if reference.kind == "script"
+                    && report.javascript_candidates.len() < 256
+                    && let Ok(url) = base_url.join(&reference.value)
+                    && let Ok(url) = normalize_url(url)
+                    && url
+                        .host_str()
+                        .is_some_and(|host| session.scope.allows(host))
+                {
+                    report.javascript_candidates.push((
+                        job.origin.ip,
+                        job.origin.port,
+                        url.to_string(),
+                    ));
+                }
+                if job.origin.scheme == "https"
+                    && reference.active
+                    && base_url
+                        .join(&reference.value)
+                        .is_ok_and(|url| url.scheme() == "http")
+                {
+                    finding(
+                        report,
+                        &job,
+                        "Mixed active content",
+                        "An HTTPS document references active content over cleartext HTTP",
+                        format!(
+                            "{} references cleartext {} content",
+                            job.url, reference.kind
+                        ),
+                    );
+                }
+                enqueue_reference(
+                    origins,
+                    queue,
+                    report,
+                    &job,
+                    &base_url,
+                    &reference.value,
+                    job.depth.saturating_add(1),
+                    JobProvenance::DiscoveredReference,
+                    request,
+                    cancel,
+                    session,
+                )
+                .await;
+            }
+            for form in discovery.forms {
+                process_form(
+                    form, &job, &base_url, request, cancel, session, origins, queue, report,
+                )
+                .await;
+            }
+            if !discovery.javascript.is_empty() {
+                process_javascript(
+                    &discovery.javascript,
+                    &job,
+                    &base_url,
+                    request,
+                    cancel,
+                    session,
+                    origins,
+                    queue,
+                    report,
+                )
+                .await;
+            }
         }
-        if !discovery.javascript.is_empty() {
+        if javascript {
             process_javascript(
-                &discovery.javascript,
-                &job,
-                &base_url,
-                request,
-                cancel,
-                session,
-                origins,
-                queue,
-                report,
+                &text, &job, &job.url, request, cancel, session, origins, queue, report,
             )
             .await;
         }
     }
-    if javascript {
-        process_javascript(
-            &text, &job, &job.url, request, cancel, session, origins, queue, report,
-        )
-        .await;
+    if capture_technology {
+        report.technology_bytes += response.body.len();
+        report
+            .technology_resources
+            .push(CapturedTechnologyResource {
+                ip: job.origin.ip,
+                port: job.origin.port,
+                url: displayed_url,
+                fetch_url: job.url.to_string(),
+                status: response.status,
+                headers: response.headers,
+                body: response.body,
+                truncated: response.body_truncated,
+                detected_file_types,
+            });
     }
 }
 
@@ -1052,9 +1163,10 @@ async fn process_form(
     if !method.eq_ignore_ascii_case("GET") {
         match base_url.join(&action) {
             Ok(url) => {
-                if !url
-                    .host_str()
-                    .is_some_and(|host| session.scope.allows(host))
+                if let Ok(url) = normalize_url(url.clone())
+                    && !url
+                        .host_str()
+                        .is_some_and(|host| session.scope.allows(host))
                 {
                     external(
                         report,
@@ -1106,7 +1218,15 @@ async fn process_form(
         source_url: safe_url(&job.url),
         action_url: normalized.clone(),
         method: method.clone(),
+        encoding: form.encoding,
         has_password: form.password,
+        likely_csrf_tokens: form
+            .controls
+            .iter()
+            .filter(|control| likely_csrf_name(&control.name))
+            .map(|control| control.name.clone())
+            .collect(),
+        controls: form.controls,
         enqueued,
     });
     if form.password && job.origin.scheme == "http" {
@@ -1160,10 +1280,12 @@ async fn process_javascript(
     }
     for candidate in decoded_candidates(text) {
         collect_personal_information(&candidate, job, report);
+        let post_only = super::stream_inventory::post_only_endpoints(base_url.as_str(), &candidate);
         let standalone = candidate.trim();
         if standalone.len() <= 2048
             && standalone.starts_with('/')
             && !standalone.chars().any(char::is_whitespace)
+            && !post_only_reference(base_url, standalone, &post_only)
         {
             enqueue_reference(
                 origins,
@@ -1181,6 +1303,9 @@ async fn process_javascript(
             .await;
         }
         for matched in ABSOLUTE_URL.find_iter(&candidate).take(REFERENCE_LIMIT) {
+            if post_only_reference(base_url, matched.as_str(), &post_only) {
+                continue;
+            }
             enqueue_reference(
                 origins,
                 queue,
@@ -1198,6 +1323,9 @@ async fn process_javascript(
         }
         for captures in PATH_HINT.captures_iter(&candidate).take(REFERENCE_LIMIT) {
             if let Some(path) = captures.get(1) {
+                if post_only_reference(base_url, path.as_str(), &post_only) {
+                    continue;
+                }
                 enqueue_reference(
                     origins,
                     queue,
@@ -1214,8 +1342,18 @@ async fn process_javascript(
                 .await;
             }
         }
-        collect_indicators(&candidate, job, &session.scope, report);
     }
+}
+
+fn post_only_reference(base_url: &Url, reference: &str, post_only: &HashSet<String>) -> bool {
+    base_url
+        .join(reference)
+        .ok()
+        .map(|mut url| {
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .is_some_and(|url| post_only.contains(&url))
 }
 
 fn decoded_candidates(text: &str) -> Vec<String> {
@@ -1360,44 +1498,12 @@ fn decode_javascript(value: &str) -> String {
     output
 }
 
-fn collect_indicators(text: &str, job: &Job, scope: &CrawlScope, report: &mut CrawlReport) {
-    for matched in DOMAIN_HINT.find_iter(text).take(REFERENCE_LIMIT) {
-        if !scope.allows(matched.as_str()) {
-            external(
-                report,
-                job.url.as_str(),
-                "domain",
-                &matched.as_str().to_ascii_lowercase(),
-                "JavaScript domain hint",
-            );
-        }
-    }
-    for matched in IPV4_HINT.find_iter(text).take(REFERENCE_LIMIT) {
-        if matched.as_str().parse::<Ipv4Addr>().is_ok() && !scope.allows(matched.as_str()) {
-            external(
-                report,
-                job.url.as_str(),
-                "IPv4 address",
-                matched.as_str(),
-                "JavaScript IPv4 hint",
-            );
-        }
-    }
-    for matched in IPV6_HINT.find_iter(text).take(REFERENCE_LIMIT) {
-        let value = matched.as_str().trim_matches(['[', ']']);
-        if value.parse::<Ipv6Addr>().is_ok() && !scope.allows(value) {
-            external(
-                report,
-                job.url.as_str(),
-                "IPv6 address",
-                value,
-                "JavaScript bracketed IPv6 hint",
-            );
-        }
-    }
-}
-
-fn response_checks(job: &Job, response: &HttpObservation, report: &mut CrawlReport) {
+fn response_checks(
+    job: &Job,
+    response: &HttpObservation,
+    baseline: Option<&HttpObservation>,
+    report: &mut CrawlReport,
+) {
     let content_type = header_values(response, "content-type")
         .next()
         .unwrap_or_default()
@@ -1407,32 +1513,52 @@ fn response_checks(job: &Job, response: &HttpObservation, report: &mut CrawlRepo
     let html = content_type.contains("html")
         || lower.trim_start().starts_with("<!doctype html")
         || lower.trim_start().starts_with("<html");
-    if (200..300).contains(&response.status) && html {
-        let mut missing = Vec::new();
-        if job.origin.scheme == "https"
-            && header_values(response, "strict-transport-security")
-                .next()
-                .is_none()
-        {
-            missing.push("Strict-Transport-Security");
+    let soft_404 = baseline.is_some_and(|baseline| {
+        Url::parse(&baseline.url).is_ok_and(|baseline_url| {
+            looks_like_soft_404(baseline, response, baseline_url.path(), job.url.path())
+        })
+    });
+    if (200..300).contains(&response.status)
+        && !soft_404
+        && job.url.path().to_ascii_lowercase().ends_with(".map")
+    {
+        for issue in super::artifact_analysis::source_map_issues(job.url.as_str(), &response.body) {
+            finding(report, job, issue.title, issue.description, issue.evidence);
         }
-        for (name, label) in [
-            ("content-security-policy", "Content-Security-Policy"),
-            ("x-content-type-options", "X-Content-Type-Options"),
-            ("referrer-policy", "Referrer-Policy"),
-        ] {
-            if header_values(response, name).next().is_none() {
-                missing.push(label);
+    } else if (200..300).contains(&response.status)
+        && !soft_404
+        && secret_scannable_path(job.url.path())
+    {
+        for issue in super::artifact_analysis::text_artifact_secret_issues(
+            job.url.as_str(),
+            &response.body,
+            None,
+        ) {
+            finding(report, job, issue.title, issue.description, issue.evidence);
+        }
+    }
+    if html {
+        for issue in super::browser_policy::response_issues(response, &job.origin.scheme, true) {
+            finding(report, job, issue.title, issue.description, issue.evidence);
+        }
+        for nonce in super::browser_policy::csp_nonces(response) {
+            if let Some(previous) = report.csp_nonce_sources.get(&nonce).cloned()
+                && previous != job.url.as_str()
+            {
+                finding(
+                    report,
+                    job,
+                    "Content-Security-Policy nonce is reused",
+                    "A script nonce was reused across distinct document responses",
+                    format!(
+                        "Nonce reused by {} and {}; nonce value withheld",
+                        previous,
+                        safe_url(&job.url)
+                    ),
+                );
+            } else {
+                report.csp_nonce_sources.insert(nonce, safe_url(&job.url));
             }
-        }
-        if !missing.is_empty() {
-            finding(
-                report,
-                job,
-                "Browser security headers are missing",
-                "An HTML response omits applicable browser hardening headers",
-                format!("{} missing {}", job.url, missing.join(", ")),
-            );
         }
     }
     for cookie in header_values(response, "set-cookie") {
@@ -1483,7 +1609,16 @@ fn response_checks(job: &Job, response: &HttpObservation, report: &mut CrawlRepo
     }
     for header in ["server", "x-powered-by", "x-generator"] {
         for value in header_values(response, header) {
-            if VERSION_HINT.is_match(value) {
+            if VERSION_HINT.is_match(value)
+                && report
+                    .technology_version_disclosures
+                    .insert(TechnologyVersionDisclosureKey {
+                        ip: job.origin.ip,
+                        port: job.origin.port,
+                        header,
+                        value: value.to_owned(),
+                    })
+            {
                 finding(
                     report,
                     job,
@@ -1545,6 +1680,29 @@ fn response_checks(job: &Job, response: &HttpObservation, report: &mut CrawlRepo
         "The response contains an OpenAPI or Swagger document signature",
         &["\"openapi\"", "\"swagger\"", "swagger-ui"],
     );
+}
+
+fn secret_scannable_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.ends_with(".env")
+        || path.contains("/.env.")
+        || path.ends_with("config.php")
+        || path.ends_with("wp-config.php")
+        || path.ends_with("web.config")
+        || path.ends_with("appsettings.json")
+        || path.ends_with("application.properties")
+        || path.ends_with("bootstrap.properties")
+        || path.ends_with("settings.py")
+        || path.ends_with("credentials.yml")
+        || path.ends_with("credentials")
+        || path.ends_with("jenkinsfile")
+        || path.ends_with(".gitlab-ci.yml")
+        || path.ends_with("azure-pipelines.yml")
+        || path.ends_with("bitbucket-pipelines.yml")
+        || path.ends_with(".travis.yml")
+        || path.contains("/.github/workflows/")
+        || path.contains("/.circleci/")
+        || path.ends_with("buildspec.yml")
 }
 
 fn check_signature(
@@ -1852,12 +2010,8 @@ fn authentication_redirect(url: &Url, response: &HttpObservation) -> Option<Stri
     )
     .is_some();
     let authentication_host = target.host_str().is_some_and(|host| {
-        host.split('.').any(|component| {
-            matches!(
-                component.to_ascii_lowercase().as_str(),
-                "login" | "signin" | "auth" | "sso"
-            )
-        })
+        host.split('.')
+            .any(|component| crate::matches_ascii(component, &["login", "signin", "auth", "sso"]))
     });
     (authentication_route || authentication_host).then(|| {
         format!(
@@ -2396,13 +2550,6 @@ fn is_textual(url: &Url, content_type: Option<&str>) -> bool {
     .any(|suffix| path.ends_with(suffix))
 }
 
-fn path_query(url: &Url) -> String {
-    match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_owned(),
-    }
-}
-
 fn redact_url(url: &Url) -> String {
     let mut redacted = url.clone();
     if redacted.query().is_some() {
@@ -2479,7 +2626,13 @@ fn collect_personal_information(text: &str, job: &Job, report: &mut CrawlReport)
             continue;
         };
         if contact_boundaries(text, full.start(), full.end()) && valid_email(value.as_str()) {
-            personal_information_finding(report, job, "Email address", value.as_str());
+            record_contact(
+                report,
+                job,
+                CrawlContactType::Email,
+                value.as_str(),
+                value.as_str().to_ascii_lowercase(),
+            );
         }
     }
     for matched in PHONE_HINT.find_iter(text).take(CANDIDATE_LIMIT) {
@@ -2487,18 +2640,44 @@ fn collect_personal_information(text: &str, job: &Job, report: &mut CrawlReport)
             continue;
         }
         let candidate = matched.as_str();
-        let value = if candidate
+        let explicit_tel = candidate
             .get(..4)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("tel:"))
-        {
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("tel:"));
+        let value = if explicit_tel {
             candidate[4..].trim()
         } else {
             candidate.trim()
         };
-        if valid_phone(value) {
-            personal_information_finding(report, job, "Telephone number", value);
+        if let Some(normalized_value) = normalize_phone(value, explicit_tel) {
+            record_contact(
+                report,
+                job,
+                CrawlContactType::Telephone,
+                value,
+                normalized_value,
+            );
         }
     }
+}
+
+fn record_contact(
+    report: &mut CrawlReport,
+    job: &Job,
+    contact_type: CrawlContactType,
+    value: &str,
+    normalized_value: String,
+) {
+    let record = report
+        .contact_records
+        .entry(ContactKey {
+            contact_type,
+            normalized_value,
+        })
+        .or_insert_with(|| CrawlContactRecord {
+            value: value.to_owned(),
+            urls: HashSet::new(),
+        });
+    record.urls.insert(job.url.as_str().to_owned());
 }
 
 fn contact_boundaries(text: &str, start: usize, end: usize) -> bool {
@@ -2535,38 +2714,91 @@ fn valid_email(value: &str) -> bool {
     let Some((local, domain)) = value.rsplit_once('@') else {
         return false;
     };
+    let domain = domain.to_ascii_lowercase();
     !local.starts_with('.')
         && !local.ends_with('.')
         && !local.contains("..")
         && local.len() <= 64
         && value.len() <= 254
         && domain.len() <= 253
+        && psl::suffix(domain.as_bytes()).is_some_and(|suffix| suffix.is_known())
 }
 
-fn valid_phone(value: &str) -> bool {
-    let digit_count = value.bytes().filter(|byte| byte.is_ascii_digit()).count();
-    if !(7..=15).contains(&digit_count) {
-        return false;
-    }
+fn normalize_phone(value: &str, explicit_tel: bool) -> Option<String> {
     if value.bytes().filter(|byte| *byte == b'+').count() > 1
         || (value.contains('+') && !value.trim_start().starts_with('+'))
     {
-        return false;
+        return None;
     }
     if !valid_phone_formatting(value) {
-        return false;
+        return None;
     }
+
     let compact = value
         .chars()
         .filter(|character| !character.is_ascii_whitespace())
         .collect::<String>();
+    if likely_decimal_number(&compact) {
+        return None;
+    }
+    let digits = value
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .collect::<String>();
+    if explicit_tel {
+        return (7..=15)
+            .contains(&digits.len())
+            .then(|| normalize_nz_phone(&digits, value.starts_with('+')).unwrap_or(digits));
+    }
+
+    if value.starts_with('+') {
+        if !(8..=15).contains(&digits.len())
+            || digits.starts_with('0')
+            || (digits.starts_with('1') && digits.len() != 11)
+        {
+            return None;
+        }
+        return if digits.starts_with("64") {
+            normalize_nz_phone(&digits, true)
+        } else {
+            Some(digits)
+        };
+    }
+
     if compact.parse::<Ipv4Addr>().is_ok()
         || likely_numeric_date(&compact)
         || likely_semantic_version(&compact)
+        || !digits.starts_with('0')
     {
-        return false;
+        return None;
     }
-    true
+    normalize_nz_phone(&digits, false)
+}
+
+fn normalize_nz_phone(digits: &str, international: bool) -> Option<String> {
+    let national = if international {
+        digits.strip_prefix("64")?
+    } else {
+        digits.strip_prefix('0').unwrap_or(digits)
+    };
+    if national.starts_with('0') || !valid_nz_national_number(national) {
+        return None;
+    }
+    Some(format!("64{national}"))
+}
+
+fn valid_nz_national_number(national: &str) -> bool {
+    (national.len() == 8
+        && matches!(
+            national.as_bytes().first(),
+            Some(b'3' | b'4' | b'6' | b'7' | b'9')
+        ))
+        || ((9..=10).contains(&national.len()) && national.starts_with('2'))
+        || (national.len() == 9
+            && (national.starts_with("70")
+                || national.starts_with("508")
+                || national.starts_with("800")))
+        || ((8..=10).contains(&national.len()) && national.starts_with("900"))
 }
 
 fn valid_phone_formatting(value: &str) -> bool {
@@ -2651,25 +2883,15 @@ fn likely_semantic_version(value: &str) -> bool {
             .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-fn personal_information_finding(report: &mut CrawlReport, job: &Job, kind: &str, value: &str) {
-    let evidence = format!("{kind}: {value} at {}", safe_url(&job.url));
-    if let Some(existing) = report.findings.iter_mut().find(|finding| {
-        finding.ip == job.origin.ip
-            && finding.port == job.origin.port
-            && finding.title == PERSONAL_INFORMATION_TITLE
-    }) {
-        if existing.evidence.len() < CANDIDATE_LIMIT && !existing.evidence.contains(&evidence) {
-            existing.evidence.push(evidence);
-        }
-        return;
-    }
-    report.findings.push(ExposureFinding {
-        title: PERSONAL_INFORMATION_TITLE.to_owned(),
-        description: PERSONAL_INFORMATION_DESCRIPTION.to_owned(),
-        ip: job.origin.ip,
-        port: job.origin.port,
-        evidence: vec![evidence],
-    });
+fn likely_decimal_number(value: &str) -> bool {
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let Some((whole, fractional)) = value.split_once('.') else {
+        return false;
+    };
+    !whole.is_empty()
+        && !fractional.is_empty()
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && fractional.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn finding(report: &mut CrawlReport, job: &Job, title: &str, description: &str, evidence: String) {
@@ -2678,8 +2900,23 @@ fn finding(report: &mut CrawlReport, job: &Job, title: &str, description: &str, 
         description: description.to_owned(),
         ip: job.origin.ip,
         port: job.origin.port,
+        transport: super::TransportProtocol::Tcp,
         evidence: vec![evidence.replace(job.url.as_str(), &safe_url(&job.url))],
+        component_kind: None,
     });
+}
+
+fn likely_csrf_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "csrf",
+        "xsrf",
+        "requestverificationtoken",
+        "authenticity_token",
+        "nonce",
+    ]
+    .iter()
+    .any(|marker| name.contains(marker))
 }
 
 fn external(report: &mut CrawlReport, source: &str, kind: &str, value: &str, evidence: &str) {
@@ -2701,7 +2938,7 @@ fn skip(report: &mut CrawlReport, source: Option<&str>, url: &str, reason: &str)
     }
 }
 
-fn send_progress(
+fn send_origin_progress(
     progress: &Option<Sender<ExposureScanProgress>>,
     origin: &CrawlOrigin,
     current_url: &str,
@@ -2719,7 +2956,48 @@ fn send_progress(
     }
 }
 
+fn send_global_progress(
+    progress: &Option<Sender<ExposureScanProgress>>,
+    origins: &BTreeMap<OriginKey, OriginState>,
+    current_url: Option<&str>,
+    state: ExposureScanPhaseState,
+) {
+    let queued = origins
+        .values()
+        .map(|origin| origin.report.queued)
+        .sum::<usize>();
+    let completed = origins
+        .values()
+        .map(|origin| origin.report.completed)
+        .sum::<usize>();
+    let fraction = if state == ExposureScanPhaseState::Complete {
+        1.0
+    } else {
+        completed as f32 / queued.max(1) as f32
+    };
+    let text = match current_url {
+        Some(url) => format!("{completed} / {queued} URLs — {url}"),
+        None if state == ExposureScanPhaseState::Complete => {
+            format!("{completed} / {queued} URLs")
+        }
+        None => format!("{completed} / {queued} URLs queued"),
+    };
+    send_phase_progress(progress, ExposureScanPhase::Crawl, state, fraction, text);
+}
+
 fn finish(report: &mut CrawlReport, reportable_urls: &HashSet<String>) {
+    report.contacts = std::mem::take(&mut report.contact_records)
+        .into_iter()
+        .map(|(key, record)| {
+            let mut endpoints = record.urls.into_iter().collect::<Vec<_>>();
+            endpoints.sort();
+            CrawlContact {
+                contact_type: key.contact_type,
+                value: record.value,
+                endpoints,
+            }
+        })
+        .collect();
     for origin in &mut report.origins {
         origin.robots_exclusions.sort();
         origin.robots_exclusions.dedup();
@@ -2773,6 +3051,16 @@ fn finish(report: &mut CrawlReport, reportable_urls: &HashSet<String>) {
             retain_smallest_source(&mut existing.source_url, form.source_url);
             existing.has_password |= form.has_password;
             existing.enqueued |= form.enqueued;
+            existing.likely_csrf_tokens.extend(form.likely_csrf_tokens);
+            existing.controls.extend(form.controls);
+            existing.likely_csrf_tokens.sort();
+            existing.likely_csrf_tokens.dedup();
+            existing.controls.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then(left.control_type.cmp(&right.control_type))
+            });
+            existing.controls.dedup();
         } else {
             forms.insert(key, form);
         }
@@ -2787,22 +3075,16 @@ fn finish(report: &mut CrawlReport, reportable_urls: &HashSet<String>) {
     let mut external_indicators = BTreeMap::<ExternalIndicatorKey, CrawlExternalIndicator>::new();
     for indicator in report.external_indicators.drain(..) {
         let key = ExternalIndicatorKey {
-            kind: indicator.kind.clone(),
             value: indicator.value.clone(),
-            evidence: indicator.evidence.clone(),
+            source_url: indicator.source_url.clone(),
         };
-        if let Some(existing) = external_indicators.get_mut(&key) {
-            retain_smallest_source(&mut existing.source_url, indicator.source_url);
-        } else {
-            external_indicators.insert(key, indicator);
-        }
+        external_indicators.entry(key).or_insert(indicator);
     }
     report.external_indicators = external_indicators.into_values().collect();
     report.external_indicators.sort_by(|left, right| {
-        left.source_url
-            .cmp(&right.source_url)
-            .then(left.kind.cmp(&right.kind))
-            .then(left.value.cmp(&right.value))
+        left.value
+            .cmp(&right.value)
+            .then(left.source_url.cmp(&right.source_url))
     });
     let mut skipped_urls = BTreeMap::<SkippedUrlKey, CrawlSkippedUrl>::new();
     for skipped in report.skipped_urls.drain(..) {
@@ -2834,9 +3116,14 @@ fn finish(report: &mut CrawlReport, reportable_urls: &HashSet<String>) {
             .then(left.url.cmp(&right.url))
             .then(left.surface_type.cmp(&right.surface_type))
     });
-    let mut findings = BTreeMap::<(IpAddr, u16, String), ExposureFinding>::new();
+    let mut findings = BTreeMap::<(IpAddr, u16, TransportProtocol, String), ExposureFinding>::new();
     for finding in report.findings.drain(..) {
-        let key = (finding.ip, finding.port, finding.title.clone());
+        let key = (
+            finding.ip,
+            finding.port,
+            finding.transport,
+            finding.title.clone(),
+        );
         if let Some(existing) = findings.get_mut(&key) {
             existing.evidence.extend(finding.evidence);
         } else {

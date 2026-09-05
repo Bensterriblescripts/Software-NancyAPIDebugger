@@ -1,8 +1,9 @@
+use crate::auth::LoadedClientCertificate;
 use crate::diagnostics::{
     ConnectionOutcome, DiagnosticProgress, DiagnosticTrace, StageKind, StageStatus,
     format_byte_size,
 };
-use crate::exposure::ConnectionRateLimiter;
+use crate::network::ConnectionRateLimiter;
 use bytes::{Buf, Bytes};
 use h3::error::Code;
 use http::{HeaderMap, Method, Version};
@@ -25,6 +26,7 @@ pub(super) async fn run(
     cancel: CancellationToken,
     progress: Sender<DiagnosticProgress>,
     limiter: Option<Arc<ConnectionRateLimiter>>,
+    client_certificate: Option<LoadedClientCertificate>,
 ) -> DiagnosticTrace {
     let quic_started = begin_stage(&mut trace, StageKind::QuicTls, &progress);
     let mut candidates = connect_quic_all(
@@ -38,6 +40,7 @@ pub(super) async fn run(
             .saturating_add(trace.request.timeouts.tls),
         &cancel,
         limiter.as_deref(),
+        client_certificate,
     )
     .await;
     let selected_index = candidates

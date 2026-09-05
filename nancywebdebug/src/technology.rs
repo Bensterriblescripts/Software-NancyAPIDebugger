@@ -1,8 +1,10 @@
 use super::javascript;
 use super::{
     Confidence, ConnectionRateLimiter, DetectedFileType, EndpointScan, ExposureFinding,
-    ExposureScanRequest, JavaScriptVersionStatus, TechnologyComponent, TechnologyComponentKind,
-    TechnologyEcosystem, TechnologyFileType, TechnologySupportStatus, TechnologyVersionStatus,
+    ExposureScanPhase, ExposureScanPhaseState, ExposureScanProgress, ExposureScanRequest,
+    ProductLayer, TechnologyComponent, TechnologyComponentKind, TechnologyEcosystem,
+    TechnologyFileType, TechnologySupportStatus, TechnologyVersionStatus, TransportProtocol,
+    send_phase_progress,
 };
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -13,17 +15,26 @@ use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::{LazyLock, mpsc::Sender};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CONCURRENT_VERSION_FETCHES: usize = 8;
+const MOODLE_LATEST_RELEASE_URL: &str = "https://download.moodle.org/releases/latest/";
+static PRERELEASE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:^|[._-])(?:alpha|beta|preview|pre|rc|dev|snapshot|nightly|canary)(?:[._-]?[0-9]+|$)|[0-9](?:a|b|rc)[0-9]+",
+    )
+    .expect("valid prerelease regex")
+});
 
 pub(super) struct CapturedTechnologyResource {
     pub ip: IpAddr,
     pub port: u16,
     pub url: String,
     pub fetch_url: String,
+    pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub truncated: bool,
@@ -314,12 +325,37 @@ pub(super) async fn analyze(
     cancel: &CancellationToken,
     limiter: &ConnectionRateLimiter,
     enrichment: &mut javascript::EnrichmentState,
+    progress: &Option<Sender<ExposureScanProgress>>,
 ) -> AnalysisReport {
+    let inventory_total = endpoints.len().saturating_mul(2) + resources.len();
+    let mut inventory_completed = 0usize;
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::TechnologyAnalysis,
+        ExposureScanPhaseState::Running,
+        0.0,
+        format!("Parsing {inventory_total} inventory inputs"),
+    );
     for endpoint in endpoints.iter_mut() {
         endpoint.technology_components.clear();
         import_javascript_components(endpoint);
+        inventory_completed += 1;
+        send_technology_progress(
+            progress,
+            0.25 * inventory_completed as f32 / inventory_total.max(1) as f32,
+            format!(
+                "Imported JavaScript inventory for {}:{}",
+                endpoint.ip, endpoint.port
+            ),
+        );
     }
     for resource in resources {
+        inventory_completed += 1;
+        send_technology_progress(
+            progress,
+            0.25 * inventory_completed as f32 / inventory_total.max(1) as f32,
+            format!("Parsing inventory resource {}", resource.url),
+        );
         let Some(endpoint) = endpoints
             .iter_mut()
             .find(|endpoint| endpoint.ip == resource.ip && endpoint.port == resource.port)
@@ -345,7 +381,15 @@ pub(super) async fn analyze(
             detect_url_components(endpoint, &url);
         }
         import_product_components(endpoint);
+        infer_runtime_components(endpoint);
+        inventory_completed += 1;
+        send_technology_progress(
+            progress,
+            0.25 * inventory_completed as f32 / inventory_total.max(1) as f32,
+            format!("Built inventory for {}:{}", endpoint.ip, endpoint.port),
+        );
     }
+    send_technology_progress(progress, 0.25, "Inventory parsing complete".to_owned());
 
     let mut cache = HashMap::<(TechnologyEcosystem, String), LatestResult>::new();
     seed_javascript_cache(endpoints, &mut cache);
@@ -386,9 +430,17 @@ pub(super) async fn analyze(
         }
     }
 
-    fetch_lookup_jobs(jobs, &mut cache, request, cancel, limiter, enrichment).await;
+    fetch_lookup_jobs(
+        jobs, &mut cache, request, cancel, limiter, enrichment, progress,
+    )
+    .await;
 
     let mut warning_groups = BTreeMap::<(TechnologyEcosystem, String), HashSet<String>>::new();
+    let application_total = endpoints
+        .iter()
+        .map(|endpoint| endpoint.technology_components.len())
+        .sum::<usize>();
+    let mut application_completed = 0usize;
     for endpoint in endpoints.iter_mut() {
         for component in &mut endpoint.technology_components {
             if component.status == TechnologyVersionStatus::Unknown {
@@ -424,6 +476,14 @@ pub(super) async fn analyze(
                     .or_default()
                     .insert(identifier.to_owned());
             }
+            application_completed += 1;
+            if !cancel.is_cancelled() {
+                send_technology_progress(
+                    progress,
+                    0.80 + 0.20 * application_completed as f32 / application_total.max(1) as f32,
+                    format!("Applied {application_completed} / {application_total} results"),
+                );
+            }
         }
         endpoint.technology_components.sort_by(|left, right| {
             left.kind
@@ -441,6 +501,15 @@ pub(super) async fn analyze(
             )
         })
         .collect();
+    if !cancel.is_cancelled() {
+        send_phase_progress(
+            progress,
+            ExposureScanPhase::TechnologyAnalysis,
+            ExposureScanPhaseState::Complete,
+            1.0,
+            format!("Applied {application_total} technology results"),
+        );
+    }
     AnalysisReport {
         findings: outdated_findings(endpoints),
         warnings,
@@ -453,6 +522,7 @@ fn lookup_priority(component: &TechnologyComponent, identifier: &str) -> (u8, u8
         TechnologyComponentKind::Server
             | TechnologyComponentKind::Runtime
             | TechnologyComponentKind::Framework
+            | TechnologyComponentKind::Cms
     );
     let high = component.confidence == Confidence::High;
     let group = match (high, preferred) {
@@ -465,8 +535,9 @@ fn lookup_priority(component: &TechnologyComponent, identifier: &str) -> (u8, u8
         TechnologyComponentKind::Server => 0,
         TechnologyComponentKind::Runtime => 1,
         TechnologyComponentKind::Framework => 2,
-        TechnologyComponentKind::Plugin => 3,
-        TechnologyComponentKind::Package => 4,
+        TechnologyComponentKind::Cms => 3,
+        TechnologyComponentKind::Plugin => 4,
+        TechnologyComponentKind::Package => 5,
     };
     (group, kind, identifier.to_owned())
 }
@@ -478,6 +549,7 @@ async fn fetch_lookup_jobs(
     cancel: &CancellationToken,
     limiter: &ConnectionRateLimiter,
     enrichment: &mut javascript::EnrichmentState,
+    progress: &Option<Sender<ExposureScanProgress>>,
 ) {
     enrichment.start();
     let mut jobs = jobs.into_iter().collect::<Vec<_>>();
@@ -509,6 +581,13 @@ async fn fetch_lookup_jobs(
     }
     let mut requests = requests.into_iter().collect::<Vec<_>>();
     requests.sort_by(|left, right| left.1.0.cmp(&right.1.0).then(left.0.cmp(&right.0)));
+    let metadata_total = requests.len() + jobs.len();
+    let mut metadata_completed = 0usize;
+    send_technology_progress(
+        progress,
+        0.25,
+        format!("Checking {metadata_total} metadata records"),
+    );
 
     let context = enrichment.fetch_context();
     let mut pending = FuturesUnordered::new();
@@ -526,6 +605,13 @@ async fn fetch_lookup_jobs(
             let body_limit = MAX_METADATA_BYTES.min(available);
             let (url, (_, accept)) = requests[next].clone();
             next += 1;
+            if !cancel.is_cancelled() {
+                send_technology_progress(
+                    progress,
+                    0.25 + 0.55 * metadata_completed as f32 / metadata_total.max(1) as f32,
+                    format!("Fetching technology metadata: {url}"),
+                );
+            }
             reserved += body_limit;
             let context = context.clone();
             pending.push(async move {
@@ -543,6 +629,14 @@ async fn fetch_lookup_jobs(
         reserved = reserved.saturating_sub(body_limit);
         enrichment.store(url.clone(), result.clone());
         fetched.insert(url, result);
+        metadata_completed += 1;
+        if !cancel.is_cancelled() {
+            send_technology_progress(
+                progress,
+                0.25 + 0.55 * metadata_completed as f32 / metadata_total.max(1) as f32,
+                format!("Fetched {metadata_completed} / {metadata_total} metadata records"),
+            );
+        }
     }
     if next < requests.len() {
         let error = enrichment
@@ -552,6 +646,7 @@ async fn fetch_lookup_jobs(
         for (url, _) in &requests[next..] {
             fetched.insert(url.clone(), metadata_error(url, &error));
         }
+        metadata_completed += requests.len() - next;
     }
 
     for (key, job) in jobs {
@@ -572,7 +667,32 @@ async fn fetch_lookup_jobs(
             },
         };
         cache.insert(key, result);
+        metadata_completed += 1;
+        if !cancel.is_cancelled() {
+            send_technology_progress(
+                progress,
+                0.25 + 0.55 * metadata_completed as f32 / metadata_total.max(1) as f32,
+                format!("Parsed {metadata_completed} / {metadata_total} metadata records"),
+            );
+        }
     }
+    if !cancel.is_cancelled() {
+        send_technology_progress(progress, 0.80, "Metadata lookups complete".to_owned());
+    }
+}
+
+fn send_technology_progress(
+    progress: &Option<Sender<ExposureScanProgress>>,
+    fraction: f32,
+    text: String,
+) {
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::TechnologyAnalysis,
+        ExposureScanPhaseState::Running,
+        fraction,
+        text,
+    );
 }
 
 fn metadata_error(url: &str, error: &str) -> javascript::Fetched {
@@ -626,7 +746,7 @@ fn import_javascript_components(endpoint: &mut EndpointScan) {
                 installed_version: library.installed_version.clone(),
                 latest_version: library.latest_version.clone(),
                 status: if library.installed_version.is_some() {
-                    javascript_status(library.status)
+                    library.status
                 } else {
                     TechnologyVersionStatus::InventoryOnly
                 },
@@ -649,20 +769,6 @@ fn import_javascript_components(endpoint: &mut EndpointScan) {
     }
     for component in components {
         merge_component(&mut endpoint.technology_components, component);
-    }
-}
-
-fn javascript_status(status: JavaScriptVersionStatus) -> TechnologyVersionStatus {
-    match status {
-        JavaScriptVersionStatus::Unknown => TechnologyVersionStatus::Unknown,
-        JavaScriptVersionStatus::NotChecked => TechnologyVersionStatus::NotChecked,
-        JavaScriptVersionStatus::Current => TechnologyVersionStatus::Current,
-        JavaScriptVersionStatus::OutdatedPatch => TechnologyVersionStatus::OutdatedPatch,
-        JavaScriptVersionStatus::OutdatedMinor => TechnologyVersionStatus::OutdatedMinor,
-        JavaScriptVersionStatus::OutdatedMajor => TechnologyVersionStatus::OutdatedMajor,
-        JavaScriptVersionStatus::NewerThanLatest => TechnologyVersionStatus::NewerThanLatest,
-        JavaScriptVersionStatus::Prerelease => TechnologyVersionStatus::Prerelease,
-        JavaScriptVersionStatus::Unverifiable => TechnologyVersionStatus::Unverifiable,
     }
 }
 
@@ -792,10 +898,14 @@ fn component(
         } else {
             Confidence::Medium
         },
-        release_source_url: identifier
-            .filter(|_| ecosystem == TechnologyEcosystem::WebServer)
-            .and_then(web_server_release_source)
-            .map(str::to_owned),
+        release_source_url: if ecosystem == TechnologyEcosystem::Moodle {
+            Some(MOODLE_LATEST_RELEASE_URL.to_owned())
+        } else {
+            identifier
+                .filter(|_| ecosystem == TechnologyEcosystem::WebServer)
+                .and_then(web_server_release_source)
+                .map(str::to_owned)
+        },
         evidence_urls: vec![url.to_owned()],
         evidence: vec![evidence],
         check_error: None,
@@ -807,29 +917,73 @@ fn known_kind(ecosystem: TechnologyEcosystem, identifier: &str) -> TechnologyCom
     let framework = match ecosystem {
         TechnologyEcosystem::Npm => matches!(
             id.as_str(),
-            "react" | "vue" | "@angular/core" | "next" | "nuxt" | "express" | "svelte"
+            "react"
+                | "vue"
+                | "@angular/core"
+                | "next"
+                | "nuxt"
+                | "express"
+                | "svelte"
+                | "fastify"
+                | "koa"
+                | "@hapi/hapi"
+                | "@nestjs/core"
         ),
+        TechnologyEcosystem::Composer if id == "silverstripe/cms" => {
+            return TechnologyComponentKind::Cms;
+        }
         TechnologyEcosystem::Composer => {
             matches!(
                 id.as_str(),
                 "laravel/framework"
                     | "symfony/framework-bundle"
                     | "sulu/sulu"
-                    | "silverstripe/cms"
                     | "magento/product-community-edition"
             )
         }
         TechnologyEcosystem::PyPi => {
-            matches!(id.as_str(), "django" | "flask" | "fastapi")
+            matches!(
+                id.as_str(),
+                "django"
+                    | "flask"
+                    | "fastapi"
+                    | "sanic"
+                    | "starlette"
+                    | "bottle"
+                    | "pyramid"
+                    | "falcon"
+                    | "quart"
+                    | "litestar"
+            )
         }
-        TechnologyEcosystem::RubyGems => matches!(id.as_str(), "rails" | "sinatra"),
+        TechnologyEcosystem::RubyGems => matches!(id.as_str(), "rails" | "sinatra" | "roda"),
         TechnologyEcosystem::MavenCentral => id.starts_with("org.springframework:"),
         TechnologyEcosystem::NuGet => id.starts_with("microsoft.aspnetcore"),
         TechnologyEcosystem::GoModules => {
-            id == "github.com/gin-gonic/gin" || id == "github.com/labstack/echo/v4"
+            matches!(
+                id.as_str(),
+                "github.com/gofiber/fiber/v2"
+                    | "github.com/gofiber/fiber/v3"
+                    | "github.com/beego/beego/v2"
+                    | "github.com/gin-gonic/gin"
+                    | "github.com/labstack/echo/v4"
+                    | "github.com/labstack-go/echo/v5"
+                    | "github.com/revel/revel"
+                    | "github.com/cloudwego/hertz"
+                    | "github.com/gogf/gf/v2"
+                    | "github.com/gobuffalo/buffalo"
+                    | "github.com/go-chi/chi/v5"
+            )
         }
-        TechnologyEcosystem::CratesIo => matches!(id.as_str(), "actix-web" | "rocket" | "axum"),
+        TechnologyEcosystem::CratesIo => matches!(
+            id.as_str(),
+            "actix-web" | "rocket" | "axum" | "salvo" | "poem"
+        ),
+        TechnologyEcosystem::WordPress if id == "wordpress" => {
+            return TechnologyComponentKind::Cms;
+        }
         TechnologyEcosystem::WordPress => return TechnologyComponentKind::Plugin,
+        TechnologyEcosystem::Moodle => return TechnologyComponentKind::Cms,
         TechnologyEcosystem::Runtime => return TechnologyComponentKind::Runtime,
         TechnologyEcosystem::WebServer => return TechnologyComponentKind::Server,
         TechnologyEcosystem::JavaScript => false,
@@ -851,25 +1005,21 @@ fn parse_resource(resource: &CapturedTechnologyResource) -> Vec<TechnologyCompon
         .unwrap_or_else(|| resource.fetch_url.to_ascii_lowercase());
     let name = path.rsplit('/').next().unwrap_or(&path);
     match name {
-        "package.json" => parse_package_json(resource),
+        "package.json" | "composer.json" => parse_dependency_manifest(resource, name),
         "package-lock.json" | "npm-shrinkwrap.json" => parse_package_lock(resource),
         "yarn.lock" => parse_yarn_lock(resource),
-        "pnpm-lock.yaml" => parse_pnpm_lock(resource),
-        "composer.json" => parse_composer_json(resource),
         "composer.lock" => parse_composer_lock(resource),
         "requirements.txt" | "pipfile" => parse_python_inventory(resource),
         "pyproject.toml" => parse_pyproject(resource),
         "pipfile.lock" => parse_pipfile_lock(resource),
         "poetry.lock" | "uv.lock" => parse_toml_package_lock(resource, TechnologyEcosystem::PyPi),
         "gemfile" => parse_gemfile(resource),
-        "gemfile.lock" => parse_gemfile_lock(resource),
         "pom.xml" => parse_pom(resource),
-        "build.gradle" | "build.gradle.kts" => parse_gradle_inventory(resource),
-        "gradle.lockfile" => parse_gradle_lock(resource),
+        "pnpm-lock.yaml" | "gemfile.lock" | "build.gradle" | "build.gradle.kts"
+        | "gradle.lockfile" | "go.mod" => parse_regex_inventory(resource, name),
         "packages.config" => parse_nuget_xml(resource, true),
         "directory.packages.props" => parse_nuget_xml(resource, false),
         "packages.lock.json" => parse_nuget_lock(resource),
-        "go.mod" => parse_go_mod(resource),
         "go.sum" => parse_go_sum(resource),
         "cargo.toml" => parse_cargo_manifest(resource),
         "cargo.lock" => parse_toml_package_lock(resource, TechnologyEcosystem::CratesIo),
@@ -877,15 +1027,26 @@ fn parse_resource(resource: &CapturedTechnologyResource) -> Vec<TechnologyCompon
     }
 }
 
-fn parse_package_json(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
+fn parse_dependency_manifest(
+    resource: &CapturedTechnologyResource,
+    manifest: &str,
+) -> Vec<TechnologyComponent> {
     let Ok(value) = serde_json::from_slice::<Value>(&resource.body) else {
         return Vec::new();
     };
     let Some(root) = value.as_object() else {
         return Vec::new();
     };
-    ["dependencies", "devDependencies", "peerDependencies"]
-        .into_iter()
+    let (ecosystem, sections): (_, &[&str]) = match manifest {
+        "composer.json" => (TechnologyEcosystem::Composer, &["require", "require-dev"]),
+        _ => (
+            TechnologyEcosystem::Npm,
+            &["dependencies", "devDependencies", "peerDependencies"],
+        ),
+    };
+    sections
+        .iter()
+        .copied()
         .filter_map(|key| {
             root.get(key)
                 .and_then(Value::as_object)
@@ -893,15 +1054,20 @@ fn parse_package_json(resource: &CapturedTechnologyResource) -> Vec<TechnologyCo
         })
         .flat_map(|(key, dependencies)| {
             dependencies.iter().filter_map(move |(name, value)| {
+                if ecosystem == TechnologyEcosystem::Composer
+                    && (name == "php" || name.starts_with("ext-"))
+                {
+                    return None;
+                }
                 let requested = value.as_str()?;
                 Some(component(
                     name,
-                    TechnologyEcosystem::Npm,
+                    ecosystem,
                     Some(name),
                     Some(requested),
                     false,
                     &resource.url,
-                    format!("package.json {key} requests {requested}"),
+                    format!("{manifest} {key} requests {requested}"),
                 ))
             })
         })
@@ -967,6 +1133,68 @@ fn collect_npm_lock_dependencies(
     }
 }
 
+fn parse_regex_inventory(
+    resource: &CapturedTechnologyResource,
+    manifest: &str,
+) -> Vec<TechnologyComponent> {
+    let (ecosystem, pattern, evidence, installed) = match manifest {
+        "pnpm-lock.yaml" => (
+            TechnologyEcosystem::Npm,
+            r#"(?m)^\s{0,4}['\"]?/?((?:@[^/@\s]+/)?[^@:\s'\"]+)@([0-9][^:\s'\"]*)['\"]?:"#,
+            "pnpm lockfile pins",
+            true,
+        ),
+        "gemfile.lock" => (
+            TechnologyEcosystem::RubyGems,
+            r"(?m)^ {4}([A-Za-z0-9_.-]+) \(([^ )]+)\)",
+            "Gemfile.lock pins",
+            true,
+        ),
+        "build.gradle" | "build.gradle.kts" => (
+            TechnologyEcosystem::MavenCentral,
+            r#"[\"']([A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+):([^\"']+)[\"']"#,
+            "Gradle dependency requests",
+            false,
+        ),
+        "gradle.lockfile" => (
+            TechnologyEcosystem::MavenCentral,
+            r"(?m)^([A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+):([^=\s]+)=",
+            "Gradle lockfile pins",
+            true,
+        ),
+        "go.mod" => (
+            TechnologyEcosystem::GoModules,
+            r"(?m)^\s*([A-Za-z0-9._~/-]+)\s+(v[0-9][^\s]*)",
+            "go.mod requires",
+            false,
+        ),
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&resource.body);
+    Regex::new(pattern)
+        .expect("valid regex")
+        .captures_iter(&text)
+        .filter_map(|captures| {
+            let identifier = captures.get(1)?.as_str();
+            let version = captures.get(2)?.as_str();
+            let name = if ecosystem == TechnologyEcosystem::MavenCentral {
+                identifier.rsplit(':').next()?
+            } else {
+                identifier
+            };
+            Some(component(
+                name,
+                ecosystem,
+                Some(identifier),
+                Some(version),
+                installed && exact_version(version),
+                &resource.url,
+                format!("{evidence} {version}"),
+            ))
+        })
+        .collect()
+}
+
 fn parse_yarn_lock(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
     let text = String::from_utf8_lossy(&resource.body);
     let version = Regex::new(r#"^\s*version\s+\"([^\"]+)\""#).expect("valid regex");
@@ -1012,63 +1240,6 @@ fn yarn_name(spec: &str) -> Option<String> {
     Some(spec.split('@').next()?.to_owned()).filter(|name| !name.is_empty())
 }
 
-fn parse_pnpm_lock(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let text = String::from_utf8_lossy(&resource.body);
-    let pattern =
-        Regex::new(r#"(?m)^\s{0,4}['\"]?/?((?:@[^/@\s]+/)?[^@:\s'\"]+)@([0-9][^:\s'\"]*)['\"]?:"#)
-            .expect("valid regex");
-    pattern
-        .captures_iter(&text)
-        .filter_map(|captures| {
-            let name = captures.get(1)?.as_str();
-            let version = captures.get(2)?.as_str();
-            Some(component(
-                name,
-                TechnologyEcosystem::Npm,
-                Some(name),
-                Some(version),
-                exact_version(version),
-                &resource.url,
-                format!("pnpm lockfile pins {version}"),
-            ))
-        })
-        .collect()
-}
-
-fn parse_composer_json(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let Ok(value) = serde_json::from_slice::<Value>(&resource.body) else {
-        return Vec::new();
-    };
-    let Some(root) = value.as_object() else {
-        return Vec::new();
-    };
-    ["require", "require-dev"]
-        .into_iter()
-        .filter_map(|key| {
-            root.get(key)
-                .and_then(Value::as_object)
-                .map(|map| (key, map))
-        })
-        .flat_map(|(key, dependencies)| {
-            dependencies.iter().filter_map(move |(name, value)| {
-                if name == "php" || name.starts_with("ext-") {
-                    return None;
-                }
-                let requested = value.as_str()?;
-                Some(component(
-                    name,
-                    TechnologyEcosystem::Composer,
-                    Some(name),
-                    Some(requested),
-                    false,
-                    &resource.url,
-                    format!("composer.json {key} requests {requested}"),
-                ))
-            })
-        })
-        .collect()
-}
-
 fn parse_composer_lock(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
     let Ok(value) = serde_json::from_slice::<Value>(&resource.body) else {
         return Vec::new();
@@ -1101,10 +1272,7 @@ fn parse_python_inventory(resource: &CapturedTechnologyResource) -> Vec<Technolo
         .captures_iter(&text)
         .filter_map(|captures| {
             let name = captures.get(1)?.as_str();
-            if matches!(
-                name.to_ascii_lowercase().as_str(),
-                "python" | "source" | "requires-python"
-            ) {
+            if crate::matches_ascii(name, &["python", "source", "requires-python"]) {
                 return None;
             }
             let spec = captures.get(3).map_or("", |value| value.as_str());
@@ -1292,27 +1460,6 @@ fn parse_gemfile(resource: &CapturedTechnologyResource) -> Vec<TechnologyCompone
         .collect()
 }
 
-fn parse_gemfile_lock(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let text = String::from_utf8_lossy(&resource.body);
-    let pattern = Regex::new(r"(?m)^ {4}([A-Za-z0-9_.-]+) \(([^ )]+)\)").expect("valid regex");
-    pattern
-        .captures_iter(&text)
-        .filter_map(|captures| {
-            let name = captures.get(1)?.as_str();
-            let version = captures.get(2)?.as_str();
-            Some(component(
-                name,
-                TechnologyEcosystem::RubyGems,
-                Some(name),
-                Some(version),
-                exact_version(version),
-                &resource.url,
-                format!("Gemfile.lock pins {version}"),
-            ))
-        })
-        .collect()
-}
-
 fn parse_pom(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
     if !valid_xml(&resource.body) {
         return Vec::new();
@@ -1344,54 +1491,6 @@ fn parse_pom(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> 
         .collect()
 }
 
-fn parse_gradle_inventory(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let text = String::from_utf8_lossy(&resource.body);
-    let pattern = Regex::new(r#"[\"']([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([^\"']+)[\"']"#)
-        .expect("valid regex");
-    pattern
-        .captures_iter(&text)
-        .filter_map(|captures| {
-            let group = captures.get(1)?.as_str();
-            let artifact = captures.get(2)?.as_str();
-            let requested = captures.get(3)?.as_str();
-            let identifier = format!("{group}:{artifact}");
-            Some(component(
-                artifact,
-                TechnologyEcosystem::MavenCentral,
-                Some(&identifier),
-                Some(requested),
-                false,
-                &resource.url,
-                format!("Gradle dependency requests {requested}"),
-            ))
-        })
-        .collect()
-}
-
-fn parse_gradle_lock(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let text = String::from_utf8_lossy(&resource.body);
-    let pattern =
-        Regex::new(r"(?m)^([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([^=\s]+)=").expect("valid regex");
-    pattern
-        .captures_iter(&text)
-        .filter_map(|captures| {
-            let group = captures.get(1)?.as_str();
-            let artifact = captures.get(2)?.as_str();
-            let version = captures.get(3)?.as_str();
-            let identifier = format!("{group}:{artifact}");
-            Some(component(
-                artifact,
-                TechnologyEcosystem::MavenCentral,
-                Some(&identifier),
-                Some(version),
-                exact_version(version),
-                &resource.url,
-                format!("Gradle lockfile pins {version}"),
-            ))
-        })
-        .collect()
-}
-
 fn parse_nuget_xml(
     resource: &CapturedTechnologyResource,
     installed_manifest: bool,
@@ -1410,50 +1509,28 @@ fn parse_nuget_xml(
     .expect("valid regex");
     let package_version = Regex::new(r#"(?i)<PackageVersion\b[^>]*\bInclude=[\"']([^\"']+)[\"'][^>]*\bVersion=[\"']([^\"']+)[\"'][^>]*/?>"#)
         .expect("valid regex");
-    package
-        .captures_iter(&text)
-        .filter_map(|captures| {
-            nuget_xml_component(
-                resource,
-                captures.get(1)?.as_str(),
-                captures.get(2)?.as_str(),
-                installed_manifest,
-            )
+    [
+        (&package, 1, 2),
+        (&version_first, 2, 1),
+        (&package_version, 1, 2),
+    ]
+    .into_iter()
+    .flat_map(|(pattern, name, version)| {
+        pattern.captures_iter(&text).filter_map(move |captures| {
+            let name = captures.get(name)?.as_str();
+            let version = captures.get(version)?.as_str();
+            Some(component(
+                name,
+                TechnologyEcosystem::NuGet,
+                Some(name),
+                Some(version),
+                installed_manifest && exact_version(version),
+                &resource.url,
+                format!("NuGet package manifest records {version}"),
+            ))
         })
-        .chain(version_first.captures_iter(&text).filter_map(|captures| {
-            nuget_xml_component(
-                resource,
-                captures.get(2)?.as_str(),
-                captures.get(1)?.as_str(),
-                installed_manifest,
-            )
-        }))
-        .chain(package_version.captures_iter(&text).filter_map(|captures| {
-            nuget_xml_component(
-                resource,
-                captures.get(1)?.as_str(),
-                captures.get(2)?.as_str(),
-                installed_manifest,
-            )
-        }))
-        .collect()
-}
-
-fn nuget_xml_component(
-    resource: &CapturedTechnologyResource,
-    name: &str,
-    version: &str,
-    installed_manifest: bool,
-) -> Option<TechnologyComponent> {
-    Some(component(
-        name,
-        TechnologyEcosystem::NuGet,
-        Some(name),
-        Some(version),
-        installed_manifest && exact_version(version),
-        &resource.url,
-        format!("NuGet package manifest records {version}"),
-    ))
+    })
+    .collect()
 }
 
 fn parse_nuget_lock(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
@@ -1477,27 +1554,6 @@ fn parse_nuget_lock(resource: &CapturedTechnologyResource) -> Vec<TechnologyComp
                 exact_version(version),
                 &resource.url,
                 format!("packages.lock.json pins {version}"),
-            ))
-        })
-        .collect()
-}
-
-fn parse_go_mod(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let text = String::from_utf8_lossy(&resource.body);
-    let pattern = Regex::new(r"(?m)^\s*([A-Za-z0-9._~/-]+)\s+(v[0-9][^\s]*)").expect("valid regex");
-    pattern
-        .captures_iter(&text)
-        .filter_map(|captures| {
-            let name = captures.get(1)?.as_str();
-            let requested = captures.get(2)?.as_str();
-            Some(component(
-                name,
-                TechnologyEcosystem::GoModules,
-                Some(name),
-                Some(requested),
-                false,
-                &resource.url,
-                format!("go.mod requires {requested}"),
             ))
         })
         .collect()
@@ -1604,14 +1660,37 @@ fn exact_version(value: &str) -> bool {
         && version_numbers(&value).is_some()
 }
 
+fn exact_moodle_version(value: &str) -> bool {
+    matches!(
+        value
+            .trim()
+            .split('.')
+            .try_fold(0, |count, part| (!part.is_empty()
+                && part.chars().all(|character| character.is_ascii_digit()))
+            .then_some(count + 1)),
+        Some(2..=4)
+    )
+}
+
+fn exact_moodle_generator_version(evidence: &str) -> Option<String> {
+    let metadata = evidence.strip_prefix("Generator metadata:")?.trim();
+    capture(
+        metadata,
+        r#"(?i)^Moodle\s+([0-9]+(?:\.[0-9]+){1,3})(?:\s*(?:\(|$))"#,
+    )
+}
+
 fn normalize_version(value: &str) -> String {
+    normalized_version(value).to_owned()
+}
+
+fn normalized_version(value: &str) -> &str {
     value
         .trim()
         .trim_start_matches('=')
         .trim_start()
         .trim_start_matches(['v', 'V'])
         .trim_end_matches("+incompatible")
-        .to_owned()
 }
 
 fn detect_url_components(endpoint: &mut EndpointScan, url: &str) {
@@ -1673,6 +1752,49 @@ fn detect_content_components(endpoint: &mut EndpointScan, resource: &CapturedTec
     let text = String::from_utf8_lossy(&resource.body);
     let lower = text.to_ascii_lowercase();
     let mut detected = Vec::new();
+    for detection in crate::web_server::detect_web_servers(
+        resource
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        &resource.body,
+        Some(resource.status),
+        Some(&resource.url),
+    ) {
+        let layer = match detection.role {
+            crate::web_server::WebProductRole::Server => ProductLayer::Server,
+            crate::web_server::WebProductRole::Proxy => ProductLayer::Proxy,
+            crate::web_server::WebProductRole::Framework => ProductLayer::Framework,
+            crate::web_server::WebProductRole::Runtime => ProductLayer::Runtime,
+        };
+        let confidence = match detection.confidence {
+            crate::web_server::FingerprintConfidence::High => Confidence::High,
+            crate::web_server::FingerprintConfidence::Medium => Confidence::Medium,
+        };
+        for evidence in detection.evidence {
+            super::add_product(
+                endpoint,
+                detection.product,
+                layer,
+                detection.version.clone(),
+                confidence,
+                evidence,
+            );
+        }
+    }
+    if crate::web_server::is_fastapi_branded_document(&resource.fetch_url, &resource.body) {
+        super::add_product(
+            endpoint,
+            "FastAPI",
+            ProductLayer::Framework,
+            None,
+            Confidence::High,
+            format!(
+                "FastAPI-branded OpenAPI or Swagger content at {}",
+                resource.url
+            ),
+        );
+    }
     if lower.contains("__react_devtools_global_hook__")
         || lower.contains("data-reactroot")
         || lower.contains("react.production.min")
@@ -1735,7 +1857,20 @@ fn detect_content_components(endpoint: &mut EndpointScan, resource: &CapturedTec
             "Nuxt __NUXT__ marker",
         ));
     }
-    if lower.contains("csrfmiddlewaretoken") {
+    if lower.contains("name=\"csrfmiddlewaretoken\"")
+        || lower.contains("name='csrfmiddlewaretoken'")
+    {
+        super::add_product(
+            endpoint,
+            "Django",
+            ProductLayer::Framework,
+            None,
+            Confidence::Medium,
+            format!(
+                "Django csrfmiddlewaretoken form control at {}",
+                resource.url
+            ),
+        );
         detected.push(fingerprint_component(
             "Django",
             TechnologyEcosystem::PyPi,
@@ -1744,6 +1879,16 @@ fn detect_content_components(endpoint: &mut EndpointScan, resource: &CapturedTec
             resource,
             "Django CSRF field marker",
         ));
+    }
+    if lower.contains("csrf verification failed. request aborted") {
+        super::add_product(
+            endpoint,
+            "Django",
+            ProductLayer::Framework,
+            None,
+            Confidence::High,
+            format!("Distinctive Django CSRF failure page at {}", resource.url),
+        );
     }
     if lower.contains("rails-ujs") || (lower.contains("csrf-param") && lower.contains("csrf-token"))
     {
@@ -1819,7 +1964,30 @@ fn detect_content_components(endpoint: &mut EndpointScan, resource: &CapturedTec
             &resource.url,
             format!("WordPress generator exposes {version}"),
         );
-        item.kind = TechnologyComponentKind::Framework;
+        item.kind = TechnologyComponentKind::Cms;
+        detected.push(item);
+    }
+    if let Some(version) = capture(
+        &text,
+        r#"(?i)<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"']moodle\s+([0-9][0-9A-Za-z._+-]*)"#,
+    )
+    .or_else(|| {
+        capture(
+            &text,
+            r#"(?i)<meta[^>]+content=[\"']moodle\s+([0-9][0-9A-Za-z._+-]*)[\"'][^>]+name=[\"']generator[\"']"#,
+        )
+    }) {
+        let exact = exact_moodle_version(&version);
+        let mut item = component(
+            "Moodle",
+            TechnologyEcosystem::Moodle,
+            Some("moodle"),
+            Some(&version),
+            exact,
+            &resource.url,
+            format!("Moodle generator exposes {version}"),
+        );
+        item.kind = TechnologyComponentKind::Cms;
         detected.push(item);
     }
     for component in detected {
@@ -1846,260 +2014,1156 @@ fn fingerprint_component(
     )
 }
 
+#[derive(Clone, Copy)]
+struct ProductComponentMapping {
+    aliases: &'static [&'static str],
+    product_layer: Option<ProductLayer>,
+    name: &'static str,
+    ecosystem: TechnologyEcosystem,
+    package_identifier: Option<&'static str>,
+    kind: TechnologyComponentKind,
+    implied_runtime: Option<(&'static str, Option<&'static str>)>,
+}
+
+macro_rules! product_mapping {
+    ($aliases:expr, $layer:expr, $name:expr, $ecosystem:ident, $package:expr, $kind:ident, $runtime:expr) => {
+        ProductComponentMapping {
+            aliases: $aliases,
+            product_layer: $layer,
+            name: $name,
+            ecosystem: TechnologyEcosystem::$ecosystem,
+            package_identifier: $package,
+            kind: TechnologyComponentKind::$kind,
+            implied_runtime: $runtime,
+        }
+    };
+}
+
+const PRODUCT_COMPONENT_MAPPINGS: &[ProductComponentMapping] = &[
+    product_mapping!(
+        &["nginx"],
+        None,
+        "nginx",
+        WebServer,
+        Some("nginx"),
+        Server,
+        None
+    ),
+    product_mapping!(
+        &["openresty"],
+        None,
+        "OpenResty",
+        WebServer,
+        Some("openresty"),
+        Server,
+        None
+    ),
+    product_mapping!(
+        &["apache http server", "apache"],
+        None,
+        "Apache HTTP Server",
+        WebServer,
+        Some("apache-httpd"),
+        Server,
+        None
+    ),
+    product_mapping!(
+        &["microsoft iis", "iis"],
+        None,
+        "Microsoft IIS",
+        WebServer,
+        Some("iis"),
+        Server,
+        None
+    ),
+    product_mapping!(
+        &["caddy"],
+        None,
+        "Caddy",
+        WebServer,
+        Some("caddy"),
+        Server,
+        None
+    ),
+    product_mapping!(
+        &["litespeed"],
+        None,
+        "LiteSpeed",
+        WebServer,
+        Some("litespeed"),
+        Server,
+        None
+    ),
+    product_mapping!(
+        &["openlitespeed"],
+        None,
+        "OpenLiteSpeed",
+        WebServer,
+        Some("openlitespeed"),
+        Server,
+        None
+    ),
+    product_mapping!(
+        &["lighttpd"],
+        None,
+        "lighttpd",
+        WebServer,
+        Some("lighttpd"),
+        Server,
+        None
+    ),
+    product_mapping!(
+        &["apache tomcat", "tomcat"],
+        None,
+        "Apache Tomcat",
+        WebServer,
+        Some("tomcat"),
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["jetty"],
+        None,
+        "Jetty",
+        WebServer,
+        Some("jetty"),
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["kestrel"],
+        None,
+        "Kestrel",
+        WebServer,
+        Some("kestrel"),
+        Server,
+        Some((".NET", Some("dotnet")))
+    ),
+    product_mapping!(
+        &["undertow"],
+        None,
+        "Undertow",
+        WebServer,
+        None,
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["wildfly"],
+        None,
+        "WildFly",
+        WebServer,
+        None,
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &[
+            "jboss eap",
+            "jboss-eap",
+            "jboss application server",
+            "jboss",
+        ],
+        None,
+        "JBoss EAP",
+        WebServer,
+        None,
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["glassfish", "oracle glassfish server", "eclipse glassfish"],
+        None,
+        "GlassFish",
+        WebServer,
+        None,
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["payara server", "payara"],
+        None,
+        "Payara Server",
+        WebServer,
+        None,
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["oracle weblogic server", "weblogic server", "weblogic"],
+        None,
+        "Oracle WebLogic Server",
+        WebServer,
+        None,
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &[
+            "ibm websphere application server",
+            "websphere application server",
+            "websphere"
+        ],
+        None,
+        "IBM WebSphere Application Server",
+        WebServer,
+        None,
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["netty"],
+        None,
+        "Netty",
+        WebServer,
+        None,
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["grizzly"],
+        None,
+        "Grizzly",
+        WebServer,
+        None,
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["resin"],
+        None,
+        "Resin",
+        WebServer,
+        None,
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["winstone"],
+        None,
+        "Winstone",
+        WebServer,
+        None,
+        Server,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["gunicorn"],
+        None,
+        "gunicorn",
+        PyPi,
+        Some("gunicorn"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["uvicorn"],
+        None,
+        "Uvicorn",
+        PyPi,
+        Some("uvicorn"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["werkzeug"],
+        None,
+        "Werkzeug",
+        PyPi,
+        Some("Werkzeug"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["hypercorn"],
+        None,
+        "Hypercorn",
+        PyPi,
+        Some("hypercorn"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["waitress"],
+        None,
+        "Waitress",
+        PyPi,
+        Some("waitress"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["cherrypy"],
+        None,
+        "CherryPy",
+        PyPi,
+        Some("CherryPy"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["tornadoserver", "tornado server", "tornado"],
+        None,
+        "TornadoServer",
+        PyPi,
+        Some("tornado"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["twistedweb", "twisted web", "twisted"],
+        None,
+        "TwistedWeb",
+        PyPi,
+        Some("Twisted"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["aiohttp"],
+        None,
+        "aiohttp",
+        PyPi,
+        Some("aiohttp"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["daphne"],
+        None,
+        "Daphne",
+        PyPi,
+        Some("daphne"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["granian"],
+        None,
+        "Granian",
+        PyPi,
+        Some("granian"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["gevent"],
+        None,
+        "gevent",
+        PyPi,
+        Some("gevent"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["mod_wsgi", "mod-wsgi"],
+        None,
+        "mod_wsgi",
+        PyPi,
+        Some("mod_wsgi"),
+        Server,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["sanic"],
+        None,
+        "Sanic",
+        PyPi,
+        Some("sanic"),
+        Framework,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["flask"],
+        None,
+        "Flask",
+        PyPi,
+        Some("Flask"),
+        Framework,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["django"],
+        None,
+        "Django",
+        PyPi,
+        Some("Django"),
+        Framework,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["fastapi"],
+        None,
+        "FastAPI",
+        PyPi,
+        Some("fastapi"),
+        Framework,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["starlette"],
+        None,
+        "Starlette",
+        PyPi,
+        Some("starlette"),
+        Framework,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["bottle"],
+        None,
+        "Bottle",
+        PyPi,
+        Some("bottle"),
+        Framework,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["pyramid"],
+        None,
+        "Pyramid",
+        PyPi,
+        Some("pyramid"),
+        Framework,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["falcon"],
+        Some(ProductLayer::Framework),
+        "Falcon",
+        PyPi,
+        Some("falcon"),
+        Framework,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["quart"],
+        None,
+        "Quart",
+        PyPi,
+        Some("Quart"),
+        Framework,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["litestar"],
+        None,
+        "Litestar",
+        PyPi,
+        Some("litestar"),
+        Framework,
+        Some(("Python", Some("python")))
+    ),
+    product_mapping!(
+        &["fasthttp"],
+        None,
+        "fasthttp",
+        GoModules,
+        Some("github.com/valyala/fasthttp"),
+        Server,
+        Some(("Go", Some("go")))
+    ),
+    product_mapping!(
+        &["fiber"],
+        None,
+        "Fiber",
+        GoModules,
+        Some("github.com/gofiber/fiber/v3"),
+        Framework,
+        Some(("Go", Some("go")))
+    ),
+    product_mapping!(
+        &["beego"],
+        None,
+        "Beego",
+        GoModules,
+        Some("github.com/beego/beego/v2"),
+        Framework,
+        Some(("Go", Some("go")))
+    ),
+    product_mapping!(
+        &["gin", "gin-gonic"],
+        None,
+        "Gin",
+        GoModules,
+        Some("github.com/gin-gonic/gin"),
+        Framework,
+        Some(("Go", Some("go")))
+    ),
+    product_mapping!(
+        &["echo", "labstack echo"],
+        None,
+        "Echo",
+        GoModules,
+        Some("github.com/labstack-go/echo/v5"),
+        Framework,
+        Some(("Go", Some("go")))
+    ),
+    product_mapping!(
+        &["revel"],
+        None,
+        "Revel",
+        GoModules,
+        Some("github.com/revel/revel"),
+        Framework,
+        Some(("Go", Some("go")))
+    ),
+    product_mapping!(
+        &["hertz", "cloudwego hertz"],
+        None,
+        "Hertz",
+        GoModules,
+        Some("github.com/cloudwego/hertz"),
+        Framework,
+        Some(("Go", Some("go")))
+    ),
+    product_mapping!(
+        &["goframe"],
+        None,
+        "GoFrame",
+        GoModules,
+        Some("github.com/gogf/gf/v2"),
+        Framework,
+        Some(("Go", Some("go")))
+    ),
+    product_mapping!(
+        &["buffalo", "gobuffalo"],
+        None,
+        "Buffalo",
+        GoModules,
+        Some("github.com/gobuffalo/buffalo"),
+        Framework,
+        Some(("Go", Some("go")))
+    ),
+    product_mapping!(
+        &["chi", "go-chi"],
+        None,
+        "Chi",
+        GoModules,
+        Some("github.com/go-chi/chi/v5"),
+        Framework,
+        Some(("Go", Some("go")))
+    ),
+    product_mapping!(
+        &["rocket"],
+        None,
+        "Rocket",
+        CratesIo,
+        Some("rocket"),
+        Framework,
+        Some(("Rust", Some("rust")))
+    ),
+    product_mapping!(
+        &["actix web", "actix-web"],
+        None,
+        "Actix Web",
+        CratesIo,
+        Some("actix-web"),
+        Framework,
+        Some(("Rust", Some("rust")))
+    ),
+    product_mapping!(
+        &["axum"],
+        None,
+        "Axum",
+        CratesIo,
+        Some("axum"),
+        Framework,
+        Some(("Rust", Some("rust")))
+    ),
+    product_mapping!(
+        &["salvo"],
+        None,
+        "Salvo",
+        CratesIo,
+        Some("salvo"),
+        Framework,
+        Some(("Rust", Some("rust")))
+    ),
+    product_mapping!(
+        &["poem"],
+        None,
+        "Poem",
+        CratesIo,
+        Some("poem"),
+        Framework,
+        Some(("Rust", Some("rust")))
+    ),
+    product_mapping!(
+        &["express"],
+        None,
+        "Express",
+        Npm,
+        Some("express"),
+        Framework,
+        Some(("Node.js", Some("node")))
+    ),
+    product_mapping!(
+        &["fastify"],
+        None,
+        "Fastify",
+        Npm,
+        Some("fastify"),
+        Framework,
+        Some(("Node.js", Some("node")))
+    ),
+    product_mapping!(
+        &["koa", "koa.js"],
+        None,
+        "Koa",
+        Npm,
+        Some("koa"),
+        Framework,
+        Some(("Node.js", Some("node")))
+    ),
+    product_mapping!(
+        &["hapi", "hapi.js", "hapijs"],
+        None,
+        "Hapi",
+        Npm,
+        Some("@hapi/hapi"),
+        Framework,
+        Some(("Node.js", Some("node")))
+    ),
+    product_mapping!(
+        &["nestjs", "nest.js"],
+        None,
+        "NestJS",
+        Npm,
+        Some("@nestjs/core"),
+        Framework,
+        Some(("Node.js", Some("node")))
+    ),
+    product_mapping!(
+        &["uwebsockets.js server", "uwebsockets.js", "uwebsockets"],
+        None,
+        "uWebSockets.js",
+        WebServer,
+        None,
+        Server,
+        Some(("Node.js", Some("node")))
+    ),
+    product_mapping!(&["deno"], None, "Deno", Runtime, None, Runtime, None),
+    product_mapping!(&["bun"], None, "Bun", Runtime, None, Runtime, None),
+    product_mapping!(
+        &["puma"],
+        None,
+        "Puma",
+        RubyGems,
+        Some("puma"),
+        Server,
+        Some(("Ruby", Some("ruby")))
+    ),
+    product_mapping!(
+        &["passenger"],
+        None,
+        "Passenger",
+        RubyGems,
+        Some("passenger"),
+        Server,
+        Some(("Ruby", Some("ruby")))
+    ),
+    product_mapping!(
+        &["unicorn"],
+        None,
+        "Unicorn",
+        RubyGems,
+        Some("unicorn"),
+        Server,
+        Some(("Ruby", Some("ruby")))
+    ),
+    product_mapping!(
+        &["thin"],
+        None,
+        "Thin",
+        RubyGems,
+        Some("thin"),
+        Server,
+        Some(("Ruby", Some("ruby")))
+    ),
+    product_mapping!(
+        &["webrick"],
+        None,
+        "WEBrick",
+        RubyGems,
+        Some("webrick"),
+        Server,
+        Some(("Ruby", Some("ruby")))
+    ),
+    product_mapping!(
+        &["falcon"],
+        Some(ProductLayer::Server),
+        "Falcon",
+        RubyGems,
+        Some("falcon"),
+        Server,
+        Some(("Ruby", Some("ruby")))
+    ),
+    product_mapping!(
+        &["mongrel"],
+        None,
+        "Mongrel",
+        RubyGems,
+        Some("mongrel"),
+        Server,
+        Some(("Ruby", Some("ruby")))
+    ),
+    product_mapping!(
+        &["roda"],
+        None,
+        "Roda",
+        RubyGems,
+        Some("roda"),
+        Framework,
+        Some(("Ruby", Some("ruby")))
+    ),
+    product_mapping!(
+        &["sinatra"],
+        None,
+        "Sinatra",
+        RubyGems,
+        Some("sinatra"),
+        Framework,
+        Some(("Ruby", Some("ruby")))
+    ),
+    product_mapping!(
+        &["ruby on rails", "rails"],
+        None,
+        "Ruby on Rails",
+        RubyGems,
+        Some("rails"),
+        Framework,
+        Some(("Ruby", Some("ruby")))
+    ),
+    product_mapping!(
+        &[
+            "php development server",
+            "php cli server",
+            "php built-in web server",
+        ],
+        None,
+        "PHP development server",
+        WebServer,
+        None,
+        Server,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(
+        &["frankenphp"],
+        None,
+        "FrankenPHP",
+        WebServer,
+        None,
+        Server,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(
+        &["roadrunner"],
+        None,
+        "RoadRunner",
+        WebServer,
+        None,
+        Server,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(
+        &["openswoole"],
+        None,
+        "OpenSwoole",
+        WebServer,
+        None,
+        Server,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(
+        &["swoole"],
+        None,
+        "Swoole",
+        WebServer,
+        None,
+        Server,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(
+        &["cowboy"],
+        None,
+        "Cowboy",
+        WebServer,
+        Some("cowboy"),
+        Server,
+        Some(("Erlang", None))
+    ),
+    product_mapping!(
+        &["bandit"],
+        None,
+        "Bandit",
+        WebServer,
+        None,
+        Server,
+        Some(("Elixir", None))
+    ),
+    product_mapping!(
+        &["mochiweb"],
+        None,
+        "MochiWeb",
+        WebServer,
+        None,
+        Server,
+        Some(("Erlang", None))
+    ),
+    product_mapping!(
+        &["yaws"],
+        None,
+        "Yaws",
+        WebServer,
+        None,
+        Server,
+        Some(("Erlang", None))
+    ),
+    product_mapping!(
+        &["phoenix"],
+        None,
+        "Phoenix",
+        Runtime,
+        None,
+        Framework,
+        Some(("Elixir", None))
+    ),
+    product_mapping!(
+        &["warp"],
+        None,
+        "Warp",
+        WebServer,
+        None,
+        Server,
+        Some(("Haskell", None))
+    ),
+    product_mapping!(
+        &["snap"],
+        None,
+        "Snap",
+        Runtime,
+        None,
+        Framework,
+        Some(("Haskell", None))
+    ),
+    product_mapping!(&["haproxy"], None, "HAProxy", WebServer, None, Server, None),
+    product_mapping!(&["envoy"], None, "Envoy", WebServer, None, Server, None),
+    product_mapping!(&["traefik"], None, "Traefik", WebServer, None, Server, None),
+    product_mapping!(&["varnish"], None, "Varnish", WebServer, None, Server, None),
+    product_mapping!(&["squid"], None, "Squid", WebServer, None, Server, None),
+    product_mapping!(
+        &["apache traffic server", "trafficserver", "ats"],
+        None,
+        "Apache Traffic Server",
+        WebServer,
+        None,
+        Server,
+        None
+    ),
+    product_mapping!(&["h2o"], None, "H2O", WebServer, None, Server, None),
+    product_mapping!(&["tengine"], None, "Tengine", WebServer, None, Server, None),
+    product_mapping!(&["angie"], None, "Angie", WebServer, None, Server, None),
+    product_mapping!(
+        &["openbsd httpd"],
+        None,
+        "OpenBSD httpd",
+        WebServer,
+        None,
+        Server,
+        None
+    ),
+    product_mapping!(
+        &["cherokee"],
+        None,
+        "Cherokee",
+        WebServer,
+        None,
+        Server,
+        None
+    ),
+    product_mapping!(
+        &["hiawatha"],
+        None,
+        "Hiawatha",
+        WebServer,
+        None,
+        Server,
+        None
+    ),
+    product_mapping!(&["thttpd"], None, "thttpd", WebServer, None, Server, None),
+    product_mapping!(
+        &["mini_httpd", "mini-httpd"],
+        None,
+        "mini_httpd",
+        WebServer,
+        None,
+        Server,
+        None
+    ),
+    product_mapping!(
+        &["goahead", "goahead webserver"],
+        None,
+        "GoAhead",
+        WebServer,
+        None,
+        Server,
+        None
+    ),
+    product_mapping!(
+        &["asp.net", "asp.net core"],
+        None,
+        "ASP.NET",
+        Runtime,
+        None,
+        Framework,
+        Some((".NET", Some("dotnet")))
+    ),
+    product_mapping!(
+        &["spring"],
+        None,
+        "Spring Framework",
+        MavenCentral,
+        Some("org.springframework:spring-core"),
+        Framework,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["spring boot"],
+        None,
+        "Spring Boot",
+        MavenCentral,
+        Some("org.springframework.boot:spring-boot"),
+        Framework,
+        Some(("Java", Some("java")))
+    ),
+    product_mapping!(
+        &["wordpress"],
+        None,
+        "WordPress",
+        WordPress,
+        Some("wordpress"),
+        Cms,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(
+        &["moodle"],
+        None,
+        "Moodle",
+        Moodle,
+        Some("moodle"),
+        Cms,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(
+        &["totara"],
+        None,
+        "Totara",
+        Moodle,
+        None,
+        Cms,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(
+        &["woocommerce"],
+        None,
+        "WooCommerce",
+        WordPress,
+        Some("woocommerce"),
+        Plugin,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(
+        &["magento", "adobe commerce"],
+        None,
+        "Magento",
+        Composer,
+        None,
+        Framework,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(
+        &["sulu"],
+        None,
+        "Sulu",
+        Composer,
+        Some("sulu/sulu"),
+        Framework,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(
+        &["silverstripe"],
+        None,
+        "Silverstripe",
+        Composer,
+        Some("silverstripe/cms"),
+        Cms,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(
+        &["symfony"],
+        None,
+        "Symfony",
+        Composer,
+        Some("symfony/framework-bundle"),
+        Framework,
+        Some(("PHP", Some("php")))
+    ),
+    product_mapping!(&["php"], None, "PHP", Runtime, Some("php"), Runtime, None),
+    product_mapping!(
+        &["python"],
+        None,
+        "Python",
+        Runtime,
+        Some("python"),
+        Runtime,
+        None
+    ),
+    product_mapping!(
+        &["ruby"],
+        None,
+        "Ruby",
+        Runtime,
+        Some("ruby"),
+        Runtime,
+        None
+    ),
+    product_mapping!(
+        &["node.js", "node"],
+        None,
+        "Node.js",
+        Runtime,
+        Some("node"),
+        Runtime,
+        None
+    ),
+    product_mapping!(
+        &["java", "openjdk"],
+        None,
+        "Java",
+        Runtime,
+        Some("java"),
+        Runtime,
+        None
+    ),
+    product_mapping!(
+        &[".net", "dotnet"],
+        None,
+        ".NET",
+        Runtime,
+        Some("dotnet"),
+        Runtime,
+        None
+    ),
+    product_mapping!(
+        &["go", "golang"],
+        None,
+        "Go",
+        Runtime,
+        Some("go"),
+        Runtime,
+        None
+    ),
+    product_mapping!(
+        &["rust"],
+        None,
+        "Rust",
+        Runtime,
+        Some("rust"),
+        Runtime,
+        None
+    ),
+];
+
+fn product_component_mapping(
+    name: &str,
+    layer: ProductLayer,
+) -> Option<&'static ProductComponentMapping> {
+    let normalized = name.to_ascii_lowercase();
+    PRODUCT_COMPONENT_MAPPINGS.iter().find(|mapping| {
+        mapping
+            .product_layer
+            .is_none_or(|expected| expected == layer)
+            && mapping.aliases.contains(&normalized.as_str())
+    })
+}
+
+fn product_package_identifier(
+    mapping: &ProductComponentMapping,
+    version: Option<&str>,
+) -> Option<&'static str> {
+    let major = version
+        .map(normalized_version)
+        .and_then(|version| version.split('.').next())
+        .and_then(|major| major.parse::<u64>().ok());
+    match (mapping.name, major) {
+        ("Fiber", Some(1)) => Some("github.com/gofiber/fiber"),
+        ("Fiber", Some(2)) => Some("github.com/gofiber/fiber/v2"),
+        ("Fiber", Some(3)) => Some("github.com/gofiber/fiber/v3"),
+        ("Echo", Some(3)) => Some("github.com/labstack/echo/v3"),
+        ("Echo", Some(4)) => Some("github.com/labstack/echo/v4"),
+        ("Echo", Some(5)) => Some("github.com/labstack-go/echo/v5"),
+        ("GoFrame", Some(1)) => Some("github.com/gogf/gf"),
+        ("Chi", Some(4)) => Some("github.com/go-chi/chi/v4"),
+        ("Chi", Some(5)) => Some("github.com/go-chi/chi/v5"),
+        _ => mapping.package_identifier,
+    }
+}
+
 fn import_product_components(endpoint: &mut EndpointScan) {
     let mut detected = Vec::new();
     for product in &endpoint.products {
-        let normalized = product.name.to_ascii_lowercase();
-        let mapping = match normalized.as_str() {
-            "nginx" => Some((
-                TechnologyEcosystem::WebServer,
-                "nginx",
-                "nginx",
-                TechnologyComponentKind::Server,
-            )),
-            "openresty" => Some((
-                TechnologyEcosystem::WebServer,
-                "OpenResty",
-                "openresty",
-                TechnologyComponentKind::Server,
-            )),
-            "apache http server" | "apache" => Some((
-                TechnologyEcosystem::WebServer,
-                "Apache HTTP Server",
-                "apache-httpd",
-                TechnologyComponentKind::Server,
-            )),
-            "microsoft iis" | "iis" => Some((
-                TechnologyEcosystem::WebServer,
-                "Microsoft IIS",
-                "iis",
-                TechnologyComponentKind::Server,
-            )),
-            "caddy" => Some((
-                TechnologyEcosystem::WebServer,
-                "Caddy",
-                "caddy",
-                TechnologyComponentKind::Server,
-            )),
-            "litespeed" => Some((
-                TechnologyEcosystem::WebServer,
-                "LiteSpeed",
-                "litespeed",
-                TechnologyComponentKind::Server,
-            )),
-            "openlitespeed" => Some((
-                TechnologyEcosystem::WebServer,
-                "OpenLiteSpeed",
-                "openlitespeed",
-                TechnologyComponentKind::Server,
-            )),
-            "lighttpd" => Some((
-                TechnologyEcosystem::WebServer,
-                "lighttpd",
-                "lighttpd",
-                TechnologyComponentKind::Server,
-            )),
-            "apache tomcat" | "tomcat" => Some((
-                TechnologyEcosystem::WebServer,
-                "Apache Tomcat",
-                "tomcat",
-                TechnologyComponentKind::Server,
-            )),
-            "jetty" => Some((
-                TechnologyEcosystem::WebServer,
-                "Jetty",
-                "jetty",
-                TechnologyComponentKind::Server,
-            )),
-            "kestrel" => Some((
-                TechnologyEcosystem::WebServer,
-                "Kestrel",
-                "kestrel",
-                TechnologyComponentKind::Server,
-            )),
-            "gunicorn" => Some((
-                TechnologyEcosystem::WebServer,
-                "gunicorn",
-                "gunicorn",
-                TechnologyComponentKind::Server,
-            )),
-            "uvicorn" => Some((
-                TechnologyEcosystem::WebServer,
-                "Uvicorn",
-                "uvicorn",
-                TechnologyComponentKind::Server,
-            )),
-            "puma" => Some((
-                TechnologyEcosystem::WebServer,
-                "Puma",
-                "puma",
-                TechnologyComponentKind::Server,
-            )),
-            "passenger" => Some((
-                TechnologyEcosystem::WebServer,
-                "Passenger",
-                "passenger",
-                TechnologyComponentKind::Server,
-            )),
-            "cowboy" => Some((
-                TechnologyEcosystem::WebServer,
-                "Cowboy",
-                "cowboy",
-                TechnologyComponentKind::Server,
-            )),
-            "werkzeug" => Some((
-                TechnologyEcosystem::WebServer,
-                "Werkzeug",
-                "werkzeug",
-                TechnologyComponentKind::Server,
-            )),
-            "php" => Some((
-                TechnologyEcosystem::Runtime,
-                "PHP",
-                "php",
-                TechnologyComponentKind::Runtime,
-            )),
-            "python" => Some((
-                TechnologyEcosystem::Runtime,
-                "Python",
-                "python",
-                TechnologyComponentKind::Runtime,
-            )),
-            "ruby" => Some((
-                TechnologyEcosystem::Runtime,
-                "Ruby",
-                "ruby",
-                TechnologyComponentKind::Runtime,
-            )),
-            "node.js" | "node" => Some((
-                TechnologyEcosystem::Runtime,
-                "Node.js",
-                "node",
-                TechnologyComponentKind::Runtime,
-            )),
-            "express" => Some((
-                TechnologyEcosystem::Npm,
-                "Express",
-                "express",
-                TechnologyComponentKind::Framework,
-            )),
-            "asp.net" => Some((
-                TechnologyEcosystem::Runtime,
-                "ASP.NET",
-                "",
-                TechnologyComponentKind::Framework,
-            )),
-            "django" => Some((
-                TechnologyEcosystem::PyPi,
-                "Django",
-                "Django",
-                TechnologyComponentKind::Framework,
-            )),
-            "ruby on rails" | "rails" => Some((
-                TechnologyEcosystem::RubyGems,
-                "Ruby on Rails",
-                "rails",
-                TechnologyComponentKind::Framework,
-            )),
-            "spring" => Some((
-                TechnologyEcosystem::MavenCentral,
-                "Spring Framework",
-                "org.springframework:spring-core",
-                TechnologyComponentKind::Framework,
-            )),
-            "spring boot" => Some((
-                TechnologyEcosystem::MavenCentral,
-                "Spring Boot",
-                "org.springframework.boot:spring-boot",
-                TechnologyComponentKind::Framework,
-            )),
-            "wordpress" => Some((
-                TechnologyEcosystem::WordPress,
-                "WordPress",
-                "wordpress",
-                TechnologyComponentKind::Framework,
-            )),
-            "woocommerce" => Some((
-                TechnologyEcosystem::WordPress,
-                "WooCommerce",
-                "woocommerce",
-                TechnologyComponentKind::Plugin,
-            )),
-            "magento" | "adobe commerce" => Some((
-                TechnologyEcosystem::Composer,
-                "Magento",
-                "",
-                TechnologyComponentKind::Framework,
-            )),
-            "sulu" => Some((
-                TechnologyEcosystem::Composer,
-                "Sulu",
-                "sulu/sulu",
-                TechnologyComponentKind::Framework,
-            )),
-            "silverstripe" => Some((
-                TechnologyEcosystem::Composer,
-                "Silverstripe",
-                "silverstripe/cms",
-                TechnologyComponentKind::Framework,
-            )),
-            "symfony" => Some((
-                TechnologyEcosystem::Composer,
-                "Symfony",
-                "symfony/framework-bundle",
-                TechnologyComponentKind::Framework,
-            )),
-            "java" | "openjdk" => Some((
-                TechnologyEcosystem::Runtime,
-                "Java",
-                "java",
-                TechnologyComponentKind::Runtime,
-            )),
-            ".net" | "dotnet" => Some((
-                TechnologyEcosystem::Runtime,
-                ".NET",
-                "dotnet",
-                TechnologyComponentKind::Runtime,
-            )),
-            "go" | "golang" => Some((
-                TechnologyEcosystem::Runtime,
-                "Go",
-                "go",
-                TechnologyComponentKind::Runtime,
-            )),
-            "rust" => Some((
-                TechnologyEcosystem::Runtime,
-                "Rust",
-                "rust",
-                TechnologyComponentKind::Runtime,
-            )),
-            _ => None,
-        };
-        let Some((ecosystem, name, identifier, kind)) = mapping else {
+        let Some(mapping) = product_component_mapping(&product.name, product.layer) else {
             continue;
         };
+        let package_identifier = product_package_identifier(mapping, product.version.as_deref());
         let url = endpoint
             .http
             .iter()
             .find(|response| (200..400).contains(&response.status))
             .map(|response| response.url.clone())
             .unwrap_or_else(|| format!("{}:{}", endpoint.ip, endpoint.port));
+        let exact = product.version.as_deref().is_some_and(|version| {
+            if mapping.ecosystem == TechnologyEcosystem::WebServer {
+                crate::web_server::is_exact_web_server_version(version)
+            } else if mapping.ecosystem == TechnologyEcosystem::Moodle {
+                exact_moodle_version(version)
+            } else {
+                exact_version(version)
+            }
+        });
+        let exact = if mapping.ecosystem == TechnologyEcosystem::Moodle {
+            exact
+                && product.confidence == Confidence::High
+                && product.version.as_deref().is_some_and(|version| {
+                    product.evidence.iter().any(|evidence| {
+                        exact_moodle_generator_version(evidence).as_deref() == Some(version)
+                    })
+                })
+        } else {
+            exact
+        };
         let mut item = component(
-            name,
-            ecosystem,
-            (!identifier.is_empty()).then_some(identifier),
+            mapping.name,
+            mapping.ecosystem,
+            package_identifier,
             product.version.as_deref(),
-            product.version.as_deref().is_some_and(|version| {
-                if ecosystem == TechnologyEcosystem::WebServer {
-                    crate::web_server::is_exact_web_server_version(version)
-                } else {
-                    exact_version(version)
-                }
-            }),
+            exact,
             &url,
             format!("Product fingerprint: {}", product.evidence.join("; ")),
         );
-        item.kind = kind;
+        if package_identifier.is_none()
+            && let Some(version) = product.version.as_deref().filter(|_| exact)
+        {
+            item.installed_version = Some(normalize_version(version));
+            item.status = TechnologyVersionStatus::InventoryOnly;
+            item.support_status = if mapping.ecosystem == TechnologyEcosystem::WebServer {
+                TechnologySupportStatus::Unknown
+            } else {
+                TechnologySupportStatus::NotApplicable
+            };
+        }
+        item.kind = mapping.kind;
         item.confidence = product.confidence;
         detected.push(item);
     }
@@ -2107,6 +3171,83 @@ fn import_product_components(endpoint: &mut EndpointScan) {
     for component in detected {
         merge_component(&mut endpoint.technology_components, component);
     }
+}
+
+fn infer_runtime_components(endpoint: &mut EndpointScan) {
+    let inferred = endpoint
+        .technology_components
+        .iter()
+        .filter(|component| component.kind != TechnologyComponentKind::Runtime)
+        .filter_map(|component| {
+            let (runtime_name, runtime_identifier) = implied_runtime(component)?;
+            Some(TechnologyComponent {
+                name: runtime_name.to_owned(),
+                ecosystem: TechnologyEcosystem::Runtime,
+                kind: TechnologyComponentKind::Runtime,
+                package_identifier: runtime_identifier.map(str::to_owned),
+                installed_version: None,
+                latest_version: None,
+                status: TechnologyVersionStatus::InventoryOnly,
+                support_status: TechnologySupportStatus::NotApplicable,
+                confidence: Confidence::High,
+                release_source_url: None,
+                evidence_urls: component.evidence_urls.clone(),
+                evidence: vec![format!(
+                    "{runtime_name} runtime implied by detected {} {}",
+                    component.ecosystem, component.name
+                )],
+                check_error: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    for component in inferred {
+        merge_component(&mut endpoint.technology_components, component);
+    }
+}
+
+fn implied_runtime(
+    component: &TechnologyComponent,
+) -> Option<(&'static str, Option<&'static str>)> {
+    let ecosystem_runtime = match component.ecosystem {
+        TechnologyEcosystem::Composer
+        | TechnologyEcosystem::WordPress
+        | TechnologyEcosystem::Moodle => Some(("PHP", Some("php"))),
+        TechnologyEcosystem::PyPi => Some(("Python", Some("python"))),
+        TechnologyEcosystem::RubyGems => Some(("Ruby", Some("ruby"))),
+        TechnologyEcosystem::MavenCentral => Some(("Java", Some("java"))),
+        TechnologyEcosystem::NuGet => Some((".NET", Some("dotnet"))),
+        TechnologyEcosystem::GoModules => Some(("Go", Some("go"))),
+        TechnologyEcosystem::CratesIo => Some(("Rust", Some("rust"))),
+        TechnologyEcosystem::JavaScript
+        | TechnologyEcosystem::Npm
+        | TechnologyEcosystem::Runtime
+        | TechnologyEcosystem::WebServer => None,
+    };
+    ecosystem_runtime.or_else(|| {
+        PRODUCT_COMPONENT_MAPPINGS
+            .iter()
+            .filter(|mapping| mapping.ecosystem == component.ecosystem)
+            .find(|mapping| {
+                mapping.name.eq_ignore_ascii_case(&component.name)
+                    || mapping
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(&component.name))
+                    || mapping.package_identifier.is_some_and(|identifier| {
+                        component
+                            .package_identifier
+                            .as_deref()
+                            .is_some_and(|package| package.eq_ignore_ascii_case(identifier))
+                    })
+            })
+            .and_then(|mapping| mapping.implied_runtime)
+            .or_else(|| {
+                component
+                    .name
+                    .eq_ignore_ascii_case("blazor")
+                    .then_some((".NET", Some("dotnet")))
+            })
+    })
 }
 
 fn detect_runtime_headers(endpoint: &EndpointScan, detected: &mut Vec<TechnologyComponent>) {
@@ -2134,10 +3275,7 @@ fn detect_runtime_headers(endpoint: &EndpointScan, detected: &mut Vec<Technology
     ];
     for response in &endpoint.http {
         for (header_name, header_value) in &response.headers {
-            if !matches!(
-                header_name.to_ascii_lowercase().as_str(),
-                "server" | "x-powered-by" | "x-runtime"
-            ) {
+            if !crate::matches_ascii(header_name, &["server", "x-powered-by", "x-runtime"]) {
                 continue;
             }
             for (identifier, pattern, name) in rules {
@@ -2175,6 +3313,8 @@ fn registry_accept(ecosystem: TechnologyEcosystem, identifier: &str) -> &'static
         .unwrap_or(identifier);
     if ecosystem == TechnologyEcosystem::Npm {
         "application/vnd.npm.install-v1+json"
+    } else if ecosystem == TechnologyEcosystem::Moodle {
+        "text/html"
     } else if ecosystem == TechnologyEcosystem::WebServer && base_identifier == "lighttpd" {
         "text/plain"
     } else if ecosystem == TechnologyEcosystem::WebServer
@@ -2284,6 +3424,10 @@ fn registry_url(ecosystem: TechnologyEcosystem, identifier: &str) -> Option<Stri
         TechnologyEcosystem::WordPress => format!(
             "https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&request%5Bslug%5D={encoded}"
         ),
+        TechnologyEcosystem::Moodle if identifier == "moodle" => {
+            MOODLE_LATEST_RELEASE_URL.to_owned()
+        }
+        TechnologyEcosystem::Moodle => return None,
         TechnologyEcosystem::PyPi => format!("https://pypi.org/pypi/{encoded}/json"),
         TechnologyEcosystem::RubyGems => {
             format!("https://rubygems.org/api/v1/versions/{encoded}.json")
@@ -2365,15 +3509,18 @@ fn encode_path(value: &str) -> String {
 
 fn go_module_escape(value: &str) -> String {
     let mut escaped = String::new();
-    for character in value.chars() {
-        if character.is_ascii_uppercase() {
+    for byte in value.bytes() {
+        if byte.is_ascii_uppercase() {
             escaped.push('!');
-            escaped.push(character.to_ascii_lowercase());
+            escaped.push(char::from(byte.to_ascii_lowercase()));
+        } else if byte.is_ascii_alphanumeric() || b"-._~+/".contains(&byte) {
+            escaped.push(char::from(byte));
         } else {
-            escaped.push(character);
+            use std::fmt::Write as _;
+            let _ = write!(escaped, "%{byte:02X}");
         }
     }
-    encode_path(&escaped)
+    escaped
 }
 
 struct WebServerRelease {
@@ -2790,6 +3937,21 @@ fn parse_latest(
                 .filter(|version| !is_prerelease(version))
                 .map(str::to_owned))
         }
+        TechnologyEcosystem::Moodle if identifier == "moodle" => {
+            let text = std::str::from_utf8(bytes)
+                .map_err(|error| format!("invalid Moodle release page: {error}"))?;
+            let pattern = Regex::new(
+                r"(?i)<strong>\s*Moodle\s+([0-9]+(?:\.[0-9]+){1,3}(?:[+A-Za-z0-9._-]*)?)\s*</strong>",
+            )
+            .expect("valid regex");
+            Ok(max_stable(
+                pattern
+                    .captures_iter(text)
+                    .filter_map(|captures| captures.get(1).map(|value| value.as_str()))
+                    .filter(|version| !version.contains('+')),
+            ))
+        }
+        TechnologyEcosystem::Moodle => Ok(None),
         TechnologyEcosystem::PyPi => {
             let value = json(bytes, "PyPI")?;
             Ok(max_stable(
@@ -2991,48 +4153,46 @@ fn max_stable<'a>(versions: impl Iterator<Item = &'a str>) -> Option<String> {
 }
 
 fn is_prerelease(version: &str) -> bool {
-    let lower = version.to_ascii_lowercase();
-    if parse_semver_flexible(&lower).is_some_and(|version| !version.pre.is_empty()) {
+    if parse_semver_flexible(version).is_some_and(|version| !version.pre.is_empty()) {
         return true;
     }
-    Regex::new(
-        r"(?i)(?:^|[._-])(?:alpha|beta|preview|pre|rc|dev|snapshot|nightly|canary)(?:[._-]?[0-9]+|$)|[0-9](?:a|b|rc)[0-9]+",
-    )
-    .expect("valid prerelease regex")
-    .is_match(&lower)
+    PRERELEASE_PATTERN.is_match(version)
 }
 
 fn version_numbers(version: &str) -> Option<Vec<u64>> {
-    let normalized = normalize_version(version);
+    let normalized = normalized_version(version);
     let start = normalized.find(|character: char| character.is_ascii_digit())?;
-    let mut numbers = Vec::new();
-    let mut current = String::new();
-    for character in normalized[start..].chars() {
-        if character.is_ascii_digit() {
-            current.push(character);
-        } else if character == '.' {
-            if current.is_empty() {
-                break;
-            }
-            numbers.push(current.parse().ok()?);
-            current.clear();
-        } else {
-            break;
-        }
-    }
-    if !current.is_empty() {
-        numbers.push(current.parse().ok()?);
-    }
+    let value = &normalized[start..];
+    let end = value
+        .find(|character: char| character != '.' && !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let numbers = value[..end]
+        .split('.')
+        .take_while(|part| !part.is_empty())
+        .map(str::parse)
+        .collect::<Result<Vec<u64>, _>>()
+        .ok()?;
     (!numbers.is_empty()).then_some(numbers)
 }
 
 fn compare_version_values(left: &str, right: &str) -> Option<Ordering> {
-    let mut left = version_numbers(left)?;
-    let mut right = version_numbers(right)?;
+    Some(compare_version_parts(
+        &version_numbers(left)?,
+        &version_numbers(right)?,
+    ))
+}
+
+fn compare_version_parts(left: &[u64], right: &[u64]) -> Ordering {
     let length = left.len().max(right.len()).max(3);
-    left.resize(length, 0);
-    right.resize(length, 0);
-    Some(left.cmp(&right))
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
 }
 
 fn compare_versions(
@@ -3071,29 +4231,28 @@ fn compare_versions(
     let Some(latest_parts) = version_numbers(latest) else {
         return TechnologyVersionStatus::Unverifiable;
     };
-    match compare_version_values(installed, latest) {
-        Some(Ordering::Equal) => TechnologyVersionStatus::Current,
-        Some(Ordering::Greater) => TechnologyVersionStatus::NewerThanLatest,
-        Some(Ordering::Less)
+    match compare_version_parts(&installed_parts, &latest_parts) {
+        Ordering::Equal => TechnologyVersionStatus::Current,
+        Ordering::Greater => TechnologyVersionStatus::NewerThanLatest,
+        Ordering::Less
             if installed_parts.first().copied().unwrap_or(0)
                 != latest_parts.first().copied().unwrap_or(0) =>
         {
             TechnologyVersionStatus::OutdatedMajor
         }
-        Some(Ordering::Less)
+        Ordering::Less
             if installed_parts.get(1).copied().unwrap_or(0)
                 != latest_parts.get(1).copied().unwrap_or(0) =>
         {
             TechnologyVersionStatus::OutdatedMinor
         }
-        Some(Ordering::Less) => TechnologyVersionStatus::OutdatedPatch,
-        None => TechnologyVersionStatus::Unverifiable,
+        Ordering::Less => TechnologyVersionStatus::OutdatedPatch,
     }
 }
 
 fn parse_semver_flexible(version: &str) -> Option<Version> {
-    let normalized = normalize_version(version);
-    if let Ok(version) = Version::parse(&normalized) {
+    let normalized = normalized_version(version);
+    if let Ok(version) = Version::parse(normalized) {
         return Some(version);
     }
     let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
@@ -3109,7 +4268,6 @@ fn parse_semver_flexible(version: &str) -> Option<Version> {
 
 fn outdated_findings(endpoints: &[EndpointScan]) -> Vec<ExposureFinding> {
     let mut findings = BTreeMap::new();
-    let mut outdated = BTreeMap::new();
     for endpoint in endpoints {
         for component in &endpoint.technology_components {
             if component.support_status == TechnologySupportStatus::Unsupported
@@ -3129,19 +4287,19 @@ fn outdated_findings(endpoints: &[EndpointScan]) -> Vec<ExposureFinding> {
                 }
                 evidence.sort();
                 evidence.dedup();
-                findings.insert(
-                    (endpoint.ip, endpoint.port, title.clone()),
-                    ExposureFinding {
-                        title,
-                        description: format!(
-                            "Upstream release metadata designates the detected {} release line as legacy, end-of-life, or outside the currently supported line",
-                            component.name
-                        ),
-                        ip: endpoint.ip,
-                        port: endpoint.port,
-                        evidence,
-                    },
-                );
+                let candidate = ExposureFinding {
+                    title,
+                    description: format!(
+                        "Upstream release metadata designates the detected {} release line as legacy, end-of-life, or outside the currently supported line",
+                        component.name
+                    ),
+                    ip: endpoint.ip,
+                    port: endpoint.port,
+                    transport: endpoint.transport,
+                    evidence,
+                    component_kind: Some(component.kind),
+                };
+                insert_outdated_finding(&mut findings, candidate);
             }
             if !matches!(
                 component.status,
@@ -3189,47 +4347,39 @@ fn outdated_findings(endpoints: &[EndpointScan]) -> Vec<ExposureFinding> {
                 ),
                 ip: endpoint.ip,
                 port: endpoint.port,
+                transport: endpoint.transport,
                 evidence,
+                component_kind: Some(component.kind),
             };
-            let key = (
-                component.name.clone(),
-                installed.to_owned(),
-                latest.to_owned(),
-            );
-            match outdated.entry(key) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(candidate);
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    let existing = entry.get();
-                    let candidate_url = candidate
-                        .evidence
-                        .iter()
-                        .find_map(|item| item.strip_prefix("Affected resource: "))
-                        .unwrap_or_default();
-                    let existing_url = existing
-                        .evidence
-                        .iter()
-                        .find_map(|item| item.strip_prefix("Affected resource: "))
-                        .unwrap_or_default();
-                    if (candidate.ip, candidate.port, candidate_url)
-                        < (existing.ip, existing.port, existing_url)
-                    {
-                        entry.insert(candidate);
-                    }
-                }
-            }
+            insert_outdated_finding(&mut findings, candidate);
         }
     }
-    let mut findings = findings
-        .into_values()
-        .chain(outdated.into_values())
-        .collect::<Vec<_>>();
+    let mut findings = findings.into_values().collect::<Vec<_>>();
     findings.sort_by(|left, right| {
         left.ip
             .cmp(&right.ip)
             .then(left.port.cmp(&right.port))
+            .then(left.transport.cmp(&right.transport))
             .then(left.title.cmp(&right.title))
     });
     findings
+}
+
+fn insert_outdated_finding(
+    findings: &mut BTreeMap<(IpAddr, u16, TransportProtocol, String), ExposureFinding>,
+    finding: ExposureFinding,
+) {
+    let key = (
+        finding.ip,
+        finding.port,
+        finding.transport,
+        finding.title.clone(),
+    );
+    if let Some(existing) = findings.get_mut(&key) {
+        existing.evidence.extend(finding.evidence);
+        existing.evidence.sort();
+        existing.evidence.dedup();
+    } else {
+        findings.insert(key, finding);
+    }
 }

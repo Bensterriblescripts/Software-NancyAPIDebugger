@@ -1,17 +1,24 @@
 mod browser;
 mod cookies;
-mod http;
 mod oauth;
 mod profiles;
 
 pub(crate) use browser::{run as run_cookie_browser, write_protocol_result};
 pub use cookies::capture_browser_cookies;
 pub use oauth::sign_in_interactive;
-pub use profiles::{AuthStore, ProfileInput, ProfileSummary, ProfileType, SharedAuthStore};
+pub use profiles::{
+    AuthStore, ClientCertificateProfile, ProfileInput, ProfileSummary, ProfileType, SharedAuthStore,
+};
 
 use cookies::{parse_http_url, validate_host};
 use oauth::{acquire_client_credentials, refresh_interactive};
 use profiles::{CachedToken, StoredProfileKind};
+use rustls::pki_types::CertificateDer;
+use rustls::sign::CertifiedKey;
+use std::fmt;
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
@@ -21,6 +28,92 @@ pub struct ResolvedAuth {
     pub header_name: &'static str,
     pub header_value: Zeroizing<String>,
     pub detail: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct LoadedClientCertificate {
+    pub(crate) profile_name: String,
+    pub(crate) host_scope: String,
+    pub(crate) certified_key: Arc<CertifiedKey>,
+}
+
+impl fmt::Debug for LoadedClientCertificate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadedClientCertificate")
+            .field("profile_name", &self.profile_name)
+            .field("host_scope", &self.host_scope)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LoadedClientCertificate {
+    pub(crate) fn applies_to(&self, host: &str) -> bool {
+        host.trim_matches(['[', ']'])
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(&self.host_scope)
+    }
+}
+
+pub(crate) fn certificate_file_metadata(
+    path: &str,
+) -> Result<crate::diagnostics::CertificateTrace, String> {
+    let certificates = read_certificates(path)?;
+    let certificate = crate::request::parse_certificate(certificates[0].as_ref());
+    if certificate
+        .subject
+        .starts_with("Unable to parse certificate:")
+    {
+        return Err(certificate.subject);
+    }
+    Ok(certificate)
+}
+
+fn read_certificates(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
+    let file =
+        File::open(path).map_err(|error| format!("Unable to open certificate chain: {error}"))?;
+    let mut reader = BufReader::new(file);
+    let certificates = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Invalid PEM certificate chain: {error}"))?;
+    if certificates.is_empty() {
+        return Err("Certificate chain contains no PEM certificates".to_owned());
+    }
+    Ok(certificates)
+}
+
+pub(crate) fn resolve_client_certificate(
+    store: SharedAuthStore,
+    id: u64,
+    target_url: &str,
+) -> Result<LoadedClientCertificate, String> {
+    let profile = store
+        .lock()
+        .map_err(|_| "Authentication profile store is unavailable".to_owned())?
+        .profile(id)
+        .ok_or_else(|| "Client-certificate profile no longer exists".to_owned())?;
+    let StoredProfileKind::ClientCertificate(config) = profile.kind else {
+        return Err("Selected profile is not a client-certificate profile".to_owned());
+    };
+    validate_host(target_url, &config.host_scope)?;
+    let certificates = read_certificates(&config.certificate_chain_path)?;
+    let file = File::open(&config.private_key_path)
+        .map_err(|error| format!("Unable to open private-key file: {error}"))?;
+    let mut reader = BufReader::new(file);
+    let key = rustls_pemfile::private_key(&mut reader)
+        .map_err(|error| format!("Invalid PEM private key: {error}"))?
+        .ok_or_else(|| "Private-key file contains no supported unencrypted PEM key".to_owned())?;
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let certified_key = CertifiedKey::from_der(certificates, key, &provider)
+        .map_err(|error| format!("Invalid client certificate or private key: {error}"))?;
+    certified_key
+        .keys_match()
+        .map_err(|error| format!("Client certificate and private key do not match: {error}"))?;
+    Ok(LoadedClientCertificate {
+        profile_name: profile.name,
+        host_scope: config.host_scope,
+        certified_key: Arc::new(certified_key),
+    })
 }
 
 pub async fn resolve(
@@ -116,6 +209,9 @@ pub async fn resolve(
                 header_value: config.cookie,
                 detail: format!("Manual cookie from '{}'", profile.name),
             })
+        }
+        StoredProfileKind::ClientCertificate(_) => {
+            Err("Client-certificate profiles must be selected separately".to_owned())
         }
     }
 }

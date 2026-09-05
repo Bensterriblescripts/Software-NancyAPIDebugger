@@ -25,10 +25,12 @@ hyper-util = { version = "0.1.14", features = ["tokio"] }
 markup_fmt = "0.27.3"
 oauth2 = { version = "5.0.0", default-features = false }
 percent-encoding = "2.3"
+psl = "2.1"
 quick-xml = "0.41"
 quinn = "0.11.9"
 regex = "1.13"
 rustls = "0.23.43"
+rustls-pemfile = "2.2.0"
 rustls-platform-verifier = "0.7.0"
 semver = "1.0"
 serde = { version = "1.0.228", features = ["derive"] }

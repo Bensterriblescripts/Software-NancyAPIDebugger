@@ -1,8 +1,9 @@
 use super::javascript;
 use super::technology::CapturedTechnologyResource;
 use super::{
-    Confidence, ConnectionRateLimiter, EndpointScan, ExposureScanRequest, HttpObservation,
-    ProductDetection, ProductLayer, TechnologyFileType, WebTechnologyDetection,
+    Confidence, ConnectionRateLimiter, EndpointScan, ExposureScanPhase, ExposureScanPhaseState,
+    ExposureScanProgress, ExposureScanRequest, HttpObservation, ProductDetection, ProductLayer,
+    TechnologyFileType, WebTechnologyDetection, send_phase_progress,
 };
 use crate::persistence;
 use html5ever::tendril::StrTendril;
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc::Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -158,7 +159,7 @@ struct CompileStats {
 
 #[derive(Clone)]
 pub(super) struct CapturedScriptResponse {
-    pub endpoint_index: usize,
+    pub endpoint_indices: Vec<usize>,
     pub source_url: String,
     pub response: HttpObservation,
 }
@@ -177,8 +178,10 @@ struct HtmlState {
     script: String,
 }
 
+#[derive(Default)]
 struct HtmlSink(RefCell<HtmlState>);
 
+#[derive(Default)]
 struct AccumulatedDetection {
     name: String,
     categories: BTreeSet<String>,
@@ -189,22 +192,6 @@ struct AccumulatedDetection {
     signal_keys: HashSet<String>,
     evidence_urls: BTreeSet<String>,
     evidence: BTreeSet<String>,
-}
-
-impl Default for AccumulatedDetection {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            categories: BTreeSet::new(),
-            version: None,
-            version_confidence: 0,
-            score: 0,
-            confidence_floor: Confidence::None,
-            signal_keys: HashSet::new(),
-            evidence_urls: BTreeSet::new(),
-            evidence: BTreeSet::new(),
-        }
-    }
 }
 
 struct MatchContext<'a> {
@@ -757,7 +744,26 @@ pub(super) fn detect(
     endpoints: &mut [EndpointScan],
     resources: &[CapturedTechnologyResource],
     scripts: &[CapturedScriptResponse],
+    cancel: &CancellationToken,
+    progress: &Option<Sender<ExposureScanProgress>>,
 ) -> Vec<String> {
+    let response_total = endpoints
+        .iter()
+        .map(|endpoint| endpoint.http.len())
+        .sum::<usize>();
+    let script_total = scripts
+        .iter()
+        .map(|script| script.endpoint_indices.len())
+        .sum::<usize>();
+    let work_total = response_total + resources.len() + script_total + endpoints.len();
+    let mut completed = 0usize;
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::Fingerprinting,
+        ExposureScanPhaseState::Running,
+        0.0,
+        format!("Scanning {response_total} HTTP responses"),
+    );
     let (catalog, info) = {
         let state = shared_state().value.lock().unwrap();
         match &*state {
@@ -778,29 +784,47 @@ pub(super) fn detect(
         .iter()
         .map(seed_curated_detections)
         .collect::<Vec<_>>();
-    if let Some(catalog) = catalog {
+    if let Some(catalog) = &catalog {
         warnings.extend(catalog.warnings.iter().cloned());
-        for (index, endpoint) in endpoints.iter().enumerate() {
-            for response in &endpoint.http {
-                catalog.scan_response(&mut accumulated[index], response, None);
+    }
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        for response in &endpoint.http {
+            if cancel.is_cancelled() {
+                break;
             }
+            if let Some(catalog) = &catalog {
+                catalog.scan_response(
+                    &mut accumulated[index],
+                    &response.url,
+                    response.status,
+                    &response.headers,
+                    &response.body,
+                    None,
+                );
+            }
+            completed += 1;
+            send_fingerprint_progress(
+                progress,
+                completed,
+                work_total,
+                format!("HTTP response: {}", sanitize_url(&response.url)),
+            );
         }
+        if cancel.is_cancelled() {
+            break;
+        }
+    }
+    if !cancel.is_cancelled() {
         for resource in resources {
-            if let Some(index) = endpoints
-                .iter()
-                .position(|endpoint| endpoint.ip == resource.ip && endpoint.port == resource.port)
-            {
-                let response = HttpObservation {
-                    method: "GET".to_owned(),
-                    url: resource.url.clone(),
-                    status: 200,
-                    reason: String::new(),
-                    headers: resource.headers.clone(),
-                    body: resource.body.clone(),
-                    body_truncated: resource.truncated,
-                    tls_unverified: false,
-                    redirect_location: None,
-                };
+            if cancel.is_cancelled() {
+                break;
+            }
+            if let (Some(catalog), Some(index)) = (
+                catalog.as_ref(),
+                endpoints.iter().position(|endpoint| {
+                    endpoint.ip == resource.ip && endpoint.port == resource.port
+                }),
+            ) {
                 let script = resource.detected_file_types.iter().any(|item| {
                     matches!(
                         item.file_type,
@@ -810,40 +834,104 @@ pub(super) fn detect(
                             | TechnologyFileType::Tsx
                     )
                 });
-                catalog.scan_response(&mut accumulated[index], &response, Some(script));
+                catalog.scan_response(
+                    &mut accumulated[index],
+                    &resource.url,
+                    200,
+                    &resource.headers,
+                    &resource.body,
+                    Some(script),
+                );
             }
+            completed += 1;
+            send_fingerprint_progress(
+                progress,
+                completed,
+                work_total,
+                format!("Resource: {}", sanitize_url(&resource.url)),
+            );
         }
-        for script in scripts {
-            if let Some(target) = accumulated.get_mut(script.endpoint_index) {
-                catalog.scan_external_script(target, &script.source_url, &script.response);
+    }
+    if !cancel.is_cancelled() {
+        'scripts: for script in scripts {
+            for &endpoint_index in &script.endpoint_indices {
+                if cancel.is_cancelled() {
+                    break 'scripts;
+                }
+                if let (Some(catalog), Some(target)) =
+                    (catalog.as_ref(), accumulated.get_mut(endpoint_index))
+                {
+                    catalog.scan_external_script(target, &script.source_url, &script.response);
+                }
+                completed += 1;
+                send_fingerprint_progress(
+                    progress,
+                    completed,
+                    work_total,
+                    format!("Script: {}", sanitize_url(&script.source_url)),
+                );
             }
         }
     }
-    for (endpoint, detections) in endpoints.iter_mut().zip(accumulated) {
-        let mut detections = detections
-            .into_values()
-            .map(finalize_detection)
-            .collect::<Vec<_>>();
-        detections.sort_by(|left, right| {
-            left.name
-                .to_ascii_lowercase()
-                .cmp(&right.name.to_ascii_lowercase())
-        });
-        promote_detections(&mut endpoint.products, &detections);
-        endpoint.web_technologies = detections;
+    if !cancel.is_cancelled() {
+        for (endpoint, detections) in endpoints.iter_mut().zip(accumulated) {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let mut detections = detections
+                .into_values()
+                .map(finalize_detection)
+                .collect::<Vec<_>>();
+            detections.sort_by(|left, right| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            });
+            promote_detections(&mut endpoint.products, &detections);
+            endpoint.web_technologies = detections;
+            completed += 1;
+            send_fingerprint_progress(
+                progress,
+                completed,
+                work_total,
+                format!("Finalized {}:{}", endpoint.ip, endpoint.port),
+            );
+        }
+    }
+    if !cancel.is_cancelled() {
+        send_phase_progress(
+            progress,
+            ExposureScanPhase::Fingerprinting,
+            ExposureScanPhaseState::Complete,
+            1.0,
+            format!("Processed {work_total} fingerprint inputs"),
+        );
     }
     warnings.sort();
     warnings.dedup();
     warnings
 }
 
+fn send_fingerprint_progress(
+    progress: &Option<Sender<ExposureScanProgress>>,
+    completed: usize,
+    total: usize,
+    text: String,
+) {
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::Fingerprinting,
+        ExposureScanPhaseState::Running,
+        completed as f32 / total.max(1) as f32,
+        text,
+    );
+}
+
 fn seed_curated_detections(endpoint: &EndpointScan) -> HashMap<String, AccumulatedDetection> {
-    let mut detections = HashMap::new();
+    let mut detections = HashMap::<String, AccumulatedDetection>::new();
     for product in &endpoint.products {
         let key = product.name.to_ascii_lowercase();
-        let detection = detections
-            .entry(key)
-            .or_insert_with(AccumulatedDetection::default);
+        let detection = detections.entry(key).or_default();
         detection.name = product.name.clone();
         detection.categories.insert(product.layer.to_string());
         detection.confidence_floor = detection.confidence_floor.max(product.confidence);
@@ -863,12 +951,15 @@ impl Catalog {
     fn scan_response(
         &self,
         detections: &mut HashMap<String, AccumulatedDetection>,
-        response: &HttpObservation,
+        response_url: &str,
+        status: u16,
+        response_headers: &[(String, String)],
+        body: &[u8],
         script_override: Option<bool>,
     ) {
-        let url = sanitize_url(&response.url);
+        let url = sanitize_url(response_url);
         let mut headers = HashMap::<String, Vec<&str>>::new();
-        for (name, value) in &response.headers {
+        for (name, value) in response_headers {
             headers
                 .entry(name.to_ascii_lowercase())
                 .or_default()
@@ -917,10 +1008,11 @@ impl Catalog {
                 }
             }
         }
-        let text = String::from_utf8_lossy(&response.body);
-        let is_script = script_override.unwrap_or_else(|| response_is_script(response));
+        let text = String::from_utf8_lossy(body);
+        let is_script =
+            script_override.unwrap_or_else(|| response_is_script(response_url, response_headers));
         if is_script {
-            if (200..300).contains(&response.status) {
+            if (200..300).contains(&status) {
                 let key = format!("script-content:{url}");
                 self.scripts.visit_matches(&text, |pattern, version| {
                     self.add_match(
@@ -985,7 +1077,7 @@ impl Catalog {
             }
         }
         for source in signals.script_sources {
-            let source = resolve_script_url(&response.url, &source);
+            let source = resolve_script_url(response_url, &source);
             let key = format!("script-url:{source}");
             self.script_sources
                 .visit_matches(&source, |pattern, version| {
@@ -1026,7 +1118,14 @@ impl Catalog {
     ) {
         let source = sanitize_url(source_url);
         let response_url = sanitize_url(&response.url);
-        self.scan_response(detections, response, Some(true));
+        self.scan_response(
+            detections,
+            &response.url,
+            response.status,
+            &response.headers,
+            &response.body,
+            Some(true),
+        );
         if source != response_url {
             let key = format!("script-url:{source}");
             self.script_sources
@@ -1083,9 +1182,7 @@ impl Catalog {
             || context.key.to_owned(),
             |parent| format!("{}:implied:{parent}>{identity}", context.key),
         );
-        let detection = detections
-            .entry(identity.clone())
-            .or_insert_with(AccumulatedDetection::default);
+        let detection = detections.entry(identity.clone()).or_default();
         detection.name = technology.name.clone();
         detection
             .categories
@@ -1138,12 +1235,6 @@ fn parse_html(text: &str) -> HtmlSignals {
     tokenizer.sink.0.into_inner().signals
 }
 
-impl Default for HtmlSink {
-    fn default() -> Self {
-        Self(RefCell::new(HtmlState::default()))
-    }
-}
-
 fn cookie_name_value(value: &str) -> Option<(String, &str)> {
     let pair = value.split(';').next()?.trim();
     let (name, value) = pair.split_once('=')?;
@@ -1151,13 +1242,13 @@ fn cookie_name_value(value: &str) -> Option<(String, &str)> {
     (!name.is_empty()).then_some((name, value.trim()))
 }
 
-fn response_is_script(response: &HttpObservation) -> bool {
-    response.headers.iter().any(|(name, value)| {
+fn response_is_script(url: &str, headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("content-type") && {
             let value = value.to_ascii_lowercase();
             value.contains("javascript") || value.contains("ecmascript")
         }
-    }) || Url::parse(&response.url)
+    }) || Url::parse(url)
         .ok()
         .is_some_and(|url| url.path().to_ascii_lowercase().ends_with(".js"))
 }

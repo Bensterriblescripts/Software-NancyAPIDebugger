@@ -1,15 +1,15 @@
-use crate::{ExposureScanReport, ExposureScanRequest, PortState};
+use crate::ExposureScanRequest;
 use eframe::egui;
 
 pub(super) struct HistoryEntry {
     pub(super) scan_number: usize,
-    pub(super) report: ExposureScanReport,
+    pub(super) request: ExposureScanRequest,
+    pub(super) error: Option<String>,
 }
 
 pub(super) fn show(
     ctx: &egui::Context,
     history: &[HistoryEntry],
-    selected_scan: &mut Option<usize>,
     is_active: bool,
 ) -> Option<ExposureScanRequest> {
     let mut rescan = None;
@@ -21,18 +21,9 @@ pub(super) fn show(
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for entry in history {
-                    let selected = *selected_scan == Some(entry.scan_number);
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(
-                                    selected,
-                                    &entry.report.request.diagnostic_request.url,
-                                )
-                                .clicked()
-                            {
-                                *selected_scan = Some(entry.scan_number);
-                            }
+                            ui.label(&entry.request.diagnostic_request.url);
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -40,28 +31,22 @@ pub(super) fn show(
                                         .add_enabled(!is_active, egui::Button::new("Rescan"))
                                         .clicked()
                                     {
-                                        rescan = Some(entry.report.request.clone());
+                                        rescan = Some(entry.request.clone());
                                     }
                                 },
                             );
                         });
-                        let open = entry
-                            .report
-                            .endpoints
-                            .iter()
-                            .filter(|endpoint| endpoint.state == PortState::Open)
-                            .count();
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new(entry.scan_number.to_string())
                                     .small()
                                     .weak(),
                             );
-                            ui.label(entry.report.status.to_string());
-                            ui.weak(format!(
-                                "{open} open; {} security summary items",
-                                entry.report.findings.len()
-                            ));
+                            if let Some(error) = &entry.error {
+                                ui.colored_label(egui::Color32::RED, error);
+                            } else {
+                                ui.colored_label(egui::Color32::GREEN, "Success");
+                            }
                         });
                     });
                     ui.add_space(6.0);

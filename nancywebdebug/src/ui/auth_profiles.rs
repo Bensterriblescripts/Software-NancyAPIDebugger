@@ -190,6 +190,26 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App) {
                                 );
                                 profile_text_row(ui, "Cookie", &mut app.profile_draft.cookie, true);
                             }
+                            ProfileType::ClientCertificate => {
+                                profile_text_row(
+                                    ui,
+                                    "Exact host scope",
+                                    &mut app.profile_draft.host_scope,
+                                    false,
+                                );
+                                profile_text_row(
+                                    ui,
+                                    "PEM certificate chain",
+                                    &mut app.profile_draft.certificate_chain_path,
+                                    false,
+                                );
+                                profile_text_row(
+                                    ui,
+                                    "PEM private key",
+                                    &mut app.profile_draft.private_key_path,
+                                    true,
+                                );
+                            }
                         }
                     });
                 ui.horizontal(|ui| {
@@ -226,7 +246,11 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App) {
             .and_then(|mut store| store.save(app.editing_auth_profile, &app.profile_draft));
         match result {
             Ok(id) => {
-                app.scan_form.diagnostic.selected_auth_profile = Some(id);
+                if app.profile_draft.profile_type == ProfileType::ClientCertificate {
+                    app.scan_form.diagnostic.selected_client_certificate_profile = Some(id);
+                } else {
+                    app.scan_form.diagnostic.selected_auth_profile = Some(id);
+                }
                 app.profile_draft = ProfileInput::default();
                 app.editing_auth_profile = None;
                 app.profile_editor_open = false;
@@ -250,6 +274,9 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App) {
         if deleted {
             if app.scan_form.diagnostic.selected_auth_profile == Some(id) {
                 app.scan_form.diagnostic.selected_auth_profile = None;
+            }
+            if app.scan_form.diagnostic.selected_client_certificate_profile == Some(id) {
+                app.scan_form.diagnostic.selected_client_certificate_profile = None;
             }
             if app.editing_auth_profile == Some(id) {
                 app.profile_draft = ProfileInput::default();

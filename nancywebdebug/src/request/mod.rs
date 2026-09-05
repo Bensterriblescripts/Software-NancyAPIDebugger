@@ -8,10 +8,10 @@ mod stages;
 mod tls;
 mod transport;
 
-pub(crate) use body::MAX_CAPTURE_BYTES;
-pub(crate) use dns::resolve_host;
+pub(crate) use dns::{resolve_host, resolve_host_exhaustive};
 pub(crate) use tls::{
-    CertificateCapture, make_exposure_tls_config, tls_trace_from_capture, tls_trace_from_stream,
+    CertificateCapture, make_exposure_tls_config, parse_certificate, tls_trace_from_capture,
+    tls_trace_from_stream,
 };
 pub(crate) use transport::{TcpCandidate, connect_tcp_endpoint};
 

@@ -1,4 +1,4 @@
-use crate::diagnostics::RequestAuth;
+use crate::diagnostics::{CertificateTrace, RequestAuth, RequestClientCertificate};
 use http::HeaderValue;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,14 +20,16 @@ pub enum ProfileType {
     AzureClientCredentials,
     BrowserCookies,
     ManualCookie,
+    ClientCertificate,
 }
 
 impl ProfileType {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::AzureInteractive,
         Self::AzureClientCredentials,
         Self::BrowserCookies,
         Self::ManualCookie,
+        Self::ClientCertificate,
     ];
 
     pub fn label(self) -> &'static str {
@@ -36,6 +38,7 @@ impl ProfileType {
             Self::AzureClientCredentials => "Azure client credentials",
             Self::BrowserCookies => "Browser session cookies",
             Self::ManualCookie => "Manual session cookie",
+            Self::ClientCertificate => "Client certificate (mTLS)",
         }
     }
 }
@@ -51,6 +54,8 @@ pub struct ProfileInput {
     pub login_url: String,
     pub host_scope: String,
     pub cookie: String,
+    pub certificate_chain_path: String,
+    pub private_key_path: String,
 }
 
 impl Default for ProfileInput {
@@ -65,6 +70,8 @@ impl Default for ProfileInput {
             login_url: String::new(),
             host_scope: String::new(),
             cookie: String::new(),
+            certificate_chain_path: String::new(),
+            private_key_path: String::new(),
         }
     }
 }
@@ -73,6 +80,7 @@ impl ProfileInput {
     pub fn clear_sensitive(&mut self) {
         self.client_secret.zeroize();
         self.cookie.zeroize();
+        self.private_key_path.zeroize();
     }
 }
 
@@ -184,11 +192,20 @@ pub(super) struct ManualCookieProfile {
 }
 
 #[derive(Clone)]
+pub struct ClientCertificateProfile {
+    pub host_scope: String,
+    pub certificate_chain_path: String,
+    pub private_key_path: String,
+    pub(crate) certificate: CertificateTrace,
+}
+
+#[derive(Clone)]
 pub(super) enum StoredProfileKind {
     AzureInteractive(AzureInteractiveProfile),
     AzureClientCredentials(AzureClientCredentialsProfile),
     BrowserCookies(BrowserCookieProfile),
     ManualCookie(ManualCookieProfile),
+    ClientCertificate(ClientCertificateProfile),
 }
 
 impl StoredProfileKind {
@@ -198,6 +215,7 @@ impl StoredProfileKind {
             Self::AzureClientCredentials(_) => ProfileType::AzureClientCredentials,
             Self::BrowserCookies(_) => ProfileType::BrowserCookies,
             Self::ManualCookie(_) => ProfileType::ManualCookie,
+            Self::ClientCertificate(_) => ProfileType::ClientCertificate,
         }
     }
 
@@ -217,6 +235,9 @@ impl StoredProfileKind {
                 None => "Cookie capture required".to_owned(),
             },
             Self::ManualCookie(_) => "Ready".to_owned(),
+            Self::ClientCertificate(profile) => {
+                format!("Ready — {}", profile.certificate.subject)
+            }
         }
     }
 }
@@ -263,11 +284,31 @@ impl AuthStore {
         self.profiles
             .iter()
             .find(|profile| profile.id == id)
-            .map(|profile| RequestAuth {
-                profile_id: profile.id,
-                profile_name: profile.name.clone(),
-                profile_kind: profile.kind.profile_type().label().to_owned(),
+            .and_then(|profile| match &profile.kind {
+                StoredProfileKind::ClientCertificate(_) => None,
+                _ => Some(RequestAuth {
+                    profile_id: profile.id,
+                    profile_name: profile.name.clone(),
+                    profile_kind: profile.kind.profile_type().label().to_owned(),
+                }),
             })
+    }
+
+    pub fn client_certificate_metadata(&self, id: u64) -> Option<RequestClientCertificate> {
+        let profile = self.profiles.iter().find(|profile| profile.id == id)?;
+        let StoredProfileKind::ClientCertificate(config) = &profile.kind else {
+            return None;
+        };
+        Some(RequestClientCertificate {
+            profile_id: profile.id,
+            profile_name: profile.name.clone(),
+            host_scope: config.host_scope.clone(),
+            subject: config.certificate.subject.clone(),
+            issuer: config.certificate.issuer.clone(),
+            serial: config.certificate.serial.clone(),
+            not_after: config.certificate.not_after.clone(),
+            sha256: config.certificate.sha256.clone(),
+        })
     }
 
     pub fn profile_input(&self, id: u64) -> Option<ProfileInput> {
@@ -294,6 +335,11 @@ impl AuthStore {
             StoredProfileKind::ManualCookie(config) => {
                 input.host_scope = config.host_scope.clone();
                 input.cookie = config.cookie.to_string();
+            }
+            StoredProfileKind::ClientCertificate(config) => {
+                input.host_scope = config.host_scope.clone();
+                input.certificate_chain_path = config.certificate_chain_path.clone();
+                input.private_key_path = config.private_key_path.clone();
             }
         }
         Some(input)
@@ -358,6 +404,29 @@ impl AuthStore {
                 StoredProfileKind::ManualCookie(ManualCookieProfile {
                     host_scope,
                     cookie: Zeroizing::new(cookie),
+                })
+            }
+            ProfileType::ClientCertificate => {
+                let host_scope = require_host_scope(&input.host_scope)?;
+                if host_scope.starts_with('.') {
+                    return Err("Client certificate host scope must be one exact host".to_owned());
+                }
+                let certificate_chain_path = input.certificate_chain_path.trim().to_owned();
+                let private_key_path = input.private_key_path.trim().to_owned();
+                if certificate_chain_path.is_empty() || private_key_path.is_empty() {
+                    return Err("Certificate chain and private-key files are required".to_owned());
+                }
+                let certificate = super::certificate_file_metadata(&certificate_chain_path)?;
+                let key_metadata = std::fs::metadata(&private_key_path)
+                    .map_err(|error| format!("Unable to access private-key file: {error}"))?;
+                if !key_metadata.is_file() {
+                    return Err("Private-key path is not a file".to_owned());
+                }
+                StoredProfileKind::ClientCertificate(ClientCertificateProfile {
+                    host_scope,
+                    certificate_chain_path,
+                    private_key_path,
+                    certificate,
                 })
             }
         };
@@ -456,6 +525,11 @@ fn same_configuration(current: &StoredProfileKind, replacement: &StoredProfileKi
         }
         (StoredProfileKind::ManualCookie(a), StoredProfileKind::ManualCookie(b)) => {
             a.host_scope == b.host_scope && a.cookie.as_str() == b.cookie.as_str()
+        }
+        (StoredProfileKind::ClientCertificate(a), StoredProfileKind::ClientCertificate(b)) => {
+            a.host_scope == b.host_scope
+                && a.certificate_chain_path == b.certificate_chain_path
+                && a.private_key_path == b.private_key_path
         }
         _ => false,
     }

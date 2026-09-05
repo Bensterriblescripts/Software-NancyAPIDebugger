@@ -1,5 +1,6 @@
+use crate::auth::LoadedClientCertificate;
 use crate::diagnostics::*;
-use crate::exposure::ConnectionRateLimiter;
+use crate::network::ConnectionRateLimiter;
 use bytes::Bytes;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, USER_AGENT};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri, Version};
@@ -31,6 +32,7 @@ pub(super) async fn run(
     cancel: CancellationToken,
     progress: Sender<DiagnosticProgress>,
     limiter: Option<Arc<ConnectionRateLimiter>>,
+    client_certificate: Option<LoadedClientCertificate>,
 ) -> DiagnosticTrace {
     let tcp_started = begin_stage(&mut trace, StageKind::Tcp, &progress);
     let mut candidates = connect_tcp_all(
@@ -97,7 +99,12 @@ pub(super) async fn run(
     let io = if trace.url.scheme == "https" {
         let tls_started = begin_stage(&mut trace, StageKind::Tls, &progress);
         let capture = Arc::new(Mutex::new(CertificateCapture::default()));
-        let config = match make_tls_config(trace.request.protocol, capture.clone(), false) {
+        let config = match make_tls_config(
+            trace.request.protocol,
+            capture.clone(),
+            false,
+            client_certificate.as_ref(),
+        ) {
             Ok(config) => config,
             Err(error) => {
                 return fail_trace(

@@ -32,6 +32,23 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
                 "Validation",
                 tls.validation.as_deref().unwrap_or("Unknown"),
             );
+            summary_row(
+                ui,
+                "Client authentication",
+                &tls.client_auth.status.to_string(),
+            );
+            summary_row(
+                ui,
+                "CertificateRequest",
+                if tls.client_auth.certificate_requested {
+                    "Observed"
+                } else {
+                    "Not observed"
+                },
+            );
+            if let Some(profile) = &tls.client_auth.profile_name {
+                summary_row(ui, "Client-certificate profile", profile);
+            }
         });
         if let Some(error) = &tls.validation_error {
             ui.colored_label(egui::Color32::LIGHT_RED, error);

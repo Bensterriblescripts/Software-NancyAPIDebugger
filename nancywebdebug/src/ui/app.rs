@@ -1,8 +1,9 @@
 use crate::auth::{self, ProfileInput, SharedAuthStore};
 use crate::exposure::fingerprints::{self, InitializationStatus};
 use crate::{
-    EndpointScan, ExposureScanProgress, ExposureScanReport, ExposureScanRequest,
-    ExposureScanStatus, ExposureScanTimings, PortState, run_exposure_scan_with_auth_store,
+    EndpointScan, ExposureScanPhase, ExposureScanPhaseState, ExposureScanProgress,
+    ExposureScanReport, ExposureScanRequest, ExposureScanStatus, ExposureScanTimings, PortState,
+    run_exposure_scan_with_auth_store,
 };
 use eframe::egui;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -21,10 +22,19 @@ struct ActiveScan {
 
 pub(super) struct ExposureLiveState {
     pub(super) message: String,
+    pub(super) resolving: bool,
     pub(super) completed: usize,
     pub(super) total: usize,
     pub(super) open_endpoints: Vec<EndpointScan>,
     pub(super) last_endpoint: Option<EndpointScan>,
+    pub(super) phases: Vec<ExposureLivePhase>,
+}
+
+pub(super) struct ExposureLivePhase {
+    pub(super) phase: ExposureScanPhase,
+    pub(super) state: ExposureScanPhaseState,
+    pub(super) fraction: f32,
+    pub(super) text: String,
 }
 
 struct AuthEvent {
@@ -45,7 +55,7 @@ pub(super) struct App {
     auth_event_tx: Sender<AuthEvent>,
     auth_event_rx: Receiver<AuthEvent>,
     history: Vec<history::HistoryEntry>,
-    selected_scan: Option<usize>,
+    latest_report: Option<ExposureScanReport>,
     active: Option<ActiveScan>,
     next_scan_number: usize,
     progress_tx: Sender<ExposureScanProgress>,
@@ -75,7 +85,7 @@ impl App {
             auth_event_tx,
             auth_event_rx,
             history: Vec::new(),
-            selected_scan: None,
+            latest_report: None,
             active: None,
             next_scan_number: 1,
             progress_tx,
@@ -102,6 +112,7 @@ impl App {
             return Err("Another scan is already running".to_owned());
         }
         request.validate()?;
+        self.latest_report = None;
         let scan_number = self.next_scan_number;
         self.next_scan_number += 1;
         let cancel = CancellationToken::new();
@@ -109,15 +120,45 @@ impl App {
             scan_number,
             cancel: cancel.clone(),
         });
-        self.selected_scan = Some(scan_number);
         self.exposure_detail_tab = ExposureDetailTab::Diagnostics;
         self.diagnostic_view = DiagnosticViewState::default();
         self.exposure_live = Some(ExposureLiveState {
             message: "Starting public exposure scan...".to_owned(),
+            resolving: true,
             completed: 0,
             total: 0,
             open_endpoints: Vec::new(),
             last_endpoint: None,
+            phases: ExposureScanPhase::ALL
+                .into_iter()
+                .map(|phase| {
+                    let skipped = !request.web_probe_level.active()
+                        && phase == ExposureScanPhase::ActiveWebAssessment;
+                    let skipped = skipped
+                        || (!request.security_operations
+                            && matches!(
+                                phase,
+                                ExposureScanPhase::Crawl
+                                    | ExposureScanPhase::JavaScriptAnalysis
+                                    | ExposureScanPhase::TechnologyAnalysis
+                            ))
+                        || (phase == ExposureScanPhase::UdpScanning && !request.udp_scanning)
+                        || (phase == ExposureScanPhase::ServiceAccess
+                            && !request.service_access_checks)
+                        || (phase == ExposureScanPhase::AssetDiscovery && !request.asset_discovery)
+                        || (phase == ExposureScanPhase::DnsAssessment && !request.dns_assessment);
+                    ExposureLivePhase {
+                        phase,
+                        state: if skipped {
+                            ExposureScanPhaseState::Skipped
+                        } else {
+                            ExposureScanPhaseState::Pending
+                        },
+                        fraction: if skipped { 1.0 } else { 0.0 },
+                        text: if skipped { "Skipped" } else { "Pending" }.to_owned(),
+                    }
+                })
+                .collect(),
         });
         self.spawn_scan(request, cancel);
         Ok(())
@@ -141,6 +182,7 @@ impl App {
                     total_endpoints,
                 } => {
                     if let Some(live) = &mut self.exposure_live {
+                        live.resolving = false;
                         live.total = total_endpoints;
                         live.message = format!(
                             "Scanning {} public address{}...",
@@ -170,6 +212,54 @@ impl App {
                         }
                     }
                 }
+                ExposureScanProgress::UdpEndpointCompleted {
+                    completed,
+                    total,
+                    endpoint,
+                } => {
+                    if let Some(live) = &mut self.exposure_live {
+                        live.message = format!(
+                            "UDP {completed}/{total}: {}:{} — {}",
+                            endpoint.ip, endpoint.port, endpoint.state
+                        );
+                    }
+                }
+                ExposureScanProgress::ServiceAccessCompleted {
+                    completed,
+                    total,
+                    result,
+                } => {
+                    if let Some(live) = &mut self.exposure_live {
+                        live.message = format!(
+                            "Service check {completed}/{total}: {}:{} — {}",
+                            result.ip, result.port, result.status
+                        );
+                    }
+                }
+                ExposureScanProgress::AssetDiscovered {
+                    completed,
+                    total,
+                    asset,
+                } => {
+                    if let Some(live) = &mut self.exposure_live {
+                        live.message = format!(
+                            "CT asset {completed}/{total}: {} — {}",
+                            asset.hostname, asset.state
+                        );
+                    }
+                }
+                ExposureScanProgress::DnsObservationCompleted {
+                    completed,
+                    total,
+                    observation,
+                } => {
+                    if let Some(live) = &mut self.exposure_live {
+                        live.message = format!(
+                            "DNS observation {completed}/{total}: {} — {}",
+                            observation.check, observation.status
+                        );
+                    }
+                }
                 ExposureScanProgress::CrawlProgress {
                     origin,
                     queued,
@@ -179,6 +269,35 @@ impl App {
                     if let Some(live) = &mut self.exposure_live {
                         live.message =
                             format!("Crawling {origin}: {completed}/{queued} — {current_url}");
+                    }
+                }
+                ExposureScanProgress::PhaseProgress {
+                    phase,
+                    state,
+                    fraction,
+                    text,
+                } => {
+                    if let Some(live) = &mut self.exposure_live {
+                        if state == ExposureScanPhaseState::Running {
+                            live.message = text.clone();
+                        }
+                        if phase == ExposureScanPhase::PortScanning {
+                            live.resolving = false;
+                        }
+                        if let Some(live_phase) = live
+                            .phases
+                            .iter_mut()
+                            .find(|live_phase| live_phase.phase == phase)
+                        {
+                            live_phase.state = state;
+                            live_phase.fraction = match state {
+                                ExposureScanPhaseState::Pending => 0.0,
+                                ExposureScanPhaseState::Running => fraction.clamp(0.0, 1.0),
+                                ExposureScanPhaseState::Complete
+                                | ExposureScanPhaseState::Skipped => 1.0,
+                            };
+                            live_phase.text = text;
+                        }
                     }
                 }
                 ExposureScanProgress::Completed(report) => {
@@ -191,10 +310,11 @@ impl App {
                         0,
                         history::HistoryEntry {
                             scan_number,
-                            report,
+                            request: report.request.clone(),
+                            error: report.error.clone(),
                         },
                     );
-                    self.selected_scan = Some(scan_number);
+                    self.latest_report = Some(report);
                     self.diagnostic_view = DiagnosticViewState::default();
                     self.active = None;
                     self.exposure_live = None;
@@ -228,11 +348,18 @@ impl App {
                         ignored_addresses: Vec::new(),
                         warnings: Vec::new(),
                         endpoints: Vec::new(),
+                        udp_endpoints: Vec::new(),
+                        service_access: Vec::new(),
+                        discovered_assets: Vec::new(),
+                        dns_observations: Vec::new(),
+                        stream_observations: Vec::new(),
                         findings: Vec::new(),
+                        security_checks: Vec::new(),
                         crawl_observed_web_surfaces: Vec::new(),
                         crawl_origins: Vec::new(),
                         crawled_resources: Vec::new(),
                         crawl_forms: Vec::new(),
+                        crawl_contacts: Vec::new(),
                         crawl_external_indicators: Vec::new(),
                         crawl_skipped_urls: Vec::new(),
                         timings: ExposureScanTimings::default(),
@@ -390,42 +517,28 @@ impl eframe::App for App {
             }
         });
 
-        let previous_scan = self.selected_scan;
         let rescan = history::show(
             ctx,
             &self.history,
-            &mut self.selected_scan,
             self.active.is_some() || !fingerprints_ready,
         );
-        if self.selected_scan != previous_scan {
-            self.diagnostic_view = DiagnosticViewState::default();
-        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(scan_number) = self.selected_scan {
-                if let Some(report) = self
-                    .history
-                    .iter()
-                    .find(|entry| entry.scan_number == scan_number)
-                    .map(|entry| &entry.report)
-                {
-                    ui.horizontal_wrapped(|ui| {
-                        for tab in ExposureDetailTab::ALL {
-                            ui.selectable_value(&mut self.exposure_detail_tab, tab, tab.label());
-                        }
-                    });
-                    ui.separator();
-                    exposure_view::show_report(
-                        ui,
-                        report,
-                        self.exposure_detail_tab,
-                        &mut self.diagnostic_view,
-                    );
-                } else if let Some(live) = &self.exposure_live {
-                    exposure_view::show_live(ui, live);
-                } else {
-                    ui.spinner();
-                }
+            if let Some(live) = &self.exposure_live {
+                exposure_view::show_live(ui, live);
+            } else if let Some(report) = &self.latest_report {
+                ui.horizontal_wrapped(|ui| {
+                    for tab in ExposureDetailTab::ALL {
+                        ui.selectable_value(&mut self.exposure_detail_tab, tab, tab.label());
+                    }
+                });
+                ui.separator();
+                exposure_view::show_report(
+                    ui,
+                    report,
+                    self.exposure_detail_tab,
+                    &mut self.diagnostic_view,
+                );
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.weak("Configure an advanced public exposure scan to begin.");
@@ -480,9 +593,9 @@ pub fn run() -> Result<(), eframe::Error> {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1700.0, 900.0])
             .with_maximized(true)
             .with_active(true),
+        persist_window: false,
         ..Default::default()
     };
     eframe::run_native(

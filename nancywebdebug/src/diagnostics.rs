@@ -1,66 +1,38 @@
 use std::borrow::Cow;
-use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::request::MAX_CAPTURE_BYTES;
+pub(crate) const MAX_CAPTURE_BYTES: usize = 50 * 1024 * 1024;
 
+display_enum! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProtocolPreference {
-    Auto,
-    Http11,
-    Http2,
-    Http3,
+    pub enum ProtocolPreference {
+        Auto => "Auto (HTTP/2 or HTTP/1.1)",
+        Http11 => "HTTP/1.1",
+        Http2 => "HTTP/2",
+        Http3 => "HTTP/3",
+    }
 }
 
 impl ProtocolPreference {
     pub const ALL: [Self; 4] = [Self::Auto, Self::Http11, Self::Http2, Self::Http3];
 }
 
-impl fmt::Display for ProtocolPreference {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Auto => "Auto (HTTP/2 or HTTP/1.1)",
-            Self::Http11 => "HTTP/1.1",
-            Self::Http2 => "HTTP/2",
-            Self::Http3 => "HTTP/3",
-        })
+labeled_enum! {
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub enum UserAgentPreset[6] {
+        #[default]
+        Nancywebdebug => "nancywebdebug",
+        Firefox => "firefox",
+        Chrome => "chrome",
+        Edge => "edge",
+        Safari => "safari",
+        None => "none",
     }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum UserAgentPreset {
-    #[default]
-    Nancywebdebug,
-    Firefox,
-    Chrome,
-    Edge,
-    Safari,
-    None,
 }
 
 impl UserAgentPreset {
-    pub const ALL: [Self; 6] = [
-        Self::Nancywebdebug,
-        Self::Firefox,
-        Self::Chrome,
-        Self::Edge,
-        Self::Safari,
-        Self::None,
-    ];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Nancywebdebug => "nancywebdebug",
-            Self::Firefox => "firefox",
-            Self::Chrome => "chrome",
-            Self::Edge => "edge",
-            Self::Safari => "safari",
-            Self::None => "none",
-        }
-    }
-
     pub const fn header_value(self) -> Option<&'static str> {
         match self {
             Self::Nancywebdebug => Some(concat!(
@@ -118,6 +90,18 @@ pub struct RequestAuth {
 }
 
 #[derive(Debug, Clone)]
+pub struct RequestClientCertificate {
+    pub profile_id: u64,
+    pub profile_name: String,
+    pub host_scope: String,
+    pub subject: String,
+    pub issuer: String,
+    pub serial: String,
+    pub not_after: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct DiagnosticRequest {
     pub method: String,
     pub url: String,
@@ -126,9 +110,9 @@ pub struct DiagnosticRequest {
     pub protocol: ProtocolPreference,
     pub timeouts: StageTimeouts,
     pub auth: Option<RequestAuth>,
+    pub client_certificate: Option<RequestClientCertificate>,
     pub follow_redirects: bool,
     pub user_agent: UserAgentPreset,
-    pub fingerprint_server: bool,
 }
 
 impl Default for DiagnosticRequest {
@@ -141,9 +125,9 @@ impl Default for DiagnosticRequest {
             protocol: ProtocolPreference::Auto,
             timeouts: StageTimeouts::default(),
             auth: None,
+            client_certificate: None,
             follow_redirects: true,
             user_agent: UserAgentPreset::default(),
-            fingerprint_server: false,
         }
     }
 }
@@ -157,78 +141,42 @@ impl DiagnosticRequest {
     }
 }
 
+display_enum! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TraceOutcome {
-    Running,
-    Success,
-    Failed,
-    TimedOut,
-    Cancelled,
-}
-
-impl fmt::Display for TraceOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Running => "Running",
-            Self::Success => "Success",
-            Self::Failed => "Failed",
-            Self::TimedOut => "Timed out",
-            Self::Cancelled => "Cancelled",
-        })
+    pub enum TraceOutcome {
+        Running => "Running",
+        Success => "Success",
+        Failed => "Failed",
+        TimedOut => "Timed out",
+        Cancelled => "Cancelled",
     }
 }
 
+display_enum! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageKind {
-    Url,
-    Authentication,
-    Dns,
-    Tcp,
-    QuicTls,
-    Tls,
-    HttpHeaders,
-    FirstByte,
-    Body,
-}
-
-impl fmt::Display for StageKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Url => "URL",
-            Self::Authentication => "Authentication",
-            Self::Dns => "DNS",
-            Self::Tcp => "TCP",
-            Self::QuicTls => "QUIC + TLS",
-            Self::Tls => "TLS",
-            Self::HttpHeaders => "HTTP headers",
-            Self::FirstByte => "First byte",
-            Self::Body => "Body",
-        })
+    pub enum StageKind {
+        Url => "URL",
+        Authentication => "Authentication",
+        Dns => "DNS",
+        Tcp => "TCP",
+        QuicTls => "QUIC + TLS",
+        Tls => "TLS",
+        HttpHeaders => "HTTP headers",
+        FirstByte => "First byte",
+        Body => "Body",
     }
 }
 
+display_enum! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageStatus {
-    Pending,
-    Running,
-    Succeeded,
-    Failed,
-    TimedOut,
-    Cancelled,
-    Skipped,
-}
-
-impl fmt::Display for StageStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Pending => "Pending",
-            Self::Running => "Running",
-            Self::Succeeded => "Succeeded",
-            Self::Failed => "Failed",
-            Self::TimedOut => "Timed out",
-            Self::Cancelled => "Cancelled",
-            Self::Skipped => "Skipped",
-        })
+    pub enum StageStatus {
+        Pending => "Pending",
+        Running => "Running",
+        Succeeded => "Succeeded",
+        Failed => "Failed",
+        TimedOut => "Timed out",
+        Cancelled => "Cancelled",
+        Skipped => "Skipped",
     }
 }
 
@@ -277,22 +225,13 @@ pub struct DnsRecord {
     pub value: String,
 }
 
+display_enum! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionOutcome {
-    Succeeded,
-    Failed,
-    TimedOut,
-    Cancelled,
-}
-
-impl fmt::Display for ConnectionOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Succeeded => "Succeeded",
-            Self::Failed => "Failed",
-            Self::TimedOut => "Timed out",
-            Self::Cancelled => "Cancelled",
-        })
+    pub enum ConnectionOutcome {
+        Succeeded => "Succeeded",
+        Failed => "Failed",
+        TimedOut => "Timed out",
+        Cancelled => "Cancelled",
     }
 }
 
@@ -316,7 +255,30 @@ pub struct TlsTrace {
     pub alpn: Option<String>,
     pub validation: Option<String>,
     pub validation_error: Option<String>,
+    pub ocsp_response: Vec<u8>,
     pub certificates: Vec<CertificateTrace>,
+    pub client_auth: ClientAuthObservation,
+}
+
+display_enum! {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub enum ClientAuthStatus {
+        Absent => "Absent",
+        Optional => "Optional",
+        Required => "Required",
+        Accepted => "Accepted",
+        Rejected => "Rejected",
+        #[default]
+        Inconclusive => "Inconclusive",
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ClientAuthObservation {
+    pub certificate_requested: bool,
+    pub status: ClientAuthStatus,
+    pub profile_name: Option<String>,
+    pub evidence: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -330,7 +292,12 @@ pub struct CertificateTrace {
     pub not_after_unix: Option<i64>,
     pub subject_alt_names: Vec<String>,
     pub public_key_algorithm: String,
+    pub public_key_bits: Option<usize>,
     pub signature_algorithm: String,
+    pub is_ca: Option<bool>,
+    pub basic_constraints_critical: Option<bool>,
+    pub key_usage: Vec<String>,
+    pub extended_key_usage: Vec<String>,
     pub sha256: String,
 }
 
@@ -436,31 +403,15 @@ pub struct TraceError {
     pub message: String,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum FingerprintStatus {
-    #[default]
-    Disabled,
-    Pending,
-    Running,
-    Detected,
-    Unknown,
-    TimedOut,
-    Cancelled,
-    Unavailable,
-}
-
-impl fmt::Display for FingerprintStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Disabled => "Disabled",
-            Self::Pending => "Pending",
-            Self::Running => "Running",
-            Self::Detected => "Detected",
-            Self::Unknown => "Unknown",
-            Self::TimedOut => "Timed out",
-            Self::Cancelled => "Cancelled",
-            Self::Unavailable => "Unavailable",
-        })
+display_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FingerprintStatus {
+        Pending => "Pending",
+        Detected => "Detected",
+        Unknown => "Unknown",
+        TimedOut => "Timed out",
+        Cancelled => "Cancelled",
+        Unavailable => "Unavailable",
     }
 }
 
@@ -469,28 +420,15 @@ pub struct FingerprintTrace {
     pub status: FingerprintStatus,
     pub web_server: String,
     pub confidence: String,
-    pub evidence: Vec<String>,
 }
 
 impl FingerprintTrace {
-    fn new(enabled: bool) -> Self {
+    fn new() -> Self {
         Self {
-            status: if enabled {
-                FingerprintStatus::Pending
-            } else {
-                FingerprintStatus::Disabled
-            },
+            status: FingerprintStatus::Pending,
             web_server: "Unknown".to_owned(),
             confidence: "None".to_owned(),
-            evidence: Vec::new(),
         }
-    }
-
-    pub fn is_active(&self) -> bool {
-        matches!(
-            self.status,
-            FingerprintStatus::Pending | FingerprintStatus::Running
-        )
     }
 }
 
@@ -517,7 +455,7 @@ pub struct DiagnosticTrace {
 
 impl DiagnosticTrace {
     pub fn new(index: usize, request: DiagnosticRequest) -> Self {
-        let fingerprint = FingerprintTrace::new(request.fingerprint_server);
+        let fingerprint = FingerprintTrace::new();
         let mut stage_kinds = vec![StageKind::Url, StageKind::Authentication, StageKind::Dns];
         if request.protocol == ProtocolPreference::Http3 {
             stage_kinds.push(StageKind::QuicTls);
@@ -592,6 +530,5 @@ pub fn normalize_url_input(input: &str) -> String {
 pub enum DiagnosticProgress {
     HttpHopUpdated(DiagnosticTrace),
     HttpHopCompleted(DiagnosticTrace),
-    FingerprintUpdated(DiagnosticTrace),
     SessionCompleted,
 }

@@ -2,7 +2,6 @@ use crate::diagnostics::DiagnosticTrace;
 use eframe::egui;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::timeline;
 use crate::ui::widgets::display_url;
 
 pub(in crate::ui) fn show(
@@ -47,6 +46,26 @@ pub(in crate::ui) fn show(
                         .auth
                         .as_ref()
                         .map(|auth| format!("{} ({})", auth.profile_name, auth.profile_kind))
+                        .unwrap_or_else(|| "None".to_owned()),
+                );
+                summary_row(
+                    ui,
+                    "Client certificate",
+                    &trace
+                        .request
+                        .client_certificate
+                        .as_ref()
+                        .map(|certificate| {
+                            format!(
+                                "{} — subject {} — issuer {} — serial {} — valid until {} — SHA-256 {}",
+                                certificate.profile_name,
+                                certificate.subject,
+                                certificate.issuer,
+                                certificate.serial,
+                                certificate.not_after,
+                                certificate.sha256
+                            )
+                        })
                         .unwrap_or_else(|| "None".to_owned()),
                 );
                 summary_row(
@@ -102,15 +121,6 @@ pub(in crate::ui) fn show(
                     &trace.body.decoded_capture_status(),
                 );
             });
-        egui::CollapsingHeader::new("Evidence").show(ui, |ui| {
-            if trace.fingerprint.evidence.is_empty() {
-                ui.weak("None");
-            } else {
-                for evidence in &trace.fingerprint.evidence {
-                    ui.label(evidence);
-                }
-            }
-        });
         if let Some(error) = &trace.error {
             ui.add_space(12.0);
             ui.colored_label(
@@ -122,17 +132,42 @@ pub(in crate::ui) fn show(
             ui.add_space(12.0);
             ui.colored_label(egui::Color32::YELLOW, reason);
         }
-        if !trace.complete || trace.fingerprint.is_active() {
+        if !trace.complete {
             ui.add_space(12.0);
             ui.spinner();
         }
         ui.add_space(12.0);
-        timeline::show(ui, trace);
+        show_timeline(ui, trace);
     });
 }
 
 pub(super) fn summary_row(ui: &mut egui::Ui, label: &str, value: &str) {
     colored_summary_row(ui, label, value, None);
+}
+
+fn show_timeline(ui: &mut egui::Ui, trace: &DiagnosticTrace) {
+    ui.heading("Timeline");
+    egui::Grid::new("timeline_grid")
+        .striped(true)
+        .min_col_width(120.0)
+        .show(ui, |ui| {
+            ui.strong("Stage");
+            ui.strong("Status");
+            ui.strong("Duration");
+            ui.strong("Detail");
+            ui.end_row();
+            for stage in &trace.stages {
+                ui.label(stage.kind.to_string());
+                ui.label(stage.status.to_string());
+                ui.label(
+                    stage
+                        .duration_ms
+                        .map_or_else(|| "—".to_owned(), |duration| format!("{duration:.2} ms")),
+                );
+                ui.label(&stage.detail);
+                ui.end_row();
+            }
+        });
 }
 
 fn colored_summary_row(ui: &mut egui::Ui, label: &str, value: &str, color: Option<egui::Color32>) {

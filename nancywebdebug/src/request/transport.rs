@@ -1,5 +1,6 @@
+use crate::auth::LoadedClientCertificate;
 use crate::diagnostics::{ConnectionAttempt, ConnectionOutcome, ProtocolPreference};
-use crate::exposure::ConnectionRateLimiter;
+use crate::network::ConnectionRateLimiter;
 use futures_util::future::join_all;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -277,10 +278,12 @@ pub(super) async fn connect_quic_all(
     timeout: Duration,
     cancel: &CancellationToken,
     limiter: Option<&ConnectionRateLimiter>,
+    client_certificate: Option<LoadedClientCertificate>,
 ) -> Vec<QuicCandidate> {
     let futures = addresses.iter().copied().map(|ip| {
         let host = host.to_owned();
         let cancel = cancel.clone();
+        let client_certificate = client_certificate.clone();
         async move {
             let remote = SocketAddr::new(ip, port);
             let started = Instant::now();
@@ -331,7 +334,12 @@ pub(super) async fn connect_quic_all(
             };
             let local = endpoint.local_addr().ok();
             let result = async {
-                let tls = make_tls_config(ProtocolPreference::Http3, capture.clone(), true)?;
+                let tls = make_tls_config(
+                    ProtocolPreference::Http3,
+                    capture.clone(),
+                    true,
+                    client_certificate.as_ref(),
+                )?;
                 let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
                     .map_err(|error| error.to_string())?;
                 let client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
