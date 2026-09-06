@@ -31,7 +31,9 @@ const MAX_FINGERPRINT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CATEGORY_BYTES: usize = 256 * 1024;
 const MAX_CACHE_BYTES: usize = MAX_FINGERPRINT_BYTES + MAX_CATEGORY_BYTES + 64 * 1024;
 const MAX_PATTERN_BYTES: usize = 16 * 1024;
-const REGEX_SIZE_LIMIT: usize = 512 * 1024;
+const REGEX_SIZE_LIMIT: usize = 4 * 1024 * 1024;
+const COMPATIBILITY_BACKTRACK_LIMIT: usize = 100_000;
+const COMPATIBILITY_DFA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const REGEX_SET_SIZE_LIMIT: usize = 16 * 1024 * 1024;
 const REGEX_BATCH_SIZE: usize = 256;
 
@@ -61,7 +63,20 @@ enum StateValue {
 }
 
 struct SharedState {
-    value: Mutex<StateValue>,
+    value: StateValue,
+    refresh_in_progress: bool,
+    refresh_queued: bool,
+}
+
+fn shared_state() -> &'static Mutex<SharedState> {
+    static STATE: OnceLock<Mutex<SharedState>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        Mutex::new(SharedState {
+            value: StateValue::NotStarted,
+            refresh_in_progress: false,
+            refresh_queued: false,
+        })
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -133,17 +148,26 @@ struct Implication {
 }
 
 struct CompiledPattern {
+    id: usize,
+    location: String,
     technology: usize,
     expression: String,
-    regex: Option<Regex>,
+    matcher: PatternMatcher,
     confidence: u16,
     version: Option<String>,
+}
+
+enum PatternMatcher {
+    Presence,
+    Standard(Regex),
+    Compatibility(fancy_regex::Regex),
 }
 
 #[derive(Default)]
 struct MatcherBank {
     always: Vec<CompiledPattern>,
     batches: Vec<MatcherBatch>,
+    individual: Vec<CompiledPattern>,
 }
 
 struct MatcherBatch {
@@ -153,8 +177,17 @@ struct MatcherBatch {
 
 #[derive(Default)]
 struct CompileStats {
-    incompatible: usize,
+    total: usize,
+    syntax: usize,
+    compiled_size: usize,
     oversized: usize,
+    warnings: Vec<String>,
+}
+
+struct MatchState<'a> {
+    cancel: &'a CancellationToken,
+    disabled: HashSet<usize>,
+    warnings: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -189,7 +222,7 @@ struct AccumulatedDetection {
     version_confidence: u16,
     score: u16,
     confidence_floor: Confidence,
-    signal_keys: HashSet<String>,
+    signal_scores: HashMap<String, u16>,
     evidence_urls: BTreeSet<String>,
     evidence: BTreeSet<String>,
 }
@@ -252,16 +285,11 @@ impl TokenSink for HtmlSink {
     }
 }
 
-fn shared_state() -> &'static SharedState {
-    static STATE: OnceLock<SharedState> = OnceLock::new();
-    STATE.get_or_init(|| SharedState {
-        value: Mutex::new(StateValue::NotStarted),
-    })
-}
-
 pub(crate) fn initialization_status() -> InitializationStatus {
-    let state = shared_state().value.lock().unwrap();
-    match &*state {
+    let state = shared_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    match &state.value {
         StateValue::NotStarted => InitializationStatus::NotStarted,
         StateValue::Pending => InitializationStatus::Pending,
         StateValue::Ready { info, .. } => InitializationStatus::Ready {
@@ -272,102 +300,69 @@ pub(crate) fn initialization_status() -> InitializationStatus {
 }
 
 pub(crate) fn start_initialization(force: bool) -> bool {
-    let mut state = shared_state().value.lock().unwrap();
-    match &*state {
-        StateValue::Pending => false,
-        StateValue::Ready { .. } if !force => false,
-        _ => {
-            *state = StateValue::Pending;
-            true
-        }
+    let mut state = shared_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if state.refresh_in_progress {
+        state.refresh_queued |= force;
+        return false;
     }
+    if matches!(state.value, StateValue::Ready { .. }) && !force {
+        return false;
+    }
+    state.refresh_in_progress = true;
+    if matches!(state.value, StateValue::NotStarted) {
+        state.value = StateValue::Pending;
+    }
+    true
 }
 
 pub(crate) async fn run_started_initialization() {
-    let result = refresh_catalog().await;
-    complete_initialization(result);
-}
-
-pub(crate) fn complete_runtime_failure(error: String) {
-    complete_initialization(cached_or_fallback(error));
-}
-
-pub(crate) async fn ensure_initialized() {
+    prepare_initial_catalog();
     loop {
-        match initialization_status() {
-            InitializationStatus::Ready { .. } => return,
-            InitializationStatus::NotStarted => {
-                if start_initialization(false) {
-                    run_started_initialization().await;
-                    return;
-                }
-            }
-            InitializationStatus::Pending => {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await
-            }
+        let result = refresh_catalog().await;
+        if !complete_initialization(result) {
+            return;
         }
     }
 }
 
-async fn refresh_catalog() -> Result<(Arc<Catalog>, InitializationInfo), InitializationInfo> {
+async fn fetch_catalog_envelope() -> Result<CacheEnvelope, String> {
     let request = ExposureScanRequest::default();
     let cancel = CancellationToken::new();
     let limiter = ConnectionRateLimiter::new(20);
     let (fingerprints, categories) = tokio::join!(
-        fetch_document(
+        fetch_catalog_json(
             FINGERPRINTS_URL,
             MAX_FINGERPRINT_BYTES,
             &request,
             &cancel,
-            &limiter
+            &limiter,
         ),
-        fetch_document(
+        fetch_catalog_json(
             CATEGORIES_URL,
             MAX_CATEGORY_BYTES,
             &request,
             &cancel,
-            &limiter
-        )
+            &limiter,
+        ),
     );
-    let remote = fingerprints.and_then(|fingerprint_data| {
-        categories.map(|category_definitions| CacheEnvelope {
-            schema_version: CACHE_SCHEMA_VERSION,
-            retrieved_unix_seconds: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            source_urls: SourceUrls {
-                fingerprints: FINGERPRINTS_URL.to_owned(),
-                categories: CATEGORIES_URL.to_owned(),
-            },
-            fingerprint_data,
-            category_definitions,
-        })
-    });
-    match remote.and_then(|envelope| {
-        let catalog = compile_envelope(&envelope)?;
-        Ok((envelope, catalog))
-    }) {
-        Ok((envelope, catalog)) => {
-            let warning =
-                persistence::write_json_with_backup(CACHE_FILE, &envelope, MAX_CACHE_BYTES)
-                    .err()
-                    .map(|error| {
-                        format!("Web technology catalog cache could not be updated: {error}")
-                    });
-            Ok((
-                Arc::new(catalog),
-                InitializationInfo {
-                    warning,
-                    using_curated_fallback: false,
-                },
-            ))
-        }
-        Err(error) => cached_or_fallback(error),
-    }
+    Ok(CacheEnvelope {
+        schema_version: CACHE_SCHEMA_VERSION,
+        retrieved_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        source_urls: SourceUrls {
+            fingerprints: FINGERPRINTS_URL.to_owned(),
+            categories: CATEGORIES_URL.to_owned(),
+        },
+        fingerprint_data: fingerprints?,
+        category_definitions: categories?,
+    })
 }
 
-async fn fetch_document(
+async fn fetch_catalog_json(
     url: &str,
     limit: usize,
     request: &ExposureScanRequest,
@@ -398,76 +393,231 @@ async fn fetch_document(
     serde_json::from_slice(&response.body).map_err(|error| format!("{url}: invalid JSON: {error}"))
 }
 
-fn cached_or_fallback(
-    remote_error: String,
-) -> Result<(Arc<Catalog>, InitializationInfo), InitializationInfo> {
-    match load_cached_catalog() {
-        Ok((catalog, used_backup)) => Ok((
-            Arc::new(catalog),
-            InitializationInfo {
-                warning: Some(format!(
-                    "Web technology catalog refresh failed; using the last valid {}cache: {remote_error}",
-                    if used_backup { "backup " } else { "" }
-                )),
-                using_curated_fallback: false,
-            },
-        )),
-        Err(cache_error) => Err(InitializationInfo {
+async fn refresh_catalog() -> Result<(Arc<Catalog>, InitializationInfo), String> {
+    let envelope = fetch_catalog_envelope().await?;
+    let catalog = Arc::new(compile_envelope(&envelope)?);
+    let warning = persistence::write_json_with_backup(CACHE_FILE, &envelope, MAX_CACHE_BYTES)
+        .err()
+        .map(|error| format!("Web technology catalog cache could not be updated: {error}"));
+    Ok((
+        catalog,
+        InitializationInfo {
+            warning,
+            using_curated_fallback: false,
+        },
+    ))
+}
+
+pub(crate) fn spawn_initialization(
+    force: bool,
+    complete: impl Fn(Result<(), String>) + Send + Sync + 'static,
+) {
+    if !start_initialization(force) {
+        return;
+    }
+    crate::worker::spawn(
+        "Fingerprint initialization",
+        || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("Unable to create async runtime: {error}"))?;
+            runtime.block_on(run_started_initialization());
+            Ok(())
+        },
+        move |result| {
+            if let Err(error) = &result {
+                complete_worker_failure(error.clone());
+            }
+            complete(result);
+        },
+    );
+}
+
+fn complete_worker_failure(error: String) {
+    let mut state = shared_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let catalog = match &state.value {
+        StateValue::Ready { catalog, .. } => catalog.clone(),
+        _ => None,
+    };
+    let using_curated_fallback = catalog.is_none();
+    state.value = StateValue::Ready {
+        catalog,
+        info: InitializationInfo {
             warning: Some(format!(
-                "Web technology catalog unavailable; using curated fingerprints: {remote_error}; {cache_error}"
+                "{error}; using {}",
+                if using_curated_fallback {
+                    "curated fingerprints"
+                } else {
+                    "the last valid catalog"
+                }
             )),
-            using_curated_fallback: true,
-        }),
+            using_curated_fallback,
+        },
+    };
+    state.refresh_in_progress = false;
+    state.refresh_queued = false;
+    shared_state().clear_poison();
+}
+
+pub(crate) async fn ensure_initialized() {
+    loop {
+        match initialization_status() {
+            InitializationStatus::Ready { .. } => return,
+            InitializationStatus::NotStarted => spawn_initialization(false, |_| {}),
+            InitializationStatus::Pending => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await
+            }
+        }
     }
 }
 
 fn load_cached_catalog() -> Result<(Catalog, bool), String> {
-    let (envelope, used_backup) = persistence::read_json_with_backup(
+    let catalog = RefCell::new(None);
+    let (_, used_backup) = persistence::read_json_with_backup(
         CACHE_FILE,
         MAX_CACHE_BYTES,
-        |envelope: &CacheEnvelope| compile_envelope(envelope).map(|_| ()),
+        |envelope: &CacheEnvelope| {
+            let compiled = compile_envelope(envelope)?;
+            *catalog.borrow_mut() = Some(compiled);
+            Ok(())
+        },
     )?;
-    Ok((compile_envelope(&envelope)?, used_backup))
+    catalog
+        .into_inner()
+        .map(|catalog| (catalog, used_backup))
+        .ok_or_else(|| "fingerprint cache validation produced no catalog".to_owned())
 }
 
-fn complete_initialization(result: Result<(Arc<Catalog>, InitializationInfo), InitializationInfo>) {
+fn prepare_initial_catalog() {
+    if matches!(
+        shared_state()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .value,
+        StateValue::Ready { .. }
+    ) {
+        return;
+    }
+    let (catalog, info) = match load_cached_catalog() {
+        Ok((catalog, used_backup)) => (
+            Some(Arc::new(catalog)),
+            InitializationInfo {
+                warning: used_backup
+                    .then(|| "Web technology catalog loaded from the backup cache".to_owned()),
+                using_curated_fallback: false,
+            },
+        ),
+        Err(error) => (
+            None,
+            InitializationInfo {
+                warning: Some(format!(
+                    "Web technology catalog cache unavailable; using curated fingerprints: {error}"
+                )),
+                using_curated_fallback: true,
+            },
+        ),
+    };
+    shared_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .value = StateValue::Ready { catalog, info };
+}
+
+fn complete_initialization(result: Result<(Arc<Catalog>, InitializationInfo), String>) -> bool {
+    let mut state = shared_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let (catalog, info) = match result {
         Ok((catalog, info)) => (Some(catalog), info),
-        Err(info) => (None, info),
+        Err(error) => {
+            let catalog = match &state.value {
+                StateValue::Ready { catalog, .. } => catalog.clone(),
+                _ => None,
+            };
+            let using_curated_fallback = catalog.is_none();
+            let source = if using_curated_fallback {
+                "curated fingerprints"
+            } else {
+                "the last valid catalog"
+            };
+            (
+                catalog,
+                InitializationInfo {
+                    warning: Some(format!(
+                        "Web technology catalog refresh failed; using {source}: {error}"
+                    )),
+                    using_curated_fallback,
+                },
+            )
+        }
     };
-    *shared_state().value.lock().unwrap() = StateValue::Ready { catalog, info };
-}
-
-fn validate_envelope(envelope: &CacheEnvelope) -> Result<(), String> {
-    if envelope.schema_version != CACHE_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported fingerprint cache schema {}",
-            envelope.schema_version
-        ));
-    }
-    if envelope.retrieved_unix_seconds == 0 {
-        return Err("fingerprint cache retrieval timestamp is missing".to_owned());
-    }
-    if envelope.source_urls.fingerprints.is_empty() || envelope.source_urls.categories.is_empty() {
-        return Err("fingerprint cache source URLs are missing".to_owned());
-    }
-    let fingerprint_bytes = serde_json::to_vec(&envelope.fingerprint_data)
-        .map_err(|error| format!("invalid cached fingerprint data: {error}"))?
-        .len();
-    if fingerprint_bytes > MAX_FINGERPRINT_BYTES {
-        return Err("cached fingerprint data exceeds the 8 MiB limit".to_owned());
-    }
-    let category_bytes = serde_json::to_vec(&envelope.category_definitions)
-        .map_err(|error| format!("invalid cached category definitions: {error}"))?
-        .len();
-    if category_bytes > MAX_CATEGORY_BYTES {
-        return Err("cached category definitions exceed the 256 KiB limit".to_owned());
-    }
-    Ok(())
+    let previous = std::mem::replace(&mut state.value, StateValue::Ready { catalog, info });
+    let refresh_again = std::mem::take(&mut state.refresh_queued);
+    state.refresh_in_progress = refresh_again;
+    drop(state);
+    drop(previous);
+    refresh_again
 }
 
 fn compile_envelope(envelope: &CacheEnvelope) -> Result<Catalog, String> {
-    validate_envelope(envelope)?;
+    ({
+        let (envelope,): (&CacheEnvelope,) = (envelope,);
+        let inlined_result: Result<(), String> = {
+            'inlined_validate_envelope: {
+                if envelope.schema_version != CACHE_SCHEMA_VERSION {
+                    break 'inlined_validate_envelope Err(format!(
+                        "unsupported fingerprint cache schema {}",
+                        envelope.schema_version
+                    ));
+                }
+                if envelope.retrieved_unix_seconds == 0 {
+                    break 'inlined_validate_envelope Err(
+                        "fingerprint cache retrieval timestamp is missing".to_owned(),
+                    );
+                }
+                if envelope.source_urls.fingerprints.is_empty()
+                    || envelope.source_urls.categories.is_empty()
+                {
+                    break 'inlined_validate_envelope Err(
+                        "fingerprint cache source URLs are missing".to_owned(),
+                    );
+                }
+                let fingerprint_bytes = match serde_json::to_vec(&envelope.fingerprint_data)
+                    .map_err(|error| format!("invalid cached fingerprint data: {error}"))
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        break 'inlined_validate_envelope Err(::core::convert::From::from(error));
+                    }
+                }
+                .len();
+                if fingerprint_bytes > MAX_FINGERPRINT_BYTES {
+                    break 'inlined_validate_envelope Err(
+                        "cached fingerprint data exceeds the 8 MiB limit".to_owned(),
+                    );
+                }
+                let category_bytes = match serde_json::to_vec(&envelope.category_definitions)
+                    .map_err(|error| format!("invalid cached category definitions: {error}"))
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        break 'inlined_validate_envelope Err(::core::convert::From::from(error));
+                    }
+                }
+                .len();
+                if category_bytes > MAX_CATEGORY_BYTES {
+                    break 'inlined_validate_envelope Err(
+                        "cached category definitions exceed the 256 KiB limit".to_owned(),
+                    );
+                }
+                Ok(())
+            }
+        };
+        inlined_result
+    })?;
     let raw: RawFingerprints = serde_json::from_value(envelope.fingerprint_data.clone())
         .map_err(|error| format!("invalid fingerprint data: {error}"))?;
     let raw_categories: BTreeMap<String, RawCategory> =
@@ -502,7 +652,29 @@ fn compile_catalog(
         let implies = fingerprint
             .implies
             .iter()
-            .filter_map(|value| parse_implication(value))
+            .filter_map(|value| {
+                let (source,): (&str,) = (value,);
+                {
+                    'inlined_parse_implication: {
+                        let mut parts = source.split("\\;");
+                        let target = match parts.next() {
+                            Some(value) => value,
+                            None => break 'inlined_parse_implication None,
+                        }
+                        .trim()
+                        .to_ascii_lowercase();
+                        if target.is_empty() {
+                            break 'inlined_parse_implication None;
+                        }
+                        let confidence = parts.find_map(|tag| {
+                            tag.strip_prefix("confidence:")
+                                .and_then(|value| value.parse::<u16>().ok())
+                                .map(|value| value.clamp(1, 100))
+                        });
+                        Some(Implication { target, confidence })
+                    }
+                }
+            })
             .collect();
         technologies.push(Technology {
             name,
@@ -523,8 +695,121 @@ fn compile_catalog(
     let mut script_sources = Vec::new();
     let mut scripts = Vec::new();
     for (technology, fingerprint) in sources.into_iter().enumerate() {
+        let mut compile = |field: &str, index, source: &str| {
+            let (technology, name, field, index, source, stats): (
+                usize,
+                &str,
+                &str,
+                usize,
+                &str,
+                &mut CompileStats,
+            ) = (
+                technology,
+                &technologies[technology].name,
+                field,
+                index,
+                source,
+                &mut stats,
+            );
+            {
+                'inlined_compile_pattern: {
+                    let id = stats.total;
+                    stats.total += 1;
+                    let location = format!("{name} {field}[{index}]");
+                    let source = match (name, field, source) {
+                        ("PubTech", "scriptSrc", r"pubtech-cmp-v(.+?)(?:-esm)?\.js;version:\1") => {
+                            r"pubtech-cmp-v(.+?)(?:-esm)?\.js\;version:\1"
+                        }
+                        _ => source,
+                    };
+                    let mut parts = source.split("\\;");
+                    let expression = parts.next().unwrap_or_default().to_owned();
+                    let mut confidence = 100u16;
+                    let mut version = None;
+                    for tag in parts {
+                        if let Some(value) = tag.strip_prefix("confidence:") {
+                            confidence = value.parse::<u16>().unwrap_or(100).clamp(1, 100);
+                        } else if let Some(value) = tag.strip_prefix("version:") {
+                            version = Some(value.to_owned());
+                        }
+                    }
+                    if expression.len() > MAX_PATTERN_BYTES {
+                        stats.oversized += 1;
+                        stats.warnings.push(format!(
+            "Web technology pattern {location} skipped (oversized expression): {} bytes exceeds {MAX_PATTERN_BYTES} bytes",
+            expression.len()
+        ));
+                        break 'inlined_compile_pattern None;
+                    }
+                    let matcher = if expression.is_empty() {
+                        PatternMatcher::Presence
+                    } else {
+                        match RegexBuilder::new(&expression)
+                            .case_insensitive(true)
+                            .size_limit(REGEX_SIZE_LIMIT)
+                            .build()
+                        {
+                            Ok(regex) => PatternMatcher::Standard(regex),
+                            Err(error @ regex::Error::Syntax(_)) => {
+                                match fancy_regex::RegexBuilder::new(&expression)
+                                    .case_insensitive(true)
+                                    .unicode_mode(true)
+                                    .backtrack_limit(COMPATIBILITY_BACKTRACK_LIMIT)
+                                    .delegate_size_limit(REGEX_SIZE_LIMIT)
+                                    .delegate_dfa_size_limit(COMPATIBILITY_DFA_SIZE_LIMIT)
+                                    .build()
+                                {
+                                    Ok(regex) => PatternMatcher::Compatibility(regex),
+                                    Err(compatibility_error) => {
+                                        let size_failure = matches!(
+                                            &compatibility_error,
+                                            fancy_regex::Error::CompileError(error)
+                                                if matches!(error.as_ref(), fancy_regex::CompileError::InnerError(error)
+                                                    if error.size_limit().is_some())
+                                        );
+                                        let reason = if size_failure {
+                                            stats.compiled_size += 1;
+                                            "compiled-size failure"
+                                        } else {
+                                            stats.syntax += 1;
+                                            "syntax failure"
+                                        };
+                                        stats.warnings.push(format!(
+                            "Web technology pattern {location} skipped ({reason}): standard compiler: {error}; compatibility compiler: {compatibility_error}"
+                        ));
+                                        break 'inlined_compile_pattern None;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let reason = if matches!(error, regex::Error::CompiledTooBig(_)) {
+                                    stats.compiled_size += 1;
+                                    "compiled-size failure"
+                                } else {
+                                    stats.syntax += 1;
+                                    "syntax failure"
+                                };
+                                stats.warnings.push(format!(
+                                    "Web technology pattern {location} skipped ({reason}): {error}"
+                                ));
+                                break 'inlined_compile_pattern None;
+                            }
+                        }
+                    };
+                    Some(CompiledPattern {
+                        id,
+                        location,
+                        technology,
+                        expression,
+                        matcher,
+                        confidence,
+                        version,
+                    })
+                }
+            }
+        };
         for (name, pattern) in fingerprint.headers {
-            if let Some(pattern) = compile_pattern(technology, &pattern, &mut stats) {
+            if let Some(pattern) = compile(&format!("headers[{name:?}]"), 0, &pattern) {
                 headers
                     .entry(name.to_ascii_lowercase())
                     .or_default()
@@ -532,7 +817,7 @@ fn compile_catalog(
             }
         }
         for (name, pattern) in fingerprint.cookies {
-            if let Some(pattern) = compile_pattern(technology, &pattern, &mut stats) {
+            if let Some(pattern) = compile(&format!("cookies[{name:?}]"), 0, &pattern) {
                 cookies
                     .entry(name.to_ascii_lowercase())
                     .or_default()
@@ -540,38 +825,98 @@ fn compile_catalog(
             }
         }
         for (name, patterns) in fingerprint.meta {
-            for pattern in patterns {
-                if let Some(pattern) = compile_pattern(technology, &pattern, &mut stats) {
+            for (index, pattern) in patterns.into_iter().enumerate() {
+                if let Some(pattern) = compile(&format!("meta[{name:?}]"), index, &pattern) {
                     meta.entry(name.to_ascii_lowercase())
                         .or_default()
                         .push(pattern);
                 }
             }
         }
-        for pattern in fingerprint.html {
-            if let Some(pattern) = compile_pattern(technology, &pattern, &mut stats) {
+        for (index, pattern) in fingerprint.html.into_iter().enumerate() {
+            if let Some(pattern) = compile("html", index, &pattern) {
                 html.push(pattern);
             }
         }
-        for pattern in fingerprint.script_src {
-            if let Some(pattern) = compile_pattern(technology, &pattern, &mut stats) {
+        for (index, pattern) in fingerprint.script_src.into_iter().enumerate() {
+            if let Some(pattern) = compile("scriptSrc", index, &pattern) {
                 script_sources.push(pattern);
             }
         }
-        for pattern in fingerprint.scripts {
-            if let Some(pattern) = compile_pattern(technology, &pattern, &mut stats) {
+        for (index, pattern) in fingerprint.scripts.into_iter().enumerate() {
+            if let Some(pattern) = compile("scripts", index, &pattern) {
                 scripts.push(pattern);
             }
         }
     }
-    let html = MatcherBank::compile(html, &mut stats);
-    let script_sources = MatcherBank::compile(script_sources, &mut stats);
-    let scripts = MatcherBank::compile(scripts, &mut stats);
-    let mut warnings = Vec::new();
-    if stats.incompatible > 0 || stats.oversized > 0 {
-        warnings.push(format!(
-            "Web technology catalog skipped {} incompatible and {} oversized passive pattern(s)",
-            stats.incompatible, stats.oversized
+    let html = {
+        let (patterns,): (Vec<CompiledPattern>,) = (html,);
+        let inlined_result: MatcherBank = {
+            let mut bank = MatcherBank::default();
+            let mut regular = Vec::new();
+            for pattern in patterns {
+                match &pattern.matcher {
+                    PatternMatcher::Presence => bank.always.push(pattern),
+                    PatternMatcher::Standard(_) => regular.push(pattern),
+                    PatternMatcher::Compatibility(_) => bank.individual.push(pattern),
+                }
+            }
+            while !regular.is_empty() {
+                let count = REGEX_BATCH_SIZE.min(regular.len());
+                let batch = regular.drain(..count).collect::<Vec<_>>();
+                compile_batch(batch, &mut bank);
+            }
+            bank
+        };
+        inlined_result
+    };
+    let script_sources = {
+        let (patterns,): (Vec<CompiledPattern>,) = (script_sources,);
+        let inlined_result: MatcherBank = {
+            let mut bank = MatcherBank::default();
+            let mut regular = Vec::new();
+            for pattern in patterns {
+                match &pattern.matcher {
+                    PatternMatcher::Presence => bank.always.push(pattern),
+                    PatternMatcher::Standard(_) => regular.push(pattern),
+                    PatternMatcher::Compatibility(_) => bank.individual.push(pattern),
+                }
+            }
+            while !regular.is_empty() {
+                let count = REGEX_BATCH_SIZE.min(regular.len());
+                let batch = regular.drain(..count).collect::<Vec<_>>();
+                compile_batch(batch, &mut bank);
+            }
+            bank
+        };
+        inlined_result
+    };
+    let scripts = {
+        let (patterns,): (Vec<CompiledPattern>,) = (scripts,);
+        let inlined_result: MatcherBank = {
+            let mut bank = MatcherBank::default();
+            let mut regular = Vec::new();
+            for pattern in patterns {
+                match &pattern.matcher {
+                    PatternMatcher::Presence => bank.always.push(pattern),
+                    PatternMatcher::Standard(_) => regular.push(pattern),
+                    PatternMatcher::Compatibility(_) => bank.individual.push(pattern),
+                }
+            }
+            while !regular.is_empty() {
+                let count = REGEX_BATCH_SIZE.min(regular.len());
+                let batch = regular.drain(..count).collect::<Vec<_>>();
+                compile_batch(batch, &mut bank);
+            }
+            bank
+        };
+        inlined_result
+    };
+    let mut warnings = stats.warnings;
+    if stats.syntax > 0 || stats.compiled_size > 0 || stats.oversized > 0 {
+        warnings.insert(0, format!(
+            "Web technology catalog skipped passive patterns: {} syntax failure(s), {} compiled-size failure(s), {} oversized expression(s)",
+            stats.syntax, stats.compiled_size, stats.oversized
         ));
     }
     Ok(Catalog {
@@ -587,101 +932,7 @@ fn compile_catalog(
     })
 }
 
-fn compile_pattern(
-    technology: usize,
-    source: &str,
-    stats: &mut CompileStats,
-) -> Option<CompiledPattern> {
-    let mut parts = source.split("\\;");
-    let expression = parts.next().unwrap_or_default().to_owned();
-    let mut confidence = 100u16;
-    let mut version = None;
-    for tag in parts {
-        if let Some(value) = tag.strip_prefix("confidence:") {
-            confidence = value.parse::<u16>().unwrap_or(100).clamp(1, 100);
-        } else if let Some(value) = tag.strip_prefix("version:") {
-            version = Some(value.to_owned());
-        }
-    }
-    if expression.len() > MAX_PATTERN_BYTES {
-        stats.oversized += 1;
-        return None;
-    }
-    let regex = if expression.is_empty() {
-        None
-    } else {
-        match RegexBuilder::new(&expression)
-            .case_insensitive(true)
-            .size_limit(REGEX_SIZE_LIMIT)
-            .build()
-        {
-            Ok(regex) => Some(regex),
-            Err(_) => {
-                stats.incompatible += 1;
-                return None;
-            }
-        }
-    };
-    Some(CompiledPattern {
-        technology,
-        expression,
-        regex,
-        confidence,
-        version,
-    })
-}
-
-fn parse_implication(source: &str) -> Option<Implication> {
-    let mut parts = source.split("\\;");
-    let target = parts.next()?.trim().to_ascii_lowercase();
-    if target.is_empty() {
-        return None;
-    }
-    let confidence = parts.find_map(|tag| {
-        tag.strip_prefix("confidence:")
-            .and_then(|value| value.parse::<u16>().ok())
-            .map(|value| value.clamp(1, 100))
-    });
-    Some(Implication { target, confidence })
-}
-
-impl MatcherBank {
-    fn compile(patterns: Vec<CompiledPattern>, stats: &mut CompileStats) -> Self {
-        let mut bank = Self::default();
-        let mut regular = Vec::new();
-        for pattern in patterns {
-            if pattern.regex.is_none() {
-                bank.always.push(pattern);
-            } else {
-                regular.push(pattern);
-            }
-        }
-        while !regular.is_empty() {
-            let count = REGEX_BATCH_SIZE.min(regular.len());
-            let batch = regular.drain(..count).collect::<Vec<_>>();
-            compile_batch(batch, &mut bank.batches, stats);
-        }
-        bank
-    }
-
-    fn visit_matches(&self, text: &str, mut visit: impl FnMut(&CompiledPattern, Option<String>)) {
-        for pattern in &self.always {
-            visit(pattern, None);
-        }
-        for batch in &self.batches {
-            for index in batch.set.matches(text).into_iter() {
-                let pattern = &batch.patterns[index];
-                visit(pattern, pattern_version(pattern, text));
-            }
-        }
-    }
-}
-
-fn compile_batch(
-    patterns: Vec<CompiledPattern>,
-    batches: &mut Vec<MatcherBatch>,
-    stats: &mut CompileStats,
-) {
+fn compile_batch(patterns: Vec<CompiledPattern>, bank: &mut MatcherBank) {
     let expressions = patterns
         .iter()
         .map(|pattern| pattern.expression.as_str())
@@ -691,52 +942,14 @@ fn compile_batch(
         .size_limit(REGEX_SET_SIZE_LIMIT)
         .build()
     {
-        Ok(set) => batches.push(MatcherBatch { set, patterns }),
+        Ok(set) => bank.batches.push(MatcherBatch { set, patterns }),
         Err(_) if patterns.len() > 1 => {
             let mut left = patterns;
             let right = left.split_off(left.len() / 2);
-            compile_batch(left, batches, stats);
-            compile_batch(right, batches, stats);
+            compile_batch(left, bank);
+            compile_batch(right, bank);
         }
-        Err(_) => stats.incompatible += 1,
-    }
-}
-
-fn pattern_version(pattern: &CompiledPattern, text: &str) -> Option<String> {
-    let template = pattern.version.as_deref()?;
-    let captures = pattern.regex.as_ref()?.captures(text)?;
-    let mut result = template.to_owned();
-    for index in 1..captures.len() {
-        let marker = format!("\\{index}");
-        let value = captures.get(index).map_or("", |capture| capture.as_str());
-        let conditional = format!("{marker}?");
-        while let Some(start) = result.find(&conditional) {
-            let branch_start = start + conditional.len();
-            let end = result[branch_start..]
-                .find("\\;")
-                .map(|offset| branch_start + offset)
-                .unwrap_or(result.len());
-            let branch = &result[branch_start..end];
-            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
-            let replacement = if value.is_empty() {
-                when_missing
-            } else {
-                when_present
-            }
-            .to_owned();
-            result.replace_range(start..end, &replacement);
-        }
-        result = result.replace(&marker, value);
-    }
-    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
-    (!result.is_empty()).then_some(result)
-}
-
-fn match_single_pattern(pattern: &CompiledPattern, text: &str) -> Option<Option<String>> {
-    match &pattern.regex {
-        None => Some(None),
-        Some(regex) if regex.is_match(text) => Some(pattern_version(pattern, text)),
-        Some(_) => None,
+        Err(_) => bank.individual.extend(patterns),
     }
 }
 
@@ -765,8 +978,10 @@ pub(super) fn detect(
         format!("Scanning {response_total} HTTP responses"),
     );
     let (catalog, info) = {
-        let state = shared_state().value.lock().unwrap();
-        match &*state {
+        let state = shared_state()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match &state.value {
             StateValue::Ready { catalog, info } => (catalog.clone(), info.clone()),
             _ => (
                 None,
@@ -780,35 +995,2266 @@ pub(super) fn detect(
         }
     };
     let mut warnings = info.warning.into_iter().collect::<Vec<_>>();
+    let mut catalogs = catalog.as_deref().into_iter().collect::<Vec<_>>();
+    match {
+        let inlined_result: &'static Result<Catalog, String> = {
+            static CATALOG: OnceLock<Result<Catalog, String>> = OnceLock::new();
+            CATALOG.get_or_init(|| {
+                let raw = serde_json::from_str(include_str!("bundled_fingerprints.json"))
+                    .map_err(|error| format!("invalid bundled fingerprints: {error}"))?;
+                let categories = [
+                    (1, "CMS"),
+                    (2, "Ecommerce"),
+                    (3, "Web servers"),
+                    (4, "CDN"),
+                    (5, "PaaS"),
+                ]
+                .into_iter()
+                .map(|(id, name)| (id, name.to_owned()))
+                .collect();
+                compile_catalog(raw, &categories)
+            })
+        };
+        inlined_result
+    } {
+        Ok(catalog) => catalogs.push(catalog),
+        Err(error) => warnings.push(error.clone()),
+    }
     let mut accumulated = endpoints
         .iter()
-        .map(seed_curated_detections)
+        .map(|endpoint: &EndpointScan| {
+            let mut detections = HashMap::<String, AccumulatedDetection>::new();
+            for product in &endpoint.products {
+                let key = product.name.to_ascii_lowercase();
+                let detection = detections.entry(key).or_default();
+                detection.name = product.name.clone();
+                detection.categories.insert(product.layer.to_string());
+                detection.confidence_floor = detection.confidence_floor.max(product.confidence);
+                if product.version.is_some()
+                    && (detection.version.is_none()
+                        || ({
+                            let (confidence,): (Confidence,) = (product.confidence,);
+                            let inlined_result: u16 = {
+                                match confidence {
+                                    Confidence::None => 0,
+                                    Confidence::Low => 25,
+                                    Confidence::Medium => 75,
+                                    Confidence::High => 100,
+                                }
+                            };
+                            inlined_result
+                        }) >= detection.version_confidence)
+                {
+                    detection.version = product.version.clone();
+                    detection.version_confidence = {
+                        let (confidence,): (Confidence,) = (product.confidence,);
+                        let inlined_result: u16 = {
+                            match confidence {
+                                Confidence::None => 0,
+                                Confidence::Low => 25,
+                                Confidence::Medium => 75,
+                                Confidence::High => 100,
+                            }
+                        };
+                        inlined_result
+                    };
+                }
+                detection.evidence.extend(product.evidence.iter().cloned());
+            }
+            detections
+        })
         .collect::<Vec<_>>();
-    if let Some(catalog) = &catalog {
+    for catalog in &catalogs {
         warnings.extend(catalog.warnings.iter().cloned());
     }
+    let mut match_states = catalogs
+        .iter()
+        .map(|_| {
+            let (cancel,): (&'_ CancellationToken,) = (cancel,);
+            {
+                MatchState {
+                    cancel,
+                    disabled: HashSet::new(),
+                    warnings: Vec::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>();
     for (index, endpoint) in endpoints.iter().enumerate() {
         for response in &endpoint.http {
             if cancel.is_cancelled() {
                 break;
             }
-            if let Some(catalog) = &catalog {
-                catalog.scan_response(
-                    &mut accumulated[index],
-                    &response.url,
-                    response.status,
-                    &response.headers,
-                    &response.body,
-                    None,
-                );
+            for (catalog, state) in catalogs.iter().zip(&mut match_states) {
+                ({
+                    let (
+                        inlined_self,
+                        detections,
+                        response_url,
+                        status,
+                        response_headers,
+                        body,
+                        script_override,
+                        state,
+                    ): (
+                        &Catalog,
+                        &mut HashMap<String, AccumulatedDetection>,
+                        &str,
+                        u16,
+                        &[(String, String)],
+                        &[u8],
+                        Option<bool>,
+                        &mut MatchState<'_>,
+                    ) = (
+                        &(catalog),
+                        &mut accumulated[index],
+                        &response.url,
+                        response.status,
+                        &response.headers,
+                        &response.body,
+                        None,
+                        state,
+                    );
+                    'inlined_scan_response: {
+                        if state.cancel.is_cancelled() {
+                            break 'inlined_scan_response;
+                        }
+                        let url = {
+                            let (source,): (&str,) = (response_url,);
+                            let inlined_result: String = {
+                                'inlined_sanitize_url: {
+                                    let Ok(mut url) = Url::parse(source) else {
+                                        break 'inlined_sanitize_url source
+                                            .chars()
+                                            .take(512)
+                                            .collect();
+                                    };
+                                    let _ = url.set_username("");
+                                    let _ = url.set_password(None);
+                                    url.set_query(None);
+                                    url.set_fragment(None);
+                                    url.to_string()
+                                }
+                            };
+                            inlined_result
+                        };
+                        let mut headers = HashMap::<String, Vec<&str>>::new();
+                        for (name, value) in response_headers {
+                            headers
+                                .entry(name.to_ascii_lowercase())
+                                .or_default()
+                                .push(value);
+                        }
+                        for (name, values) in &headers {
+                            let combined = values.join(", ");
+                            if let Some(patterns) = inlined_self.headers.get(name) {
+                                for pattern in patterns {
+                                    if let Some(version) = {
+                                        let (pattern, text, state): (
+                                            &CompiledPattern,
+                                            &str,
+                                            &mut MatchState<'_>,
+                                        ) = (pattern, &combined, state);
+                                        let inlined_result: Option<Option<String>> = {
+                                            'inlined_match_single_pattern: {
+                                                if state.cancel.is_cancelled() {
+                                                    break 'inlined_match_single_pattern None;
+                                                }
+                                                match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                            }
+                                        };
+                                        inlined_result
+                                    } {
+                                        let key = format!("header:{name}:{url}");
+                                        let label = format!("header {name}");
+                                        ({
+                                            let (
+                                                inlined_self,
+                                                detections,
+                                                pattern,
+                                                version,
+                                                context,
+                                            ): (
+                                                &Catalog,
+                                                &mut HashMap<String, AccumulatedDetection>,
+                                                &CompiledPattern,
+                                                Option<String>,
+                                                MatchContext<'_>,
+                                            ) = (
+                                                &(inlined_self),
+                                                detections,
+                                                pattern,
+                                                version,
+                                                MatchContext {
+                                                    key: &key,
+                                                    label: &label,
+                                                    url: &url,
+                                                },
+                                            );
+
+                                            let mut path = HashSet::new();
+                                            inlined_self.add_recursive(
+                                                detections,
+                                                pattern.technology,
+                                                pattern.confidence,
+                                                version,
+                                                &context,
+                                                &mut path,
+                                                None,
+                                            );
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        for value in headers.get("set-cookie").into_iter().flatten() {
+                            if let Some((name, cookie_value)) = ({
+                                let (value,): (&str,) = (value,);
+                                {
+                                    'inlined_cookie_name_value: {
+                                        let pair = match value.split(';').next() {
+                                            Some(value) => value,
+                                            None => break 'inlined_cookie_name_value None,
+                                        }
+                                        .trim();
+                                        let (name, value) = match pair.split_once('=') {
+                                            Some(value) => value,
+                                            None => break 'inlined_cookie_name_value None,
+                                        };
+                                        let name = name.trim().to_ascii_lowercase();
+                                        (!name.is_empty()).then_some((name, value.trim()))
+                                    }
+                                }
+                            }) && let Some(patterns) = inlined_self.cookies.get(&name)
+                            {
+                                for pattern in patterns {
+                                    if let Some(version) = {
+                                        let (pattern, text, state): (
+                                            &CompiledPattern,
+                                            &str,
+                                            &mut MatchState<'_>,
+                                        ) = (pattern, cookie_value, state);
+                                        let inlined_result: Option<Option<String>> = {
+                                            'inlined_match_single_pattern: {
+                                                if state.cancel.is_cancelled() {
+                                                    break 'inlined_match_single_pattern None;
+                                                }
+                                                match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                            }
+                                        };
+                                        inlined_result
+                                    } {
+                                        let key = format!("cookie:{name}:{url}");
+                                        let label = format!("cookie {name}");
+                                        ({
+                                            let (
+                                                inlined_self,
+                                                detections,
+                                                pattern,
+                                                version,
+                                                context,
+                                            ): (
+                                                &Catalog,
+                                                &mut HashMap<String, AccumulatedDetection>,
+                                                &CompiledPattern,
+                                                Option<String>,
+                                                MatchContext<'_>,
+                                            ) = (
+                                                &(inlined_self),
+                                                detections,
+                                                pattern,
+                                                version,
+                                                MatchContext {
+                                                    key: &key,
+                                                    label: &label,
+                                                    url: &url,
+                                                },
+                                            );
+
+                                            let mut path = HashSet::new();
+                                            inlined_self.add_recursive(
+                                                detections,
+                                                pattern.technology,
+                                                pattern.confidence,
+                                                version,
+                                                &context,
+                                                &mut path,
+                                                None,
+                                            );
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        let text = String::from_utf8_lossy(body);
+                        let is_script = script_override.unwrap_or_else(|| {
+                            let (url, headers): (&str, &[(String, String)]) =
+                                (response_url, response_headers);
+                            {
+                                headers.iter().any(|(name, value)| {
+                                    name.eq_ignore_ascii_case("content-type") && {
+                                        let value = value.to_ascii_lowercase();
+                                        value.contains("javascript") || value.contains("ecmascript")
+                                    }
+                                }) || Url::parse(url).ok().is_some_and(|url| {
+                                    url.path().to_ascii_lowercase().ends_with(".js")
+                                })
+                            }
+                        });
+                        if is_script {
+                            if (200..300).contains(&status) {
+                                let key = format!("script-content:{url}");
+                                ({
+                                    let (inlined_self, text, state, mut visit): (
+                                        &MatcherBank,
+                                        &str,
+                                        &mut MatchState<'_>,
+                                        _,
+                                    ) = (
+                                        &(inlined_self.scripts),
+                                        &text,
+                                        state,
+                                        |pattern, version| {
+                                            ({
+                                                let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                                key: &key,
+                                label: "external script content",
+                                url: &url,
+                            },);
+
+                                                let mut path = HashSet::new();
+                                                inlined_self.add_recursive(
+                                                    detections,
+                                                    pattern.technology,
+                                                    pattern.confidence,
+                                                    version,
+                                                    &context,
+                                                    &mut path,
+                                                    None,
+                                                );
+                                            });
+                                        },
+                                    );
+                                    'inlined_visit_matches: {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        for pattern in &inlined_self.always {
+                                            visit(pattern, None);
+                                        }
+                                        for batch in &inlined_self.batches {
+                                            if state.cancel.is_cancelled() {
+                                                break 'inlined_visit_matches;
+                                            }
+                                            for index in batch.set.matches(text).into_iter() {
+                                                let pattern = &batch.patterns[index];
+                                                visit(pattern, {
+                                                    let (pattern, text): (&CompiledPattern, &str) =
+                                                        (pattern, text);
+                                                    let inlined_result: Option<String> = {
+                                                        'inlined_pattern_version: {
+                                                            let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                            let PatternMatcher::Standard(regex) =
+                                                                &pattern.matcher
+                                                            else {
+                                                                break 'inlined_pattern_version None;
+                                                            };
+                                                            let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                            {
+                                                                let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                                let inlined_result: Option<String> = {
+                                                                    let mut result =
+                                                                        template.to_owned();
+                                                                    for index in 1..capture_count {
+                                                                        let marker =
+                                                                            format!("\\{index}");
+                                                                        let value = capture(index);
+                                                                        let conditional =
+                                                                            format!("{marker}?");
+                                                                        while let Some(start) =
+                                                                            result
+                                                                                .find(&conditional)
+                                                                        {
+                                                                            let branch_start = start
+                                                                                + conditional.len();
+                                                                            let end = result
+                                                                                [branch_start..]
+                                                                                .find("\\;")
+                                                                                .map(|offset| {
+                                                                                    branch_start
+                                                                                        + offset
+                                                                                })
+                                                                                .unwrap_or(
+                                                                                    result.len(),
+                                                                                );
+                                                                            let branch = &result
+                                                                                [branch_start..end];
+                                                                            let (
+                                                                                when_present,
+                                                                                when_missing,
+                                                                            ) = branch
+                                                                                .split_once(':')
+                                                                                .unwrap_or((
+                                                                                    branch, "",
+                                                                                ));
+                                                                            let replacement =
+                                                                                if value.is_empty()
+                                                                                {
+                                                                                    when_missing
+                                                                                } else {
+                                                                                    when_present
+                                                                                }
+                                                                                .to_owned();
+                                                                            result.replace_range(
+                                                                                start..end,
+                                                                                &replacement,
+                                                                            );
+                                                                        }
+                                                                        result = result.replace(
+                                                                            &marker, value,
+                                                                        );
+                                                                    }
+                                                                    let result = result
+                                                                        .trim()
+                                                                        .trim_start_matches([
+                                                                            'v', 'V',
+                                                                        ])
+                                                                        .to_owned();
+                                                                    (!result.is_empty())
+                                                                        .then_some(result)
+                                                                };
+                                                                inlined_result
+                                                            }
+                                                        }
+                                                    };
+                                                    inlined_result
+                                                });
+                                            }
+                                        }
+                                        for pattern in &inlined_self.individual {
+                                            if state.cancel.is_cancelled() {
+                                                break 'inlined_visit_matches;
+                                            }
+                                            if let Some(version) = {
+                                                let (pattern, text, state): (
+                                                    &CompiledPattern,
+                                                    &str,
+                                                    &mut MatchState<'_>,
+                                                ) = (pattern, text, state);
+                                                let inlined_result: Option<Option<String>> = {
+                                                    'inlined_match_single_pattern: {
+                                                        if state.cancel.is_cancelled() {
+                                                            break 'inlined_match_single_pattern None;
+                                                        }
+                                                        match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                    }
+                                                };
+                                                inlined_result
+                                            } {
+                                                visit(pattern, version);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            let key = format!("script-url:{url}");
+                            ({
+                                let (inlined_self, text, state, mut visit): (
+                                    &MatcherBank,
+                                    &str,
+                                    &mut MatchState<'_>,
+                                    _,
+                                ) = (
+                                    &(inlined_self.script_sources),
+                                    &url,
+                                    state,
+                                    |pattern, version| {
+                                        ({
+                                            let (
+                                                inlined_self,
+                                                detections,
+                                                pattern,
+                                                version,
+                                                context,
+                                            ): (
+                                                &Catalog,
+                                                &mut HashMap<String, AccumulatedDetection>,
+                                                &CompiledPattern,
+                                                Option<String>,
+                                                MatchContext<'_>,
+                                            ) = (
+                                                &(inlined_self),
+                                                detections,
+                                                pattern,
+                                                version,
+                                                MatchContext {
+                                                    key: &key,
+                                                    label: "script URL",
+                                                    url: &url,
+                                                },
+                                            );
+
+                                            let mut path = HashSet::new();
+                                            inlined_self.add_recursive(
+                                                detections,
+                                                pattern.technology,
+                                                pattern.confidence,
+                                                version,
+                                                &context,
+                                                &mut path,
+                                                None,
+                                            );
+                                        });
+                                    },
+                                );
+                                'inlined_visit_matches: {
+                                    if state.cancel.is_cancelled() {
+                                        break 'inlined_visit_matches;
+                                    }
+                                    for pattern in &inlined_self.always {
+                                        visit(pattern, None);
+                                    }
+                                    for batch in &inlined_self.batches {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        for index in batch.set.matches(text).into_iter() {
+                                            let pattern = &batch.patterns[index];
+                                            visit(pattern, {
+                                                let (pattern, text): (&CompiledPattern, &str) =
+                                                    (pattern, text);
+                                                let inlined_result: Option<String> = {
+                                                    'inlined_pattern_version: {
+                                                        let template = match pattern
+                                                            .version
+                                                            .as_deref()
+                                                        {
+                                                            Some(value) => value,
+                                                            None => {
+                                                                break 'inlined_pattern_version None;
+                                                            }
+                                                        };
+                                                        let PatternMatcher::Standard(regex) =
+                                                            &pattern.matcher
+                                                        else {
+                                                            break 'inlined_pattern_version None;
+                                                        };
+                                                        let captures = match regex.captures(text) {
+                                                            Some(value) => value,
+                                                            None => {
+                                                                break 'inlined_pattern_version None;
+                                                            }
+                                                        };
+                                                        {
+                                                            let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                            let inlined_result: Option<String> = {
+                                                                let mut result =
+                                                                    template.to_owned();
+                                                                for index in 1..capture_count {
+                                                                    let marker =
+                                                                        format!("\\{index}");
+                                                                    let value = capture(index);
+                                                                    let conditional =
+                                                                        format!("{marker}?");
+                                                                    while let Some(start) =
+                                                                        result.find(&conditional)
+                                                                    {
+                                                                        let branch_start = start
+                                                                            + conditional.len();
+                                                                        let end = result
+                                                                            [branch_start..]
+                                                                            .find("\\;")
+                                                                            .map(|offset| {
+                                                                                branch_start
+                                                                                    + offset
+                                                                            })
+                                                                            .unwrap_or(
+                                                                                result.len(),
+                                                                            );
+                                                                        let branch = &result
+                                                                            [branch_start..end];
+                                                                        let (
+                                                                            when_present,
+                                                                            when_missing,
+                                                                        ) = branch
+                                                                            .split_once(':')
+                                                                            .unwrap_or((
+                                                                                branch, "",
+                                                                            ));
+                                                                        let replacement =
+                                                                            if value.is_empty() {
+                                                                                when_missing
+                                                                            } else {
+                                                                                when_present
+                                                                            }
+                                                                            .to_owned();
+                                                                        result.replace_range(
+                                                                            start..end,
+                                                                            &replacement,
+                                                                        );
+                                                                    }
+                                                                    result = result
+                                                                        .replace(&marker, value);
+                                                                }
+                                                                let result = result
+                                                                    .trim()
+                                                                    .trim_start_matches(['v', 'V'])
+                                                                    .to_owned();
+                                                                (!result.is_empty())
+                                                                    .then_some(result)
+                                                            };
+                                                            inlined_result
+                                                        }
+                                                    }
+                                                };
+                                                inlined_result
+                                            });
+                                        }
+                                    }
+                                    for pattern in &inlined_self.individual {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        if let Some(version) = {
+                                            let (pattern, text, state): (
+                                                &CompiledPattern,
+                                                &str,
+                                                &mut MatchState<'_>,
+                                            ) = (pattern, text, state);
+                                            let inlined_result: Option<Option<String>> = {
+                                                'inlined_match_single_pattern: {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_match_single_pattern None;
+                                                    }
+                                                    match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                }
+                                            };
+                                            inlined_result
+                                        } {
+                                            visit(pattern, version);
+                                        }
+                                    }
+                                }
+                            });
+                            break 'inlined_scan_response;
+                        }
+                        let html_key = format!("html:{url}");
+                        ({
+                            let (inlined_self, text, state, mut visit): (
+                                &MatcherBank,
+                                &str,
+                                &mut MatchState<'_>,
+                                _,
+                            ) = (&(inlined_self.html), &text, state, |pattern, version| {
+                                ({
+                                    let (inlined_self, detections, pattern, version, context): (
+                                        &Catalog,
+                                        &mut HashMap<String, AccumulatedDetection>,
+                                        &CompiledPattern,
+                                        Option<String>,
+                                        MatchContext<'_>,
+                                    ) = (
+                                        &(inlined_self),
+                                        detections,
+                                        pattern,
+                                        version,
+                                        MatchContext {
+                                            key: &html_key,
+                                            label: "HTML signature",
+                                            url: &url,
+                                        },
+                                    );
+
+                                    let mut path = HashSet::new();
+                                    inlined_self.add_recursive(
+                                        detections,
+                                        pattern.technology,
+                                        pattern.confidence,
+                                        version,
+                                        &context,
+                                        &mut path,
+                                        None,
+                                    );
+                                });
+                            });
+                            'inlined_visit_matches: {
+                                if state.cancel.is_cancelled() {
+                                    break 'inlined_visit_matches;
+                                }
+                                for pattern in &inlined_self.always {
+                                    visit(pattern, None);
+                                }
+                                for batch in &inlined_self.batches {
+                                    if state.cancel.is_cancelled() {
+                                        break 'inlined_visit_matches;
+                                    }
+                                    for index in batch.set.matches(text).into_iter() {
+                                        let pattern = &batch.patterns[index];
+                                        visit(pattern, {
+                                            let (pattern, text): (&CompiledPattern, &str) =
+                                                (pattern, text);
+                                            let inlined_result: Option<String> = {
+                                                'inlined_pattern_version: {
+                                                    let template = match pattern.version.as_deref()
+                                                    {
+                                                        Some(value) => value,
+                                                        None => {
+                                                            break 'inlined_pattern_version None;
+                                                        }
+                                                    };
+                                                    let PatternMatcher::Standard(regex) =
+                                                        &pattern.matcher
+                                                    else {
+                                                        break 'inlined_pattern_version None;
+                                                    };
+                                                    let captures = match regex.captures(text) {
+                                                        Some(value) => value,
+                                                        None => {
+                                                            break 'inlined_pattern_version None;
+                                                        }
+                                                    };
+                                                    {
+                                                        let (template, capture_count, capture): (
+                                                            &str,
+                                                            usize,
+                                                            _,
+                                                        ) = (template, captures.len(), |index| {
+                                                            captures
+                                                                .get(index)
+                                                                .map_or("", |capture| {
+                                                                    capture.as_str()
+                                                                })
+                                                        });
+                                                        let inlined_result: Option<String> = {
+                                                            let mut result = template.to_owned();
+                                                            for index in 1..capture_count {
+                                                                let marker = format!("\\{index}");
+                                                                let value = capture(index);
+                                                                let conditional =
+                                                                    format!("{marker}?");
+                                                                while let Some(start) =
+                                                                    result.find(&conditional)
+                                                                {
+                                                                    let branch_start =
+                                                                        start + conditional.len();
+                                                                    let end = result
+                                                                        [branch_start..]
+                                                                        .find("\\;")
+                                                                        .map(|offset| {
+                                                                            branch_start + offset
+                                                                        })
+                                                                        .unwrap_or(result.len());
+                                                                    let branch =
+                                                                        &result[branch_start..end];
+                                                                    let (
+                                                                        when_present,
+                                                                        when_missing,
+                                                                    ) = branch
+                                                                        .split_once(':')
+                                                                        .unwrap_or((branch, ""));
+                                                                    let replacement =
+                                                                        if value.is_empty() {
+                                                                            when_missing
+                                                                        } else {
+                                                                            when_present
+                                                                        }
+                                                                        .to_owned();
+                                                                    result.replace_range(
+                                                                        start..end,
+                                                                        &replacement,
+                                                                    );
+                                                                }
+                                                                result =
+                                                                    result.replace(&marker, value);
+                                                            }
+                                                            let result = result
+                                                                .trim()
+                                                                .trim_start_matches(['v', 'V'])
+                                                                .to_owned();
+                                                            (!result.is_empty()).then_some(result)
+                                                        };
+                                                        inlined_result
+                                                    }
+                                                }
+                                            };
+                                            inlined_result
+                                        });
+                                    }
+                                }
+                                for pattern in &inlined_self.individual {
+                                    if state.cancel.is_cancelled() {
+                                        break 'inlined_visit_matches;
+                                    }
+                                    if let Some(version) = {
+                                        let (pattern, text, state): (
+                                            &CompiledPattern,
+                                            &str,
+                                            &mut MatchState<'_>,
+                                        ) = (pattern, text, state);
+                                        let inlined_result: Option<Option<String>> = {
+                                            'inlined_match_single_pattern: {
+                                                if state.cancel.is_cancelled() {
+                                                    break 'inlined_match_single_pattern None;
+                                                }
+                                                match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                            }
+                                        };
+                                        inlined_result
+                                    } {
+                                        visit(pattern, version);
+                                    }
+                                }
+                            }
+                        });
+                        let signals = {
+                            let (text,): (&str,) = (&text,);
+                            let inlined_result: HtmlSignals = {
+                                let input = BufferQueue::default();
+                                input.push_back(StrTendril::from(text));
+                                let tokenizer =
+                                    Tokenizer::new(HtmlSink::default(), Default::default());
+                                let _ = tokenizer.feed(&input);
+                                tokenizer.end();
+                                tokenizer.sink.0.into_inner().signals
+                            };
+                            inlined_result
+                        };
+                        for (name, content) in signals.meta {
+                            if let Some(patterns) = inlined_self.meta.get(&name) {
+                                for pattern in patterns {
+                                    if let Some(version) = {
+                                        let (pattern, text, state): (
+                                            &CompiledPattern,
+                                            &str,
+                                            &mut MatchState<'_>,
+                                        ) = (pattern, &content, state);
+                                        let inlined_result: Option<Option<String>> = {
+                                            'inlined_match_single_pattern: {
+                                                if state.cancel.is_cancelled() {
+                                                    break 'inlined_match_single_pattern None;
+                                                }
+                                                match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                            }
+                                        };
+                                        inlined_result
+                                    } {
+                                        let key = format!("meta:{name}:{url}");
+                                        let label = format!("meta {name}");
+                                        ({
+                                            let (
+                                                inlined_self,
+                                                detections,
+                                                pattern,
+                                                version,
+                                                context,
+                                            ): (
+                                                &Catalog,
+                                                &mut HashMap<String, AccumulatedDetection>,
+                                                &CompiledPattern,
+                                                Option<String>,
+                                                MatchContext<'_>,
+                                            ) = (
+                                                &(inlined_self),
+                                                detections,
+                                                pattern,
+                                                version,
+                                                MatchContext {
+                                                    key: &key,
+                                                    label: &label,
+                                                    url: &url,
+                                                },
+                                            );
+
+                                            let mut path = HashSet::new();
+                                            inlined_self.add_recursive(
+                                                detections,
+                                                pattern.technology,
+                                                pattern.confidence,
+                                                version,
+                                                &context,
+                                                &mut path,
+                                                None,
+                                            );
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        for source in signals.script_sources {
+                            let source = {
+                                let (document_url, source): (&str, &str) = (response_url, &source);
+                                let inlined_result: String = {
+                                    Url::parse(document_url)
+                                        .ok()
+                                        .and_then(|base| base.join(source).ok())
+                                        .map(|url| {
+                                            let (source,): (&str,) = (url.as_str(),);
+                                            let inlined_result: String = {
+                                                'inlined_sanitize_url: {
+                                                    let Ok(mut url) = Url::parse(source) else {
+                                                        break 'inlined_sanitize_url source
+                                                            .chars()
+                                                            .take(512)
+                                                            .collect();
+                                                    };
+                                                    let _ = url.set_username("");
+                                                    let _ = url.set_password(None);
+                                                    url.set_query(None);
+                                                    url.set_fragment(None);
+                                                    url.to_string()
+                                                }
+                                            };
+                                            inlined_result
+                                        })
+                                        .unwrap_or_else(|| {
+                                            let (source,): (&str,) = (source,);
+                                            let inlined_result: String = {
+                                                'inlined_sanitize_url: {
+                                                    let Ok(mut url) = Url::parse(source) else {
+                                                        break 'inlined_sanitize_url source
+                                                            .chars()
+                                                            .take(512)
+                                                            .collect();
+                                                    };
+                                                    let _ = url.set_username("");
+                                                    let _ = url.set_password(None);
+                                                    url.set_query(None);
+                                                    url.set_fragment(None);
+                                                    url.to_string()
+                                                }
+                                            };
+                                            inlined_result
+                                        })
+                                };
+                                inlined_result
+                            };
+                            let key = format!("script-url:{source}");
+                            ({
+                                let (inlined_self, text, state, mut visit): (
+                                    &MatcherBank,
+                                    &str,
+                                    &mut MatchState<'_>,
+                                    _,
+                                ) = (
+                                    &(inlined_self.script_sources),
+                                    &source,
+                                    state,
+                                    |pattern, version| {
+                                        ({
+                                            let (
+                                                inlined_self,
+                                                detections,
+                                                pattern,
+                                                version,
+                                                context,
+                                            ): (
+                                                &Catalog,
+                                                &mut HashMap<String, AccumulatedDetection>,
+                                                &CompiledPattern,
+                                                Option<String>,
+                                                MatchContext<'_>,
+                                            ) = (
+                                                &(inlined_self),
+                                                detections,
+                                                pattern,
+                                                version,
+                                                MatchContext {
+                                                    key: &key,
+                                                    label: "script URL",
+                                                    url: &source,
+                                                },
+                                            );
+
+                                            let mut path = HashSet::new();
+                                            inlined_self.add_recursive(
+                                                detections,
+                                                pattern.technology,
+                                                pattern.confidence,
+                                                version,
+                                                &context,
+                                                &mut path,
+                                                None,
+                                            );
+                                        });
+                                    },
+                                );
+                                'inlined_visit_matches: {
+                                    if state.cancel.is_cancelled() {
+                                        break 'inlined_visit_matches;
+                                    }
+                                    for pattern in &inlined_self.always {
+                                        visit(pattern, None);
+                                    }
+                                    for batch in &inlined_self.batches {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        for index in batch.set.matches(text).into_iter() {
+                                            let pattern = &batch.patterns[index];
+                                            visit(pattern, {
+                                                let (pattern, text): (&CompiledPattern, &str) =
+                                                    (pattern, text);
+                                                let inlined_result: Option<String> = {
+                                                    'inlined_pattern_version: {
+                                                        let template = match pattern
+                                                            .version
+                                                            .as_deref()
+                                                        {
+                                                            Some(value) => value,
+                                                            None => {
+                                                                break 'inlined_pattern_version None;
+                                                            }
+                                                        };
+                                                        let PatternMatcher::Standard(regex) =
+                                                            &pattern.matcher
+                                                        else {
+                                                            break 'inlined_pattern_version None;
+                                                        };
+                                                        let captures = match regex.captures(text) {
+                                                            Some(value) => value,
+                                                            None => {
+                                                                break 'inlined_pattern_version None;
+                                                            }
+                                                        };
+                                                        {
+                                                            let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                            let inlined_result: Option<String> = {
+                                                                let mut result =
+                                                                    template.to_owned();
+                                                                for index in 1..capture_count {
+                                                                    let marker =
+                                                                        format!("\\{index}");
+                                                                    let value = capture(index);
+                                                                    let conditional =
+                                                                        format!("{marker}?");
+                                                                    while let Some(start) =
+                                                                        result.find(&conditional)
+                                                                    {
+                                                                        let branch_start = start
+                                                                            + conditional.len();
+                                                                        let end = result
+                                                                            [branch_start..]
+                                                                            .find("\\;")
+                                                                            .map(|offset| {
+                                                                                branch_start
+                                                                                    + offset
+                                                                            })
+                                                                            .unwrap_or(
+                                                                                result.len(),
+                                                                            );
+                                                                        let branch = &result
+                                                                            [branch_start..end];
+                                                                        let (
+                                                                            when_present,
+                                                                            when_missing,
+                                                                        ) = branch
+                                                                            .split_once(':')
+                                                                            .unwrap_or((
+                                                                                branch, "",
+                                                                            ));
+                                                                        let replacement =
+                                                                            if value.is_empty() {
+                                                                                when_missing
+                                                                            } else {
+                                                                                when_present
+                                                                            }
+                                                                            .to_owned();
+                                                                        result.replace_range(
+                                                                            start..end,
+                                                                            &replacement,
+                                                                        );
+                                                                    }
+                                                                    result = result
+                                                                        .replace(&marker, value);
+                                                                }
+                                                                let result = result
+                                                                    .trim()
+                                                                    .trim_start_matches(['v', 'V'])
+                                                                    .to_owned();
+                                                                (!result.is_empty())
+                                                                    .then_some(result)
+                                                            };
+                                                            inlined_result
+                                                        }
+                                                    }
+                                                };
+                                                inlined_result
+                                            });
+                                        }
+                                    }
+                                    for pattern in &inlined_self.individual {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        if let Some(version) = {
+                                            let (pattern, text, state): (
+                                                &CompiledPattern,
+                                                &str,
+                                                &mut MatchState<'_>,
+                                            ) = (pattern, text, state);
+                                            let inlined_result: Option<Option<String>> = {
+                                                'inlined_match_single_pattern: {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_match_single_pattern None;
+                                                    }
+                                                    match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                }
+                                            };
+                                            inlined_result
+                                        } {
+                                            visit(pattern, version);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        for (index, script) in signals.inline_scripts.into_iter().enumerate() {
+                            let key = format!("inline-script:{url}:{index}");
+                            ({
+                                let (inlined_self, text, state, mut visit): (
+                                    &MatcherBank,
+                                    &str,
+                                    &mut MatchState<'_>,
+                                    _,
+                                ) = (
+                                    &(inlined_self.scripts),
+                                    &script,
+                                    state,
+                                    |pattern, version| {
+                                        ({
+                                            let (
+                                                inlined_self,
+                                                detections,
+                                                pattern,
+                                                version,
+                                                context,
+                                            ): (
+                                                &Catalog,
+                                                &mut HashMap<String, AccumulatedDetection>,
+                                                &CompiledPattern,
+                                                Option<String>,
+                                                MatchContext<'_>,
+                                            ) = (
+                                                &(inlined_self),
+                                                detections,
+                                                pattern,
+                                                version,
+                                                MatchContext {
+                                                    key: &key,
+                                                    label: "inline script content",
+                                                    url: &url,
+                                                },
+                                            );
+
+                                            let mut path = HashSet::new();
+                                            inlined_self.add_recursive(
+                                                detections,
+                                                pattern.technology,
+                                                pattern.confidence,
+                                                version,
+                                                &context,
+                                                &mut path,
+                                                None,
+                                            );
+                                        });
+                                    },
+                                );
+                                'inlined_visit_matches: {
+                                    if state.cancel.is_cancelled() {
+                                        break 'inlined_visit_matches;
+                                    }
+                                    for pattern in &inlined_self.always {
+                                        visit(pattern, None);
+                                    }
+                                    for batch in &inlined_self.batches {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        for index in batch.set.matches(text).into_iter() {
+                                            let pattern = &batch.patterns[index];
+                                            visit(pattern, {
+                                                let (pattern, text): (&CompiledPattern, &str) =
+                                                    (pattern, text);
+                                                let inlined_result: Option<String> = {
+                                                    'inlined_pattern_version: {
+                                                        let template = match pattern
+                                                            .version
+                                                            .as_deref()
+                                                        {
+                                                            Some(value) => value,
+                                                            None => {
+                                                                break 'inlined_pattern_version None;
+                                                            }
+                                                        };
+                                                        let PatternMatcher::Standard(regex) =
+                                                            &pattern.matcher
+                                                        else {
+                                                            break 'inlined_pattern_version None;
+                                                        };
+                                                        let captures = match regex.captures(text) {
+                                                            Some(value) => value,
+                                                            None => {
+                                                                break 'inlined_pattern_version None;
+                                                            }
+                                                        };
+                                                        {
+                                                            let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                            let inlined_result: Option<String> = {
+                                                                let mut result =
+                                                                    template.to_owned();
+                                                                for index in 1..capture_count {
+                                                                    let marker =
+                                                                        format!("\\{index}");
+                                                                    let value = capture(index);
+                                                                    let conditional =
+                                                                        format!("{marker}?");
+                                                                    while let Some(start) =
+                                                                        result.find(&conditional)
+                                                                    {
+                                                                        let branch_start = start
+                                                                            + conditional.len();
+                                                                        let end = result
+                                                                            [branch_start..]
+                                                                            .find("\\;")
+                                                                            .map(|offset| {
+                                                                                branch_start
+                                                                                    + offset
+                                                                            })
+                                                                            .unwrap_or(
+                                                                                result.len(),
+                                                                            );
+                                                                        let branch = &result
+                                                                            [branch_start..end];
+                                                                        let (
+                                                                            when_present,
+                                                                            when_missing,
+                                                                        ) = branch
+                                                                            .split_once(':')
+                                                                            .unwrap_or((
+                                                                                branch, "",
+                                                                            ));
+                                                                        let replacement =
+                                                                            if value.is_empty() {
+                                                                                when_missing
+                                                                            } else {
+                                                                                when_present
+                                                                            }
+                                                                            .to_owned();
+                                                                        result.replace_range(
+                                                                            start..end,
+                                                                            &replacement,
+                                                                        );
+                                                                    }
+                                                                    result = result
+                                                                        .replace(&marker, value);
+                                                                }
+                                                                let result = result
+                                                                    .trim()
+                                                                    .trim_start_matches(['v', 'V'])
+                                                                    .to_owned();
+                                                                (!result.is_empty())
+                                                                    .then_some(result)
+                                                            };
+                                                            inlined_result
+                                                        }
+                                                    }
+                                                };
+                                                inlined_result
+                                            });
+                                        }
+                                    }
+                                    for pattern in &inlined_self.individual {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        if let Some(version) = {
+                                            let (pattern, text, state): (
+                                                &CompiledPattern,
+                                                &str,
+                                                &mut MatchState<'_>,
+                                            ) = (pattern, text, state);
+                                            let inlined_result: Option<Option<String>> = {
+                                                'inlined_match_single_pattern: {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_match_single_pattern None;
+                                                    }
+                                                    match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                }
+                                            };
+                                            inlined_result
+                                        } {
+                                            visit(pattern, version);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
             }
             completed += 1;
-            send_fingerprint_progress(
-                progress,
-                completed,
-                work_total,
-                format!("HTTP response: {}", sanitize_url(&response.url)),
-            );
+            ({
+                let (progress, completed, total, text): (
+                    &Option<Sender<ExposureScanProgress>>,
+                    usize,
+                    usize,
+                    String,
+                ) = (
+                    progress,
+                    completed,
+                    work_total,
+                    format!(
+                        "HTTP response: {}",
+                        ({
+                            let (source,): (&str,) = (&response.url,);
+                            let inlined_result: String = {
+                                'inlined_sanitize_url: {
+                                    let Ok(mut url) = Url::parse(source) else {
+                                        break 'inlined_sanitize_url source
+                                            .chars()
+                                            .take(512)
+                                            .collect();
+                                    };
+                                    let _ = url.set_username("");
+                                    let _ = url.set_password(None);
+                                    url.set_query(None);
+                                    url.set_fragment(None);
+                                    url.to_string()
+                                }
+                            };
+                            inlined_result
+                        })
+                    ),
+                );
+
+                send_phase_progress(
+                    progress,
+                    ExposureScanPhase::Fingerprinting,
+                    ExposureScanPhaseState::Running,
+                    completed as f32 / total.max(1) as f32,
+                    text,
+                );
+            });
         }
         if cancel.is_cancelled() {
             break;
@@ -819,12 +3265,10 @@ pub(super) fn detect(
             if cancel.is_cancelled() {
                 break;
             }
-            if let (Some(catalog), Some(index)) = (
-                catalog.as_ref(),
-                endpoints.iter().position(|endpoint| {
-                    endpoint.ip == resource.ip && endpoint.port == resource.port
-                }),
-            ) {
+            if let Some(index) = endpoints
+                .iter()
+                .position(|endpoint| endpoint.ip == resource.ip && endpoint.port == resource.port)
+            {
                 let script = resource.detected_file_types.iter().any(|item| {
                     matches!(
                         item.file_type,
@@ -834,22 +3278,2042 @@ pub(super) fn detect(
                             | TechnologyFileType::Tsx
                     )
                 });
-                catalog.scan_response(
-                    &mut accumulated[index],
-                    &resource.url,
-                    200,
-                    &resource.headers,
-                    &resource.body,
-                    Some(script),
-                );
+                for (catalog, state) in catalogs.iter().zip(&mut match_states) {
+                    ({
+                        let (
+                            inlined_self,
+                            detections,
+                            response_url,
+                            status,
+                            response_headers,
+                            body,
+                            script_override,
+                            state,
+                        ): (
+                            &Catalog,
+                            &mut HashMap<String, AccumulatedDetection>,
+                            &str,
+                            u16,
+                            &[(String, String)],
+                            &[u8],
+                            Option<bool>,
+                            &mut MatchState<'_>,
+                        ) = (
+                            &(catalog),
+                            &mut accumulated[index],
+                            &resource.url,
+                            200,
+                            &resource.headers,
+                            &resource.body,
+                            Some(script),
+                            state,
+                        );
+                        'inlined_scan_response: {
+                            if state.cancel.is_cancelled() {
+                                break 'inlined_scan_response;
+                            }
+                            let url = {
+                                let (source,): (&str,) = (response_url,);
+                                let inlined_result: String = {
+                                    'inlined_sanitize_url: {
+                                        let Ok(mut url) = Url::parse(source) else {
+                                            break 'inlined_sanitize_url source
+                                                .chars()
+                                                .take(512)
+                                                .collect();
+                                        };
+                                        let _ = url.set_username("");
+                                        let _ = url.set_password(None);
+                                        url.set_query(None);
+                                        url.set_fragment(None);
+                                        url.to_string()
+                                    }
+                                };
+                                inlined_result
+                            };
+                            let mut headers = HashMap::<String, Vec<&str>>::new();
+                            for (name, value) in response_headers {
+                                headers
+                                    .entry(name.to_ascii_lowercase())
+                                    .or_default()
+                                    .push(value);
+                            }
+                            for (name, values) in &headers {
+                                let combined = values.join(", ");
+                                if let Some(patterns) = inlined_self.headers.get(name) {
+                                    for pattern in patterns {
+                                        if let Some(version) = {
+                                            let (pattern, text, state): (
+                                                &CompiledPattern,
+                                                &str,
+                                                &mut MatchState<'_>,
+                                            ) = (pattern, &combined, state);
+                                            let inlined_result: Option<Option<String>> = {
+                                                'inlined_match_single_pattern: {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_match_single_pattern None;
+                                                    }
+                                                    match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                }
+                                            };
+                                            inlined_result
+                                        } {
+                                            let key = format!("header:{name}:{url}");
+                                            let label = format!("header {name}");
+                                            ({
+                                                let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                                key: &key,
+                                label: &label,
+                                url: &url,
+                            },);
+
+                                                let mut path = HashSet::new();
+                                                inlined_self.add_recursive(
+                                                    detections,
+                                                    pattern.technology,
+                                                    pattern.confidence,
+                                                    version,
+                                                    &context,
+                                                    &mut path,
+                                                    None,
+                                                );
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            for value in headers.get("set-cookie").into_iter().flatten() {
+                                if let Some((name, cookie_value)) = ({
+                                    let (value,): (&str,) = (value,);
+                                    {
+                                        'inlined_cookie_name_value: {
+                                            let pair = match value.split(';').next() {
+                                                Some(value) => value,
+                                                None => break 'inlined_cookie_name_value None,
+                                            }
+                                            .trim();
+                                            let (name, value) = match pair.split_once('=') {
+                                                Some(value) => value,
+                                                None => break 'inlined_cookie_name_value None,
+                                            };
+                                            let name = name.trim().to_ascii_lowercase();
+                                            (!name.is_empty()).then_some((name, value.trim()))
+                                        }
+                                    }
+                                }) && let Some(patterns) = inlined_self.cookies.get(&name)
+                                {
+                                    for pattern in patterns {
+                                        if let Some(version) = {
+                                            let (pattern, text, state): (
+                                                &CompiledPattern,
+                                                &str,
+                                                &mut MatchState<'_>,
+                                            ) = (pattern, cookie_value, state);
+                                            let inlined_result: Option<Option<String>> = {
+                                                'inlined_match_single_pattern: {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_match_single_pattern None;
+                                                    }
+                                                    match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                }
+                                            };
+                                            inlined_result
+                                        } {
+                                            let key = format!("cookie:{name}:{url}");
+                                            let label = format!("cookie {name}");
+                                            ({
+                                                let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                                key: &key,
+                                label: &label,
+                                url: &url,
+                            },);
+
+                                                let mut path = HashSet::new();
+                                                inlined_self.add_recursive(
+                                                    detections,
+                                                    pattern.technology,
+                                                    pattern.confidence,
+                                                    version,
+                                                    &context,
+                                                    &mut path,
+                                                    None,
+                                                );
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            let text = String::from_utf8_lossy(body);
+                            let is_script = script_override.unwrap_or_else(|| {
+                                let (url, headers): (&str, &[(String, String)]) =
+                                    (response_url, response_headers);
+                                {
+                                    headers.iter().any(|(name, value)| {
+                                        name.eq_ignore_ascii_case("content-type") && {
+                                            let value = value.to_ascii_lowercase();
+                                            value.contains("javascript")
+                                                || value.contains("ecmascript")
+                                        }
+                                    }) || Url::parse(url).ok().is_some_and(|url| {
+                                        url.path().to_ascii_lowercase().ends_with(".js")
+                                    })
+                                }
+                            });
+                            if is_script {
+                                if (200..300).contains(&status) {
+                                    let key = format!("script-content:{url}");
+                                    ({
+                                        let (inlined_self, text, state, mut visit): (
+                                            &MatcherBank,
+                                            &str,
+                                            &mut MatchState<'_>,
+                                            _,
+                                        ) = (
+                                            &(inlined_self.scripts),
+                                            &text,
+                                            state,
+                                            |pattern, version| {
+                                                ({
+                                                    let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                                key: &key,
+                                label: "external script content",
+                                url: &url,
+                            },);
+
+                                                    let mut path = HashSet::new();
+                                                    inlined_self.add_recursive(
+                                                        detections,
+                                                        pattern.technology,
+                                                        pattern.confidence,
+                                                        version,
+                                                        &context,
+                                                        &mut path,
+                                                        None,
+                                                    );
+                                                });
+                                            },
+                                        );
+                                        'inlined_visit_matches: {
+                                            if state.cancel.is_cancelled() {
+                                                break 'inlined_visit_matches;
+                                            }
+                                            for pattern in &inlined_self.always {
+                                                visit(pattern, None);
+                                            }
+                                            for batch in &inlined_self.batches {
+                                                if state.cancel.is_cancelled() {
+                                                    break 'inlined_visit_matches;
+                                                }
+                                                for index in batch.set.matches(text).into_iter() {
+                                                    let pattern = &batch.patterns[index];
+                                                    visit(pattern, {
+                                                        let (pattern, text): (
+                                                            &CompiledPattern,
+                                                            &str,
+                                                        ) = (pattern, text);
+                                                        let inlined_result: Option<String> = {
+                                                            'inlined_pattern_version: {
+                                                                let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                                let PatternMatcher::Standard(regex) =
+                                                                    &pattern.matcher
+                                                                else {
+                                                                    break 'inlined_pattern_version None;
+                                                                };
+                                                                let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                                {
+                                                                    let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                                    let inlined_result: Option<
+                                                                        String,
+                                                                    > = {
+                                                                        let mut result =
+                                                                            template.to_owned();
+                                                                        for index in
+                                                                            1..capture_count
+                                                                        {
+                                                                            let marker = format!(
+                                                                                "\\{index}"
+                                                                            );
+                                                                            let value =
+                                                                                capture(index);
+                                                                            let conditional = format!(
+                                                                                "{marker}?"
+                                                                            );
+                                                                            while let Some(start) =
+                                                                                result.find(
+                                                                                    &conditional,
+                                                                                )
+                                                                            {
+                                                                                let branch_start = start + conditional.len();
+                                                                                let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+                                                                                let branch = &result[branch_start..end];
+                                                                                let (
+                                                                                    when_present,
+                                                                                    when_missing,
+                                                                                ) = branch
+                                                                                    .split_once(':')
+                                                                                    .unwrap_or((
+                                                                                        branch, "",
+                                                                                    ));
+                                                                                let replacement =
+                                                                                    if value
+                                                                                        .is_empty()
+                                                                                    {
+                                                                                        when_missing
+                                                                                    } else {
+                                                                                        when_present
+                                                                                    }
+                                                                                    .to_owned();
+                                                                                result
+                                                                                    .replace_range(
+                                                                                    start..end,
+                                                                                    &replacement,
+                                                                                );
+                                                                            }
+                                                                            result = result
+                                                                                .replace(
+                                                                                    &marker, value,
+                                                                                );
+                                                                        }
+                                                                        let result = result
+                                                                            .trim()
+                                                                            .trim_start_matches([
+                                                                                'v', 'V',
+                                                                            ])
+                                                                            .to_owned();
+                                                                        (!result.is_empty())
+                                                                            .then_some(result)
+                                                                    };
+                                                                    inlined_result
+                                                                }
+                                                            }
+                                                        };
+                                                        inlined_result
+                                                    });
+                                                }
+                                            }
+                                            for pattern in &inlined_self.individual {
+                                                if state.cancel.is_cancelled() {
+                                                    break 'inlined_visit_matches;
+                                                }
+                                                if let Some(version) = {
+                                                    let (pattern, text, state): (
+                                                        &CompiledPattern,
+                                                        &str,
+                                                        &mut MatchState<'_>,
+                                                    ) = (pattern, text, state);
+                                                    let inlined_result: Option<Option<String>> = {
+                                                        'inlined_match_single_pattern: {
+                                                            if state.cancel.is_cancelled() {
+                                                                break 'inlined_match_single_pattern None;
+                                                            }
+                                                            match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                        }
+                                                    };
+                                                    inlined_result
+                                                } {
+                                                    visit(pattern, version);
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                                let key = format!("script-url:{url}");
+                                ({
+                                    let (inlined_self, text, state, mut visit): (
+                                        &MatcherBank,
+                                        &str,
+                                        &mut MatchState<'_>,
+                                        _,
+                                    ) = (
+                                        &(inlined_self.script_sources),
+                                        &url,
+                                        state,
+                                        |pattern, version| {
+                                            ({
+                                                let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                            key: &key,
+                            label: "script URL",
+                            url: &url,
+                        },);
+
+                                                let mut path = HashSet::new();
+                                                inlined_self.add_recursive(
+                                                    detections,
+                                                    pattern.technology,
+                                                    pattern.confidence,
+                                                    version,
+                                                    &context,
+                                                    &mut path,
+                                                    None,
+                                                );
+                                            });
+                                        },
+                                    );
+                                    'inlined_visit_matches: {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        for pattern in &inlined_self.always {
+                                            visit(pattern, None);
+                                        }
+                                        for batch in &inlined_self.batches {
+                                            if state.cancel.is_cancelled() {
+                                                break 'inlined_visit_matches;
+                                            }
+                                            for index in batch.set.matches(text).into_iter() {
+                                                let pattern = &batch.patterns[index];
+                                                visit(pattern, {
+                                                    let (pattern, text): (&CompiledPattern, &str) =
+                                                        (pattern, text);
+                                                    let inlined_result: Option<String> = {
+                                                        'inlined_pattern_version: {
+                                                            let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                            let PatternMatcher::Standard(regex) =
+                                                                &pattern.matcher
+                                                            else {
+                                                                break 'inlined_pattern_version None;
+                                                            };
+                                                            let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                            {
+                                                                let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                                let inlined_result: Option<String> = {
+                                                                    let mut result =
+                                                                        template.to_owned();
+                                                                    for index in 1..capture_count {
+                                                                        let marker =
+                                                                            format!("\\{index}");
+                                                                        let value = capture(index);
+                                                                        let conditional =
+                                                                            format!("{marker}?");
+                                                                        while let Some(start) =
+                                                                            result
+                                                                                .find(&conditional)
+                                                                        {
+                                                                            let branch_start = start
+                                                                                + conditional.len();
+                                                                            let end = result
+                                                                                [branch_start..]
+                                                                                .find("\\;")
+                                                                                .map(|offset| {
+                                                                                    branch_start
+                                                                                        + offset
+                                                                                })
+                                                                                .unwrap_or(
+                                                                                    result.len(),
+                                                                                );
+                                                                            let branch = &result
+                                                                                [branch_start..end];
+                                                                            let (
+                                                                                when_present,
+                                                                                when_missing,
+                                                                            ) = branch
+                                                                                .split_once(':')
+                                                                                .unwrap_or((
+                                                                                    branch, "",
+                                                                                ));
+                                                                            let replacement =
+                                                                                if value.is_empty()
+                                                                                {
+                                                                                    when_missing
+                                                                                } else {
+                                                                                    when_present
+                                                                                }
+                                                                                .to_owned();
+                                                                            result.replace_range(
+                                                                                start..end,
+                                                                                &replacement,
+                                                                            );
+                                                                        }
+                                                                        result = result.replace(
+                                                                            &marker, value,
+                                                                        );
+                                                                    }
+                                                                    let result = result
+                                                                        .trim()
+                                                                        .trim_start_matches([
+                                                                            'v', 'V',
+                                                                        ])
+                                                                        .to_owned();
+                                                                    (!result.is_empty())
+                                                                        .then_some(result)
+                                                                };
+                                                                inlined_result
+                                                            }
+                                                        }
+                                                    };
+                                                    inlined_result
+                                                });
+                                            }
+                                        }
+                                        for pattern in &inlined_self.individual {
+                                            if state.cancel.is_cancelled() {
+                                                break 'inlined_visit_matches;
+                                            }
+                                            if let Some(version) = {
+                                                let (pattern, text, state): (
+                                                    &CompiledPattern,
+                                                    &str,
+                                                    &mut MatchState<'_>,
+                                                ) = (pattern, text, state);
+                                                let inlined_result: Option<Option<String>> = {
+                                                    'inlined_match_single_pattern: {
+                                                        if state.cancel.is_cancelled() {
+                                                            break 'inlined_match_single_pattern None;
+                                                        }
+                                                        match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                    }
+                                                };
+                                                inlined_result
+                                            } {
+                                                visit(pattern, version);
+                                            }
+                                        }
+                                    }
+                                });
+                                break 'inlined_scan_response;
+                            }
+                            let html_key = format!("html:{url}");
+                            ({
+                                let (inlined_self, text, state, mut visit): (
+                                    &MatcherBank,
+                                    &str,
+                                    &mut MatchState<'_>,
+                                    _,
+                                ) = (&(inlined_self.html), &text, state, |pattern, version| {
+                                    ({
+                                        let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                    key: &html_key,
+                    label: "HTML signature",
+                    url: &url,
+                },);
+
+                                        let mut path = HashSet::new();
+                                        inlined_self.add_recursive(
+                                            detections,
+                                            pattern.technology,
+                                            pattern.confidence,
+                                            version,
+                                            &context,
+                                            &mut path,
+                                            None,
+                                        );
+                                    });
+                                });
+                                'inlined_visit_matches: {
+                                    if state.cancel.is_cancelled() {
+                                        break 'inlined_visit_matches;
+                                    }
+                                    for pattern in &inlined_self.always {
+                                        visit(pattern, None);
+                                    }
+                                    for batch in &inlined_self.batches {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        for index in batch.set.matches(text).into_iter() {
+                                            let pattern = &batch.patterns[index];
+                                            visit(pattern, {
+                                                let (pattern, text): (&CompiledPattern, &str) =
+                                                    (pattern, text);
+                                                let inlined_result: Option<String> = {
+                                                    'inlined_pattern_version: {
+                                                        let template = match pattern
+                                                            .version
+                                                            .as_deref()
+                                                        {
+                                                            Some(value) => value,
+                                                            None => {
+                                                                break 'inlined_pattern_version None;
+                                                            }
+                                                        };
+                                                        let PatternMatcher::Standard(regex) =
+                                                            &pattern.matcher
+                                                        else {
+                                                            break 'inlined_pattern_version None;
+                                                        };
+                                                        let captures = match regex.captures(text) {
+                                                            Some(value) => value,
+                                                            None => {
+                                                                break 'inlined_pattern_version None;
+                                                            }
+                                                        };
+                                                        {
+                                                            let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                            let inlined_result: Option<String> = {
+                                                                let mut result =
+                                                                    template.to_owned();
+                                                                for index in 1..capture_count {
+                                                                    let marker =
+                                                                        format!("\\{index}");
+                                                                    let value = capture(index);
+                                                                    let conditional =
+                                                                        format!("{marker}?");
+                                                                    while let Some(start) =
+                                                                        result.find(&conditional)
+                                                                    {
+                                                                        let branch_start = start
+                                                                            + conditional.len();
+                                                                        let end = result
+                                                                            [branch_start..]
+                                                                            .find("\\;")
+                                                                            .map(|offset| {
+                                                                                branch_start
+                                                                                    + offset
+                                                                            })
+                                                                            .unwrap_or(
+                                                                                result.len(),
+                                                                            );
+                                                                        let branch = &result
+                                                                            [branch_start..end];
+                                                                        let (
+                                                                            when_present,
+                                                                            when_missing,
+                                                                        ) = branch
+                                                                            .split_once(':')
+                                                                            .unwrap_or((
+                                                                                branch, "",
+                                                                            ));
+                                                                        let replacement =
+                                                                            if value.is_empty() {
+                                                                                when_missing
+                                                                            } else {
+                                                                                when_present
+                                                                            }
+                                                                            .to_owned();
+                                                                        result.replace_range(
+                                                                            start..end,
+                                                                            &replacement,
+                                                                        );
+                                                                    }
+                                                                    result = result
+                                                                        .replace(&marker, value);
+                                                                }
+                                                                let result = result
+                                                                    .trim()
+                                                                    .trim_start_matches(['v', 'V'])
+                                                                    .to_owned();
+                                                                (!result.is_empty())
+                                                                    .then_some(result)
+                                                            };
+                                                            inlined_result
+                                                        }
+                                                    }
+                                                };
+                                                inlined_result
+                                            });
+                                        }
+                                    }
+                                    for pattern in &inlined_self.individual {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        if let Some(version) = {
+                                            let (pattern, text, state): (
+                                                &CompiledPattern,
+                                                &str,
+                                                &mut MatchState<'_>,
+                                            ) = (pattern, text, state);
+                                            let inlined_result: Option<Option<String>> = {
+                                                'inlined_match_single_pattern: {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_match_single_pattern None;
+                                                    }
+                                                    match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                }
+                                            };
+                                            inlined_result
+                                        } {
+                                            visit(pattern, version);
+                                        }
+                                    }
+                                }
+                            });
+                            let signals = {
+                                let (text,): (&str,) = (&text,);
+                                let inlined_result: HtmlSignals = {
+                                    let input = BufferQueue::default();
+                                    input.push_back(StrTendril::from(text));
+                                    let tokenizer =
+                                        Tokenizer::new(HtmlSink::default(), Default::default());
+                                    let _ = tokenizer.feed(&input);
+                                    tokenizer.end();
+                                    tokenizer.sink.0.into_inner().signals
+                                };
+                                inlined_result
+                            };
+                            for (name, content) in signals.meta {
+                                if let Some(patterns) = inlined_self.meta.get(&name) {
+                                    for pattern in patterns {
+                                        if let Some(version) = {
+                                            let (pattern, text, state): (
+                                                &CompiledPattern,
+                                                &str,
+                                                &mut MatchState<'_>,
+                                            ) = (pattern, &content, state);
+                                            let inlined_result: Option<Option<String>> = {
+                                                'inlined_match_single_pattern: {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_match_single_pattern None;
+                                                    }
+                                                    match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                }
+                                            };
+                                            inlined_result
+                                        } {
+                                            let key = format!("meta:{name}:{url}");
+                                            let label = format!("meta {name}");
+                                            ({
+                                                let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                                key: &key,
+                                label: &label,
+                                url: &url,
+                            },);
+
+                                                let mut path = HashSet::new();
+                                                inlined_self.add_recursive(
+                                                    detections,
+                                                    pattern.technology,
+                                                    pattern.confidence,
+                                                    version,
+                                                    &context,
+                                                    &mut path,
+                                                    None,
+                                                );
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            for source in signals.script_sources {
+                                let source = {
+                                    let (document_url, source): (&str, &str) =
+                                        (response_url, &source);
+                                    let inlined_result: String = {
+                                        Url::parse(document_url)
+                                            .ok()
+                                            .and_then(|base| base.join(source).ok())
+                                            .map(|url| {
+                                                let (source,): (&str,) = (url.as_str(),);
+                                                let inlined_result: String = {
+                                                    'inlined_sanitize_url: {
+                                                        let Ok(mut url) = Url::parse(source) else {
+                                                            break 'inlined_sanitize_url source
+                                                                .chars()
+                                                                .take(512)
+                                                                .collect();
+                                                        };
+                                                        let _ = url.set_username("");
+                                                        let _ = url.set_password(None);
+                                                        url.set_query(None);
+                                                        url.set_fragment(None);
+                                                        url.to_string()
+                                                    }
+                                                };
+                                                inlined_result
+                                            })
+                                            .unwrap_or_else(|| {
+                                                let (source,): (&str,) = (source,);
+                                                let inlined_result: String = {
+                                                    'inlined_sanitize_url: {
+                                                        let Ok(mut url) = Url::parse(source) else {
+                                                            break 'inlined_sanitize_url source
+                                                                .chars()
+                                                                .take(512)
+                                                                .collect();
+                                                        };
+                                                        let _ = url.set_username("");
+                                                        let _ = url.set_password(None);
+                                                        url.set_query(None);
+                                                        url.set_fragment(None);
+                                                        url.to_string()
+                                                    }
+                                                };
+                                                inlined_result
+                                            })
+                                    };
+                                    inlined_result
+                                };
+                                let key = format!("script-url:{source}");
+                                ({
+                                    let (inlined_self, text, state, mut visit): (
+                                        &MatcherBank,
+                                        &str,
+                                        &mut MatchState<'_>,
+                                        _,
+                                    ) = (
+                                        &(inlined_self.script_sources),
+                                        &source,
+                                        state,
+                                        |pattern, version| {
+                                            ({
+                                                let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                            key: &key,
+                            label: "script URL",
+                            url: &source,
+                        },);
+
+                                                let mut path = HashSet::new();
+                                                inlined_self.add_recursive(
+                                                    detections,
+                                                    pattern.technology,
+                                                    pattern.confidence,
+                                                    version,
+                                                    &context,
+                                                    &mut path,
+                                                    None,
+                                                );
+                                            });
+                                        },
+                                    );
+                                    'inlined_visit_matches: {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        for pattern in &inlined_self.always {
+                                            visit(pattern, None);
+                                        }
+                                        for batch in &inlined_self.batches {
+                                            if state.cancel.is_cancelled() {
+                                                break 'inlined_visit_matches;
+                                            }
+                                            for index in batch.set.matches(text).into_iter() {
+                                                let pattern = &batch.patterns[index];
+                                                visit(pattern, {
+                                                    let (pattern, text): (&CompiledPattern, &str) =
+                                                        (pattern, text);
+                                                    let inlined_result: Option<String> = {
+                                                        'inlined_pattern_version: {
+                                                            let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                            let PatternMatcher::Standard(regex) =
+                                                                &pattern.matcher
+                                                            else {
+                                                                break 'inlined_pattern_version None;
+                                                            };
+                                                            let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                            {
+                                                                let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                                let inlined_result: Option<String> = {
+                                                                    let mut result =
+                                                                        template.to_owned();
+                                                                    for index in 1..capture_count {
+                                                                        let marker =
+                                                                            format!("\\{index}");
+                                                                        let value = capture(index);
+                                                                        let conditional =
+                                                                            format!("{marker}?");
+                                                                        while let Some(start) =
+                                                                            result
+                                                                                .find(&conditional)
+                                                                        {
+                                                                            let branch_start = start
+                                                                                + conditional.len();
+                                                                            let end = result
+                                                                                [branch_start..]
+                                                                                .find("\\;")
+                                                                                .map(|offset| {
+                                                                                    branch_start
+                                                                                        + offset
+                                                                                })
+                                                                                .unwrap_or(
+                                                                                    result.len(),
+                                                                                );
+                                                                            let branch = &result
+                                                                                [branch_start..end];
+                                                                            let (
+                                                                                when_present,
+                                                                                when_missing,
+                                                                            ) = branch
+                                                                                .split_once(':')
+                                                                                .unwrap_or((
+                                                                                    branch, "",
+                                                                                ));
+                                                                            let replacement =
+                                                                                if value.is_empty()
+                                                                                {
+                                                                                    when_missing
+                                                                                } else {
+                                                                                    when_present
+                                                                                }
+                                                                                .to_owned();
+                                                                            result.replace_range(
+                                                                                start..end,
+                                                                                &replacement,
+                                                                            );
+                                                                        }
+                                                                        result = result.replace(
+                                                                            &marker, value,
+                                                                        );
+                                                                    }
+                                                                    let result = result
+                                                                        .trim()
+                                                                        .trim_start_matches([
+                                                                            'v', 'V',
+                                                                        ])
+                                                                        .to_owned();
+                                                                    (!result.is_empty())
+                                                                        .then_some(result)
+                                                                };
+                                                                inlined_result
+                                                            }
+                                                        }
+                                                    };
+                                                    inlined_result
+                                                });
+                                            }
+                                        }
+                                        for pattern in &inlined_self.individual {
+                                            if state.cancel.is_cancelled() {
+                                                break 'inlined_visit_matches;
+                                            }
+                                            if let Some(version) = {
+                                                let (pattern, text, state): (
+                                                    &CompiledPattern,
+                                                    &str,
+                                                    &mut MatchState<'_>,
+                                                ) = (pattern, text, state);
+                                                let inlined_result: Option<Option<String>> = {
+                                                    'inlined_match_single_pattern: {
+                                                        if state.cancel.is_cancelled() {
+                                                            break 'inlined_match_single_pattern None;
+                                                        }
+                                                        match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                    }
+                                                };
+                                                inlined_result
+                                            } {
+                                                visit(pattern, version);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            for (index, script) in signals.inline_scripts.into_iter().enumerate() {
+                                let key = format!("inline-script:{url}:{index}");
+                                ({
+                                    let (inlined_self, text, state, mut visit): (
+                                        &MatcherBank,
+                                        &str,
+                                        &mut MatchState<'_>,
+                                        _,
+                                    ) = (
+                                        &(inlined_self.scripts),
+                                        &script,
+                                        state,
+                                        |pattern, version| {
+                                            ({
+                                                let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                            key: &key,
+                            label: "inline script content",
+                            url: &url,
+                        },);
+
+                                                let mut path = HashSet::new();
+                                                inlined_self.add_recursive(
+                                                    detections,
+                                                    pattern.technology,
+                                                    pattern.confidence,
+                                                    version,
+                                                    &context,
+                                                    &mut path,
+                                                    None,
+                                                );
+                                            });
+                                        },
+                                    );
+                                    'inlined_visit_matches: {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        for pattern in &inlined_self.always {
+                                            visit(pattern, None);
+                                        }
+                                        for batch in &inlined_self.batches {
+                                            if state.cancel.is_cancelled() {
+                                                break 'inlined_visit_matches;
+                                            }
+                                            for index in batch.set.matches(text).into_iter() {
+                                                let pattern = &batch.patterns[index];
+                                                visit(pattern, {
+                                                    let (pattern, text): (&CompiledPattern, &str) =
+                                                        (pattern, text);
+                                                    let inlined_result: Option<String> = {
+                                                        'inlined_pattern_version: {
+                                                            let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                            let PatternMatcher::Standard(regex) =
+                                                                &pattern.matcher
+                                                            else {
+                                                                break 'inlined_pattern_version None;
+                                                            };
+                                                            let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                            {
+                                                                let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                                let inlined_result: Option<String> = {
+                                                                    let mut result =
+                                                                        template.to_owned();
+                                                                    for index in 1..capture_count {
+                                                                        let marker =
+                                                                            format!("\\{index}");
+                                                                        let value = capture(index);
+                                                                        let conditional =
+                                                                            format!("{marker}?");
+                                                                        while let Some(start) =
+                                                                            result
+                                                                                .find(&conditional)
+                                                                        {
+                                                                            let branch_start = start
+                                                                                + conditional.len();
+                                                                            let end = result
+                                                                                [branch_start..]
+                                                                                .find("\\;")
+                                                                                .map(|offset| {
+                                                                                    branch_start
+                                                                                        + offset
+                                                                                })
+                                                                                .unwrap_or(
+                                                                                    result.len(),
+                                                                                );
+                                                                            let branch = &result
+                                                                                [branch_start..end];
+                                                                            let (
+                                                                                when_present,
+                                                                                when_missing,
+                                                                            ) = branch
+                                                                                .split_once(':')
+                                                                                .unwrap_or((
+                                                                                    branch, "",
+                                                                                ));
+                                                                            let replacement =
+                                                                                if value.is_empty()
+                                                                                {
+                                                                                    when_missing
+                                                                                } else {
+                                                                                    when_present
+                                                                                }
+                                                                                .to_owned();
+                                                                            result.replace_range(
+                                                                                start..end,
+                                                                                &replacement,
+                                                                            );
+                                                                        }
+                                                                        result = result.replace(
+                                                                            &marker, value,
+                                                                        );
+                                                                    }
+                                                                    let result = result
+                                                                        .trim()
+                                                                        .trim_start_matches([
+                                                                            'v', 'V',
+                                                                        ])
+                                                                        .to_owned();
+                                                                    (!result.is_empty())
+                                                                        .then_some(result)
+                                                                };
+                                                                inlined_result
+                                                            }
+                                                        }
+                                                    };
+                                                    inlined_result
+                                                });
+                                            }
+                                        }
+                                        for pattern in &inlined_self.individual {
+                                            if state.cancel.is_cancelled() {
+                                                break 'inlined_visit_matches;
+                                            }
+                                            if let Some(version) = {
+                                                let (pattern, text, state): (
+                                                    &CompiledPattern,
+                                                    &str,
+                                                    &mut MatchState<'_>,
+                                                ) = (pattern, text, state);
+                                                let inlined_result: Option<Option<String>> = {
+                                                    'inlined_match_single_pattern: {
+                                                        if state.cancel.is_cancelled() {
+                                                            break 'inlined_match_single_pattern None;
+                                                        }
+                                                        match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                    }
+                                                };
+                                                inlined_result
+                                            } {
+                                                visit(pattern, version);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+                }
             }
             completed += 1;
-            send_fingerprint_progress(
-                progress,
-                completed,
-                work_total,
-                format!("Resource: {}", sanitize_url(&resource.url)),
-            );
+            ({
+                let (progress, completed, total, text): (
+                    &Option<Sender<ExposureScanProgress>>,
+                    usize,
+                    usize,
+                    String,
+                ) = (
+                    progress,
+                    completed,
+                    work_total,
+                    format!(
+                        "Resource: {}",
+                        ({
+                            let (source,): (&str,) = (&resource.url,);
+                            let inlined_result: String = {
+                                'inlined_sanitize_url: {
+                                    let Ok(mut url) = Url::parse(source) else {
+                                        break 'inlined_sanitize_url source
+                                            .chars()
+                                            .take(512)
+                                            .collect();
+                                    };
+                                    let _ = url.set_username("");
+                                    let _ = url.set_password(None);
+                                    url.set_query(None);
+                                    url.set_fragment(None);
+                                    url.to_string()
+                                }
+                            };
+                            inlined_result
+                        })
+                    ),
+                );
+
+                send_phase_progress(
+                    progress,
+                    ExposureScanPhase::Fingerprinting,
+                    ExposureScanPhaseState::Running,
+                    completed as f32 / total.max(1) as f32,
+                    text,
+                );
+            });
         }
     }
     if !cancel.is_cancelled() {
@@ -858,18 +5322,2330 @@ pub(super) fn detect(
                 if cancel.is_cancelled() {
                     break 'scripts;
                 }
-                if let (Some(catalog), Some(target)) =
-                    (catalog.as_ref(), accumulated.get_mut(endpoint_index))
-                {
-                    catalog.scan_external_script(target, &script.source_url, &script.response);
+                if let Some(target) = accumulated.get_mut(endpoint_index) {
+                    for (catalog, state) in catalogs.iter().zip(&mut match_states) {
+                        ({
+                            let (inlined_self, detections, source_url, response, state): (
+                                &Catalog,
+                                &mut HashMap<String, AccumulatedDetection>,
+                                &str,
+                                &HttpObservation,
+                                &mut MatchState<'_>,
+                            ) = (
+                                &(catalog),
+                                target,
+                                &script.source_url,
+                                &script.response,
+                                state,
+                            );
+
+                            let source = {
+                                let (source,): (&str,) = (source_url,);
+                                let inlined_result: String = {
+                                    'inlined_sanitize_url: {
+                                        let Ok(mut url) = Url::parse(source) else {
+                                            break 'inlined_sanitize_url source
+                                                .chars()
+                                                .take(512)
+                                                .collect();
+                                        };
+                                        let _ = url.set_username("");
+                                        let _ = url.set_password(None);
+                                        url.set_query(None);
+                                        url.set_fragment(None);
+                                        url.to_string()
+                                    }
+                                };
+                                inlined_result
+                            };
+                            let response_url = {
+                                let (source,): (&str,) = (&response.url,);
+                                let inlined_result: String = {
+                                    'inlined_sanitize_url: {
+                                        let Ok(mut url) = Url::parse(source) else {
+                                            break 'inlined_sanitize_url source
+                                                .chars()
+                                                .take(512)
+                                                .collect();
+                                        };
+                                        let _ = url.set_username("");
+                                        let _ = url.set_password(None);
+                                        url.set_query(None);
+                                        url.set_fragment(None);
+                                        url.to_string()
+                                    }
+                                };
+                                inlined_result
+                            };
+                            ({
+                                let (
+                                    inlined_self,
+                                    detections,
+                                    response_url,
+                                    status,
+                                    response_headers,
+                                    body,
+                                    script_override,
+                                    state,
+                                ): (
+                                    &Catalog,
+                                    &mut HashMap<String, AccumulatedDetection>,
+                                    &str,
+                                    u16,
+                                    &[(String, String)],
+                                    &[u8],
+                                    Option<bool>,
+                                    &mut MatchState<'_>,
+                                ) = (
+                                    &(inlined_self),
+                                    detections,
+                                    &response.url,
+                                    response.status,
+                                    &response.headers,
+                                    &response.body,
+                                    Some(true),
+                                    state,
+                                );
+                                'inlined_scan_response: {
+                                    if state.cancel.is_cancelled() {
+                                        break 'inlined_scan_response;
+                                    }
+                                    let url = {
+                                        let (source,): (&str,) = (response_url,);
+                                        let inlined_result: String = {
+                                            'inlined_sanitize_url: {
+                                                let Ok(mut url) = Url::parse(source) else {
+                                                    break 'inlined_sanitize_url source
+                                                        .chars()
+                                                        .take(512)
+                                                        .collect();
+                                                };
+                                                let _ = url.set_username("");
+                                                let _ = url.set_password(None);
+                                                url.set_query(None);
+                                                url.set_fragment(None);
+                                                url.to_string()
+                                            }
+                                        };
+                                        inlined_result
+                                    };
+                                    let mut headers = HashMap::<String, Vec<&str>>::new();
+                                    for (name, value) in response_headers {
+                                        headers
+                                            .entry(name.to_ascii_lowercase())
+                                            .or_default()
+                                            .push(value);
+                                    }
+                                    for (name, values) in &headers {
+                                        let combined = values.join(", ");
+                                        if let Some(patterns) = inlined_self.headers.get(name) {
+                                            for pattern in patterns {
+                                                if let Some(version) = {
+                                                    let (pattern, text, state): (
+                                                        &CompiledPattern,
+                                                        &str,
+                                                        &mut MatchState<'_>,
+                                                    ) = (pattern, &combined, state);
+                                                    let inlined_result: Option<Option<String>> = {
+                                                        'inlined_match_single_pattern: {
+                                                            if state.cancel.is_cancelled() {
+                                                                break 'inlined_match_single_pattern None;
+                                                            }
+                                                            match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                        }
+                                                    };
+                                                    inlined_result
+                                                } {
+                                                    let key = format!("header:{name}:{url}");
+                                                    let label = format!("header {name}");
+                                                    ({
+                                                        let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                                key: &key,
+                                label: &label,
+                                url: &url,
+                            },);
+
+                                                        let mut path = HashSet::new();
+                                                        inlined_self.add_recursive(
+                                                            detections,
+                                                            pattern.technology,
+                                                            pattern.confidence,
+                                                            version,
+                                                            &context,
+                                                            &mut path,
+                                                            None,
+                                                        );
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    for value in headers.get("set-cookie").into_iter().flatten() {
+                                        if let Some((name, cookie_value)) = ({
+                                            let (value,): (&str,) = (value,);
+                                            {
+                                                'inlined_cookie_name_value: {
+                                                    let pair = match value.split(';').next() {
+                                                        Some(value) => value,
+                                                        None => {
+                                                            break 'inlined_cookie_name_value None;
+                                                        }
+                                                    }
+                                                    .trim();
+                                                    let (name, value) = match pair.split_once('=') {
+                                                        Some(value) => value,
+                                                        None => {
+                                                            break 'inlined_cookie_name_value None;
+                                                        }
+                                                    };
+                                                    let name = name.trim().to_ascii_lowercase();
+                                                    (!name.is_empty())
+                                                        .then_some((name, value.trim()))
+                                                }
+                                            }
+                                        }) && let Some(patterns) =
+                                            inlined_self.cookies.get(&name)
+                                        {
+                                            for pattern in patterns {
+                                                if let Some(version) = {
+                                                    let (pattern, text, state): (
+                                                        &CompiledPattern,
+                                                        &str,
+                                                        &mut MatchState<'_>,
+                                                    ) = (pattern, cookie_value, state);
+                                                    let inlined_result: Option<Option<String>> = {
+                                                        'inlined_match_single_pattern: {
+                                                            if state.cancel.is_cancelled() {
+                                                                break 'inlined_match_single_pattern None;
+                                                            }
+                                                            match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                        }
+                                                    };
+                                                    inlined_result
+                                                } {
+                                                    let key = format!("cookie:{name}:{url}");
+                                                    let label = format!("cookie {name}");
+                                                    ({
+                                                        let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                                key: &key,
+                                label: &label,
+                                url: &url,
+                            },);
+
+                                                        let mut path = HashSet::new();
+                                                        inlined_self.add_recursive(
+                                                            detections,
+                                                            pattern.technology,
+                                                            pattern.confidence,
+                                                            version,
+                                                            &context,
+                                                            &mut path,
+                                                            None,
+                                                        );
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let text = String::from_utf8_lossy(body);
+                                    let is_script = script_override.unwrap_or_else(|| {
+                                        let (url, headers): (&str, &[(String, String)]) =
+                                            (response_url, response_headers);
+                                        {
+                                            headers.iter().any(|(name, value)| {
+                                                name.eq_ignore_ascii_case("content-type") && {
+                                                    let value = value.to_ascii_lowercase();
+                                                    value.contains("javascript")
+                                                        || value.contains("ecmascript")
+                                                }
+                                            }) || Url::parse(url).ok().is_some_and(|url| {
+                                                url.path().to_ascii_lowercase().ends_with(".js")
+                                            })
+                                        }
+                                    });
+                                    if is_script {
+                                        if (200..300).contains(&status) {
+                                            let key = format!("script-content:{url}");
+                                            ({
+                                                let (inlined_self, text, state, mut visit): (
+                                                    &MatcherBank,
+                                                    &str,
+                                                    &mut MatchState<'_>,
+                                                    _,
+                                                ) = (
+                                                    &(inlined_self.scripts),
+                                                    &text,
+                                                    state,
+                                                    |pattern, version| {
+                                                        ({
+                                                            let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                                key: &key,
+                                label: "external script content",
+                                url: &url,
+                            },);
+
+                                                            let mut path = HashSet::new();
+                                                            inlined_self.add_recursive(
+                                                                detections,
+                                                                pattern.technology,
+                                                                pattern.confidence,
+                                                                version,
+                                                                &context,
+                                                                &mut path,
+                                                                None,
+                                                            );
+                                                        });
+                                                    },
+                                                );
+                                                'inlined_visit_matches: {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_visit_matches;
+                                                    }
+                                                    for pattern in &inlined_self.always {
+                                                        visit(pattern, None);
+                                                    }
+                                                    for batch in &inlined_self.batches {
+                                                        if state.cancel.is_cancelled() {
+                                                            break 'inlined_visit_matches;
+                                                        }
+                                                        for index in
+                                                            batch.set.matches(text).into_iter()
+                                                        {
+                                                            let pattern = &batch.patterns[index];
+                                                            visit(pattern, {
+                                                                let (pattern, text): (
+                                                                    &CompiledPattern,
+                                                                    &str,
+                                                                ) = (pattern, text);
+                                                                let inlined_result: Option<String> = {
+                                                                    'inlined_pattern_version: {
+                                                                        let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                                        let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+                                                                        let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                                        {
+                                                                            let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                                            let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+                                                                            inlined_result
+                                                                        }
+                                                                    }
+                                                                };
+                                                                inlined_result
+                                                            });
+                                                        }
+                                                    }
+                                                    for pattern in &inlined_self.individual {
+                                                        if state.cancel.is_cancelled() {
+                                                            break 'inlined_visit_matches;
+                                                        }
+                                                        if let Some(version) = {
+                                                            let (pattern, text, state): (
+                                                                &CompiledPattern,
+                                                                &str,
+                                                                &mut MatchState<'_>,
+                                                            ) = (pattern, text, state);
+                                                            let inlined_result: Option<
+                                                                Option<String>,
+                                                            > = {
+                                                                'inlined_match_single_pattern: {
+                                                                    if state.cancel.is_cancelled() {
+                                                                        break 'inlined_match_single_pattern None;
+                                                                    }
+                                                                    match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                                }
+                                                            };
+                                                            inlined_result
+                                                        } {
+                                                            visit(pattern, version);
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        let key = format!("script-url:{url}");
+                                        ({
+                                            let (inlined_self, text, state, mut visit): (
+                                                &MatcherBank,
+                                                &str,
+                                                &mut MatchState<'_>,
+                                                _,
+                                            ) = (
+                                                &(inlined_self.script_sources),
+                                                &url,
+                                                state,
+                                                |pattern, version| {
+                                                    ({
+                                                        let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                            key: &key,
+                            label: "script URL",
+                            url: &url,
+                        },);
+
+                                                        let mut path = HashSet::new();
+                                                        inlined_self.add_recursive(
+                                                            detections,
+                                                            pattern.technology,
+                                                            pattern.confidence,
+                                                            version,
+                                                            &context,
+                                                            &mut path,
+                                                            None,
+                                                        );
+                                                    });
+                                                },
+                                            );
+                                            'inlined_visit_matches: {
+                                                if state.cancel.is_cancelled() {
+                                                    break 'inlined_visit_matches;
+                                                }
+                                                for pattern in &inlined_self.always {
+                                                    visit(pattern, None);
+                                                }
+                                                for batch in &inlined_self.batches {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_visit_matches;
+                                                    }
+                                                    for index in batch.set.matches(text).into_iter()
+                                                    {
+                                                        let pattern = &batch.patterns[index];
+                                                        visit(pattern, {
+                                                            let (pattern, text): (
+                                                                &CompiledPattern,
+                                                                &str,
+                                                            ) = (pattern, text);
+                                                            let inlined_result: Option<String> = {
+                                                                'inlined_pattern_version: {
+                                                                    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                                    let PatternMatcher::Standard(
+                                                                        regex,
+                                                                    ) = &pattern.matcher
+                                                                    else {
+                                                                        break 'inlined_pattern_version None;
+                                                                    };
+                                                                    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                                    {
+                                                                        let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                                        let inlined_result: Option<
+                                                                            String,
+                                                                        > = {
+                                                                            let mut result =
+                                                                                template.to_owned();
+                                                                            for index in
+                                                                                1..capture_count
+                                                                            {
+                                                                                let marker = format!(
+                                                                                    "\\{index}"
+                                                                                );
+                                                                                let value =
+                                                                                    capture(index);
+                                                                                let conditional = format!(
+                                                                                    "{marker}?"
+                                                                                );
+                                                                                while let Some(
+                                                                                    start,
+                                                                                ) = result
+                                                                                    .find(
+                                                                                    &conditional,
+                                                                                ) {
+                                                                                    let branch_start = start + conditional.len();
+                                                                                    let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+                                                                                    let branch = &result[branch_start..end];
+                                                                                    let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+                                                                                    let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+                                                                                    result.replace_range(start..end, &replacement);
+                                                                                }
+                                                                                result = result
+                                                                                    .replace(
+                                                                                        &marker,
+                                                                                        value,
+                                                                                    );
+                                                                            }
+                                                                            let result = result
+                                                                                .trim()
+                                                                                .trim_start_matches(
+                                                                                    ['v', 'V'],
+                                                                                )
+                                                                                .to_owned();
+                                                                            (!result.is_empty())
+                                                                                .then_some(result)
+                                                                        };
+                                                                        inlined_result
+                                                                    }
+                                                                }
+                                                            };
+                                                            inlined_result
+                                                        });
+                                                    }
+                                                }
+                                                for pattern in &inlined_self.individual {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_visit_matches;
+                                                    }
+                                                    if let Some(version) = {
+                                                        let (pattern, text, state): (
+                                                            &CompiledPattern,
+                                                            &str,
+                                                            &mut MatchState<'_>,
+                                                        ) = (pattern, text, state);
+                                                        let inlined_result: Option<Option<String>> = {
+                                                            'inlined_match_single_pattern: {
+                                                                if state.cancel.is_cancelled() {
+                                                                    break 'inlined_match_single_pattern None;
+                                                                }
+                                                                match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                            }
+                                                        };
+                                                        inlined_result
+                                                    } {
+                                                        visit(pattern, version);
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        break 'inlined_scan_response;
+                                    }
+                                    let html_key = format!("html:{url}");
+                                    ({
+                                        let (inlined_self, text, state, mut visit): (
+                                            &MatcherBank,
+                                            &str,
+                                            &mut MatchState<'_>,
+                                            _,
+                                        ) = (
+                                            &(inlined_self.html),
+                                            &text,
+                                            state,
+                                            |pattern, version| {
+                                                ({
+                                                    let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                    key: &html_key,
+                    label: "HTML signature",
+                    url: &url,
+                },);
+
+                                                    let mut path = HashSet::new();
+                                                    inlined_self.add_recursive(
+                                                        detections,
+                                                        pattern.technology,
+                                                        pattern.confidence,
+                                                        version,
+                                                        &context,
+                                                        &mut path,
+                                                        None,
+                                                    );
+                                                });
+                                            },
+                                        );
+                                        'inlined_visit_matches: {
+                                            if state.cancel.is_cancelled() {
+                                                break 'inlined_visit_matches;
+                                            }
+                                            for pattern in &inlined_self.always {
+                                                visit(pattern, None);
+                                            }
+                                            for batch in &inlined_self.batches {
+                                                if state.cancel.is_cancelled() {
+                                                    break 'inlined_visit_matches;
+                                                }
+                                                for index in batch.set.matches(text).into_iter() {
+                                                    let pattern = &batch.patterns[index];
+                                                    visit(pattern, {
+                                                        let (pattern, text): (
+                                                            &CompiledPattern,
+                                                            &str,
+                                                        ) = (pattern, text);
+                                                        let inlined_result: Option<String> = {
+                                                            'inlined_pattern_version: {
+                                                                let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                                let PatternMatcher::Standard(regex) =
+                                                                    &pattern.matcher
+                                                                else {
+                                                                    break 'inlined_pattern_version None;
+                                                                };
+                                                                let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                                {
+                                                                    let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                                    let inlined_result: Option<
+                                                                        String,
+                                                                    > = {
+                                                                        let mut result =
+                                                                            template.to_owned();
+                                                                        for index in
+                                                                            1..capture_count
+                                                                        {
+                                                                            let marker = format!(
+                                                                                "\\{index}"
+                                                                            );
+                                                                            let value =
+                                                                                capture(index);
+                                                                            let conditional = format!(
+                                                                                "{marker}?"
+                                                                            );
+                                                                            while let Some(start) =
+                                                                                result.find(
+                                                                                    &conditional,
+                                                                                )
+                                                                            {
+                                                                                let branch_start = start + conditional.len();
+                                                                                let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+                                                                                let branch = &result[branch_start..end];
+                                                                                let (
+                                                                                    when_present,
+                                                                                    when_missing,
+                                                                                ) = branch
+                                                                                    .split_once(':')
+                                                                                    .unwrap_or((
+                                                                                        branch, "",
+                                                                                    ));
+                                                                                let replacement =
+                                                                                    if value
+                                                                                        .is_empty()
+                                                                                    {
+                                                                                        when_missing
+                                                                                    } else {
+                                                                                        when_present
+                                                                                    }
+                                                                                    .to_owned();
+                                                                                result
+                                                                                    .replace_range(
+                                                                                    start..end,
+                                                                                    &replacement,
+                                                                                );
+                                                                            }
+                                                                            result = result
+                                                                                .replace(
+                                                                                    &marker, value,
+                                                                                );
+                                                                        }
+                                                                        let result = result
+                                                                            .trim()
+                                                                            .trim_start_matches([
+                                                                                'v', 'V',
+                                                                            ])
+                                                                            .to_owned();
+                                                                        (!result.is_empty())
+                                                                            .then_some(result)
+                                                                    };
+                                                                    inlined_result
+                                                                }
+                                                            }
+                                                        };
+                                                        inlined_result
+                                                    });
+                                                }
+                                            }
+                                            for pattern in &inlined_self.individual {
+                                                if state.cancel.is_cancelled() {
+                                                    break 'inlined_visit_matches;
+                                                }
+                                                if let Some(version) = {
+                                                    let (pattern, text, state): (
+                                                        &CompiledPattern,
+                                                        &str,
+                                                        &mut MatchState<'_>,
+                                                    ) = (pattern, text, state);
+                                                    let inlined_result: Option<Option<String>> = {
+                                                        'inlined_match_single_pattern: {
+                                                            if state.cancel.is_cancelled() {
+                                                                break 'inlined_match_single_pattern None;
+                                                            }
+                                                            match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                        }
+                                                    };
+                                                    inlined_result
+                                                } {
+                                                    visit(pattern, version);
+                                                }
+                                            }
+                                        }
+                                    });
+                                    let signals = {
+                                        let (text,): (&str,) = (&text,);
+                                        let inlined_result: HtmlSignals = {
+                                            let input = BufferQueue::default();
+                                            input.push_back(StrTendril::from(text));
+                                            let tokenizer = Tokenizer::new(
+                                                HtmlSink::default(),
+                                                Default::default(),
+                                            );
+                                            let _ = tokenizer.feed(&input);
+                                            tokenizer.end();
+                                            tokenizer.sink.0.into_inner().signals
+                                        };
+                                        inlined_result
+                                    };
+                                    for (name, content) in signals.meta {
+                                        if let Some(patterns) = inlined_self.meta.get(&name) {
+                                            for pattern in patterns {
+                                                if let Some(version) = {
+                                                    let (pattern, text, state): (
+                                                        &CompiledPattern,
+                                                        &str,
+                                                        &mut MatchState<'_>,
+                                                    ) = (pattern, &content, state);
+                                                    let inlined_result: Option<Option<String>> = {
+                                                        'inlined_match_single_pattern: {
+                                                            if state.cancel.is_cancelled() {
+                                                                break 'inlined_match_single_pattern None;
+                                                            }
+                                                            match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                        }
+                                                    };
+                                                    inlined_result
+                                                } {
+                                                    let key = format!("meta:{name}:{url}");
+                                                    let label = format!("meta {name}");
+                                                    ({
+                                                        let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                                key: &key,
+                                label: &label,
+                                url: &url,
+                            },);
+
+                                                        let mut path = HashSet::new();
+                                                        inlined_self.add_recursive(
+                                                            detections,
+                                                            pattern.technology,
+                                                            pattern.confidence,
+                                                            version,
+                                                            &context,
+                                                            &mut path,
+                                                            None,
+                                                        );
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    for source in signals.script_sources {
+                                        let source = {
+                                            let (document_url, source): (&str, &str) =
+                                                (response_url, &source);
+                                            let inlined_result: String = {
+                                                Url::parse(document_url)
+        .ok()
+        .and_then(|base| base.join(source).ok())
+        .map(|url| {
+let (source,): (& str,) = (url.as_str(),);
+let inlined_result: String = {
+'inlined_sanitize_url: {
+
+    let Ok(mut url) = Url::parse(source) else {
+        break 'inlined_sanitize_url source.chars().take(512).collect();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+
+}
+};
+inlined_result
+})
+        .unwrap_or_else(|| {
+let (source,): (& str,) = (source,);
+let inlined_result: String = {
+'inlined_sanitize_url: {
+
+    let Ok(mut url) = Url::parse(source) else {
+        break 'inlined_sanitize_url source.chars().take(512).collect();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+
+}
+};
+inlined_result
+})
+                                            };
+                                            inlined_result
+                                        };
+                                        let key = format!("script-url:{source}");
+                                        ({
+                                            let (inlined_self, text, state, mut visit): (
+                                                &MatcherBank,
+                                                &str,
+                                                &mut MatchState<'_>,
+                                                _,
+                                            ) = (
+                                                &(inlined_self.script_sources),
+                                                &source,
+                                                state,
+                                                |pattern, version| {
+                                                    ({
+                                                        let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                            key: &key,
+                            label: "script URL",
+                            url: &source,
+                        },);
+
+                                                        let mut path = HashSet::new();
+                                                        inlined_self.add_recursive(
+                                                            detections,
+                                                            pattern.technology,
+                                                            pattern.confidence,
+                                                            version,
+                                                            &context,
+                                                            &mut path,
+                                                            None,
+                                                        );
+                                                    });
+                                                },
+                                            );
+                                            'inlined_visit_matches: {
+                                                if state.cancel.is_cancelled() {
+                                                    break 'inlined_visit_matches;
+                                                }
+                                                for pattern in &inlined_self.always {
+                                                    visit(pattern, None);
+                                                }
+                                                for batch in &inlined_self.batches {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_visit_matches;
+                                                    }
+                                                    for index in batch.set.matches(text).into_iter()
+                                                    {
+                                                        let pattern = &batch.patterns[index];
+                                                        visit(pattern, {
+                                                            let (pattern, text): (
+                                                                &CompiledPattern,
+                                                                &str,
+                                                            ) = (pattern, text);
+                                                            let inlined_result: Option<String> = {
+                                                                'inlined_pattern_version: {
+                                                                    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                                    let PatternMatcher::Standard(
+                                                                        regex,
+                                                                    ) = &pattern.matcher
+                                                                    else {
+                                                                        break 'inlined_pattern_version None;
+                                                                    };
+                                                                    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                                    {
+                                                                        let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                                        let inlined_result: Option<
+                                                                            String,
+                                                                        > = {
+                                                                            let mut result =
+                                                                                template.to_owned();
+                                                                            for index in
+                                                                                1..capture_count
+                                                                            {
+                                                                                let marker = format!(
+                                                                                    "\\{index}"
+                                                                                );
+                                                                                let value =
+                                                                                    capture(index);
+                                                                                let conditional = format!(
+                                                                                    "{marker}?"
+                                                                                );
+                                                                                while let Some(
+                                                                                    start,
+                                                                                ) = result
+                                                                                    .find(
+                                                                                    &conditional,
+                                                                                ) {
+                                                                                    let branch_start = start + conditional.len();
+                                                                                    let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+                                                                                    let branch = &result[branch_start..end];
+                                                                                    let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+                                                                                    let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+                                                                                    result.replace_range(start..end, &replacement);
+                                                                                }
+                                                                                result = result
+                                                                                    .replace(
+                                                                                        &marker,
+                                                                                        value,
+                                                                                    );
+                                                                            }
+                                                                            let result = result
+                                                                                .trim()
+                                                                                .trim_start_matches(
+                                                                                    ['v', 'V'],
+                                                                                )
+                                                                                .to_owned();
+                                                                            (!result.is_empty())
+                                                                                .then_some(result)
+                                                                        };
+                                                                        inlined_result
+                                                                    }
+                                                                }
+                                                            };
+                                                            inlined_result
+                                                        });
+                                                    }
+                                                }
+                                                for pattern in &inlined_self.individual {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_visit_matches;
+                                                    }
+                                                    if let Some(version) = {
+                                                        let (pattern, text, state): (
+                                                            &CompiledPattern,
+                                                            &str,
+                                                            &mut MatchState<'_>,
+                                                        ) = (pattern, text, state);
+                                                        let inlined_result: Option<Option<String>> = {
+                                                            'inlined_match_single_pattern: {
+                                                                if state.cancel.is_cancelled() {
+                                                                    break 'inlined_match_single_pattern None;
+                                                                }
+                                                                match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                            }
+                                                        };
+                                                        inlined_result
+                                                    } {
+                                                        visit(pattern, version);
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                    for (index, script) in
+                                        signals.inline_scripts.into_iter().enumerate()
+                                    {
+                                        let key = format!("inline-script:{url}:{index}");
+                                        ({
+                                            let (inlined_self, text, state, mut visit): (
+                                                &MatcherBank,
+                                                &str,
+                                                &mut MatchState<'_>,
+                                                _,
+                                            ) = (
+                                                &(inlined_self.scripts),
+                                                &script,
+                                                state,
+                                                |pattern, version| {
+                                                    ({
+                                                        let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                            key: &key,
+                            label: "inline script content",
+                            url: &url,
+                        },);
+
+                                                        let mut path = HashSet::new();
+                                                        inlined_self.add_recursive(
+                                                            detections,
+                                                            pattern.technology,
+                                                            pattern.confidence,
+                                                            version,
+                                                            &context,
+                                                            &mut path,
+                                                            None,
+                                                        );
+                                                    });
+                                                },
+                                            );
+                                            'inlined_visit_matches: {
+                                                if state.cancel.is_cancelled() {
+                                                    break 'inlined_visit_matches;
+                                                }
+                                                for pattern in &inlined_self.always {
+                                                    visit(pattern, None);
+                                                }
+                                                for batch in &inlined_self.batches {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_visit_matches;
+                                                    }
+                                                    for index in batch.set.matches(text).into_iter()
+                                                    {
+                                                        let pattern = &batch.patterns[index];
+                                                        visit(pattern, {
+                                                            let (pattern, text): (
+                                                                &CompiledPattern,
+                                                                &str,
+                                                            ) = (pattern, text);
+                                                            let inlined_result: Option<String> = {
+                                                                'inlined_pattern_version: {
+                                                                    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                                    let PatternMatcher::Standard(
+                                                                        regex,
+                                                                    ) = &pattern.matcher
+                                                                    else {
+                                                                        break 'inlined_pattern_version None;
+                                                                    };
+                                                                    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                                    {
+                                                                        let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                                        let inlined_result: Option<
+                                                                            String,
+                                                                        > = {
+                                                                            let mut result =
+                                                                                template.to_owned();
+                                                                            for index in
+                                                                                1..capture_count
+                                                                            {
+                                                                                let marker = format!(
+                                                                                    "\\{index}"
+                                                                                );
+                                                                                let value =
+                                                                                    capture(index);
+                                                                                let conditional = format!(
+                                                                                    "{marker}?"
+                                                                                );
+                                                                                while let Some(
+                                                                                    start,
+                                                                                ) = result
+                                                                                    .find(
+                                                                                    &conditional,
+                                                                                ) {
+                                                                                    let branch_start = start + conditional.len();
+                                                                                    let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+                                                                                    let branch = &result[branch_start..end];
+                                                                                    let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+                                                                                    let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+                                                                                    result.replace_range(start..end, &replacement);
+                                                                                }
+                                                                                result = result
+                                                                                    .replace(
+                                                                                        &marker,
+                                                                                        value,
+                                                                                    );
+                                                                            }
+                                                                            let result = result
+                                                                                .trim()
+                                                                                .trim_start_matches(
+                                                                                    ['v', 'V'],
+                                                                                )
+                                                                                .to_owned();
+                                                                            (!result.is_empty())
+                                                                                .then_some(result)
+                                                                        };
+                                                                        inlined_result
+                                                                    }
+                                                                }
+                                                            };
+                                                            inlined_result
+                                                        });
+                                                    }
+                                                }
+                                                for pattern in &inlined_self.individual {
+                                                    if state.cancel.is_cancelled() {
+                                                        break 'inlined_visit_matches;
+                                                    }
+                                                    if let Some(version) = {
+                                                        let (pattern, text, state): (
+                                                            &CompiledPattern,
+                                                            &str,
+                                                            &mut MatchState<'_>,
+                                                        ) = (pattern, text, state);
+                                                        let inlined_result: Option<Option<String>> = {
+                                                            'inlined_match_single_pattern: {
+                                                                if state.cancel.is_cancelled() {
+                                                                    break 'inlined_match_single_pattern None;
+                                                                }
+                                                                match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                            }
+                                                        };
+                                                        inlined_result
+                                                    } {
+                                                        visit(pattern, version);
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                            });
+                            if source != response_url {
+                                let key = format!("script-url:{source}");
+                                ({
+                                    let (inlined_self, text, state, mut visit): (
+                                        &MatcherBank,
+                                        &str,
+                                        &mut MatchState<'_>,
+                                        _,
+                                    ) = (
+                                        &(inlined_self.script_sources),
+                                        &source,
+                                        state,
+                                        |pattern, version| {
+                                            ({
+                                                let (inlined_self, detections, pattern, version, context,): (& Catalog, & mut HashMap < String , AccumulatedDetection >, & CompiledPattern, Option < String >, MatchContext < '_ >,) = (&(inlined_self), detections, pattern, version, MatchContext {
+                            key: &key,
+                            label: "script URL",
+                            url: &source,
+                        },);
+
+                                                let mut path = HashSet::new();
+                                                inlined_self.add_recursive(
+                                                    detections,
+                                                    pattern.technology,
+                                                    pattern.confidence,
+                                                    version,
+                                                    &context,
+                                                    &mut path,
+                                                    None,
+                                                );
+                                            });
+                                        },
+                                    );
+                                    'inlined_visit_matches: {
+                                        if state.cancel.is_cancelled() {
+                                            break 'inlined_visit_matches;
+                                        }
+                                        for pattern in &inlined_self.always {
+                                            visit(pattern, None);
+                                        }
+                                        for batch in &inlined_self.batches {
+                                            if state.cancel.is_cancelled() {
+                                                break 'inlined_visit_matches;
+                                            }
+                                            for index in batch.set.matches(text).into_iter() {
+                                                let pattern = &batch.patterns[index];
+                                                visit(pattern, {
+                                                    let (pattern, text): (&CompiledPattern, &str) =
+                                                        (pattern, text);
+                                                    let inlined_result: Option<String> = {
+                                                        'inlined_pattern_version: {
+                                                            let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                            let PatternMatcher::Standard(regex) =
+                                                                &pattern.matcher
+                                                            else {
+                                                                break 'inlined_pattern_version None;
+                                                            };
+                                                            let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+                                                            {
+                                                                let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+                                                                let inlined_result: Option<String> = {
+                                                                    let mut result =
+                                                                        template.to_owned();
+                                                                    for index in 1..capture_count {
+                                                                        let marker =
+                                                                            format!("\\{index}");
+                                                                        let value = capture(index);
+                                                                        let conditional =
+                                                                            format!("{marker}?");
+                                                                        while let Some(start) =
+                                                                            result
+                                                                                .find(&conditional)
+                                                                        {
+                                                                            let branch_start = start
+                                                                                + conditional.len();
+                                                                            let end = result
+                                                                                [branch_start..]
+                                                                                .find("\\;")
+                                                                                .map(|offset| {
+                                                                                    branch_start
+                                                                                        + offset
+                                                                                })
+                                                                                .unwrap_or(
+                                                                                    result.len(),
+                                                                                );
+                                                                            let branch = &result
+                                                                                [branch_start..end];
+                                                                            let (
+                                                                                when_present,
+                                                                                when_missing,
+                                                                            ) = branch
+                                                                                .split_once(':')
+                                                                                .unwrap_or((
+                                                                                    branch, "",
+                                                                                ));
+                                                                            let replacement =
+                                                                                if value.is_empty()
+                                                                                {
+                                                                                    when_missing
+                                                                                } else {
+                                                                                    when_present
+                                                                                }
+                                                                                .to_owned();
+                                                                            result.replace_range(
+                                                                                start..end,
+                                                                                &replacement,
+                                                                            );
+                                                                        }
+                                                                        result = result.replace(
+                                                                            &marker, value,
+                                                                        );
+                                                                    }
+                                                                    let result = result
+                                                                        .trim()
+                                                                        .trim_start_matches([
+                                                                            'v', 'V',
+                                                                        ])
+                                                                        .to_owned();
+                                                                    (!result.is_empty())
+                                                                        .then_some(result)
+                                                                };
+                                                                inlined_result
+                                                            }
+                                                        }
+                                                    };
+                                                    inlined_result
+                                                });
+                                            }
+                                        }
+                                        for pattern in &inlined_self.individual {
+                                            if state.cancel.is_cancelled() {
+                                                break 'inlined_visit_matches;
+                                            }
+                                            if let Some(version) = {
+                                                let (pattern, text, state): (
+                                                    &CompiledPattern,
+                                                    &str,
+                                                    &mut MatchState<'_>,
+                                                ) = (pattern, text, state);
+                                                let inlined_result: Option<Option<String>> = {
+                                                    'inlined_match_single_pattern: {
+                                                        if state.cancel.is_cancelled() {
+                                                            break 'inlined_match_single_pattern None;
+                                                        }
+                                                        match &pattern.matcher {
+        PatternMatcher::Presence => Some(None),
+        PatternMatcher::Standard(regex) => {
+            regex.is_match(text).then(|| {
+let (pattern, text,): (& CompiledPattern, & str,) = (pattern, text,);
+let inlined_result: Option < String > = {
+'inlined_pattern_version: {
+
+    let template = match pattern.version.as_deref() { Some(value) => value, None => break 'inlined_pattern_version None };
+    let PatternMatcher::Standard(regex) = &pattern.matcher else {
+        break 'inlined_pattern_version None;
+    };
+    let captures = match regex.captures(text) { Some(value) => value, None => break 'inlined_pattern_version None };
+    {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+        captures.get(index).map_or("", |capture| capture.as_str())
+    },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+
+}
+};
+inlined_result
+})
+        }
+        PatternMatcher::Compatibility(regex) => {
+            if state.disabled.contains(&pattern.id) {
+                break 'inlined_match_single_pattern None;
+            }
+            let matched = if let Some(template) = &pattern.version {
+                regex.captures(text).map(|captures| {
+                    captures.map(|captures| {
+                        {
+let (template, capture_count, capture,): (& str, usize, _,) = (template, captures.len(), |index| {
+                            captures.get(index).map_or("", |capture| capture.as_str())
+                        },);
+let inlined_result: Option < String > = {
+
+    let mut result = template.to_owned();
+    for index in 1..capture_count {
+        let marker = format!("\\{index}");
+        let value = capture(index);
+        let conditional = format!("{marker}?");
+        while let Some(start) = result.find(&conditional) {
+            let branch_start = start + conditional.len();
+            let end = result[branch_start..]
+                .find("\\;")
+                .map(|offset| branch_start + offset)
+                .unwrap_or(result.len());
+            let branch = &result[branch_start..end];
+            let (when_present, when_missing) = branch.split_once(':').unwrap_or((branch, ""));
+            let replacement = if value.is_empty() {
+                when_missing
+            } else {
+                when_present
+            }
+            .to_owned();
+            result.replace_range(start..end, &replacement);
+        }
+        result = result.replace(&marker, value);
+    }
+    let result = result.trim().trim_start_matches(['v', 'V']).to_owned();
+    (!result.is_empty()).then_some(result)
+
+};
+inlined_result
+}
+                    })
+                })
+            } else {
+                regex.is_match(text).map(|matched| matched.then_some(None))
+            };
+            match matched {
+                Ok(version) => version,
+                Err(error) => {
+                    if state.disabled.insert(pattern.id) {
+                        state.warnings.push(format!(
+                            "Web technology pattern {} disabled for the remainder of this scan: {error}",
+                            pattern.location
+                        ));
+                    }
+                    None
+                }
+            }
+        }
+    }
+                                                    }
+                                                };
+                                                inlined_result
+                                            } {
+                                                visit(pattern, version);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                    }
                 }
                 completed += 1;
-                send_fingerprint_progress(
-                    progress,
-                    completed,
-                    work_total,
-                    format!("Script: {}", sanitize_url(&script.source_url)),
-                );
+                ({
+                    let (progress, completed, total, text): (
+                        &Option<Sender<ExposureScanProgress>>,
+                        usize,
+                        usize,
+                        String,
+                    ) = (
+                        progress,
+                        completed,
+                        work_total,
+                        format!(
+                            "Script: {}",
+                            ({
+                                let (source,): (&str,) = (&script.source_url,);
+                                let inlined_result: String = {
+                                    'inlined_sanitize_url: {
+                                        let Ok(mut url) = Url::parse(source) else {
+                                            break 'inlined_sanitize_url source
+                                                .chars()
+                                                .take(512)
+                                                .collect();
+                                        };
+                                        let _ = url.set_username("");
+                                        let _ = url.set_password(None);
+                                        url.set_query(None);
+                                        url.set_fragment(None);
+                                        url.to_string()
+                                    }
+                                };
+                                inlined_result
+                            })
+                        ),
+                    );
+
+                    send_phase_progress(
+                        progress,
+                        ExposureScanPhase::Fingerprinting,
+                        ExposureScanPhaseState::Running,
+                        completed as f32 / total.max(1) as f32,
+                        text,
+                    );
+                });
             }
         }
     }
@@ -880,22 +7656,123 @@ pub(super) fn detect(
             }
             let mut detections = detections
                 .into_values()
-                .map(finalize_detection)
+                .map(|detection: AccumulatedDetection| {
+                    let confidence = detection.confidence_floor.max(match detection.score {
+                        100 => Confidence::High,
+                        50..=99 => Confidence::Medium,
+                        1..=49 => Confidence::Low,
+                        _ => Confidence::None,
+                    });
+                    WebTechnologyDetection {
+                        name: detection.name,
+                        category_names: detection.categories.into_iter().collect(),
+                        version: detection.version,
+                        confidence,
+                        evidence_urls: detection.evidence_urls.into_iter().collect(),
+                        evidence: detection.evidence.into_iter().collect(),
+                    }
+                })
                 .collect::<Vec<_>>();
             detections.sort_by(|left, right| {
                 left.name
                     .to_ascii_lowercase()
                     .cmp(&right.name.to_ascii_lowercase())
             });
-            promote_detections(&mut endpoint.products, &detections);
+            ({
+                let (products, detections): (
+                    &mut Vec<ProductDetection>,
+                    &[WebTechnologyDetection],
+                ) = (&mut endpoint.products, &detections);
+
+                for detection in detections {
+                    for layer in detection.category_names.iter().filter_map(|name| {
+                        let (name,): (&str,) = (name,);
+                        {
+                            'inlined_category_layer: {
+                                Some(match name.to_ascii_lowercase().as_str() {
+                                    "cms" => ProductLayer::Cms,
+                                    "ecommerce" | "ecommerce frontends" => ProductLayer::Ecommerce,
+                                    "javascript frameworks"
+                                    | "web frameworks"
+                                    | "mobile frameworks"
+                                    | "ui frameworks" => ProductLayer::Framework,
+                                    "programming languages" => ProductLayer::Runtime,
+                                    "web servers" | "web server extensions" => ProductLayer::Server,
+                                    "cdn" => ProductLayer::Cdn,
+                                    "caching" | "reverse proxies" | "load balancers" => {
+                                        ProductLayer::Proxy
+                                    }
+                                    "paas" | "iaas" | "hosting" => ProductLayer::Cloud,
+                                    _ => break 'inlined_category_layer None,
+                                })
+                            }
+                        }
+                    }) {
+                        let evidence = detection.evidence.clone();
+                        let name = if matches!(layer, ProductLayer::Server | ProductLayer::Proxy) {
+                            match crate::web_server::canonical_product_name(&detection.name) {
+                                Some(name) => name,
+                                None => detection.name.as_str(),
+                            }
+                        } else {
+                            detection.name.as_str()
+                        };
+                        if let Some(existing) = products.iter_mut().find(|product| {
+                            product.layer == layer && product.name.eq_ignore_ascii_case(name)
+                        }) {
+                            let previous_confidence = existing.confidence;
+                            if detection.version.is_some()
+                                && (existing.version.is_none()
+                                    || detection.confidence >= previous_confidence)
+                            {
+                                existing.version = detection.version.clone();
+                            }
+                            existing.confidence = existing.confidence.max(detection.confidence);
+                            existing.evidence.extend(evidence);
+                            existing.evidence.sort();
+                            existing.evidence.dedup();
+                        } else {
+                            products.push(ProductDetection {
+                                name: name.to_owned(),
+                                layer,
+                                version: detection.version.clone(),
+                                confidence: detection.confidence,
+                                evidence,
+                            });
+                        }
+                    }
+                }
+                products.sort_by(|left, right| {
+                    left.layer.to_string().cmp(&right.layer.to_string()).then(
+                        left.name
+                            .to_ascii_lowercase()
+                            .cmp(&right.name.to_ascii_lowercase()),
+                    )
+                });
+            });
             endpoint.web_technologies = detections;
             completed += 1;
-            send_fingerprint_progress(
-                progress,
-                completed,
-                work_total,
-                format!("Finalized {}:{}", endpoint.ip, endpoint.port),
-            );
+            ({
+                let (progress, completed, total, text): (
+                    &Option<Sender<ExposureScanProgress>>,
+                    usize,
+                    usize,
+                    String,
+                ) = (
+                    progress,
+                    completed,
+                    work_total,
+                    format!("Finalized {}:{}", endpoint.ip, endpoint.port),
+                );
+
+                send_phase_progress(
+                    progress,
+                    ExposureScanPhase::Fingerprinting,
+                    ExposureScanPhaseState::Running,
+                    completed as f32 / total.max(1) as f32,
+                    text,
+                );
+            });
         }
     }
     if !cancel.is_cancelled() {
@@ -907,262 +7784,15 @@ pub(super) fn detect(
             format!("Processed {work_total} fingerprint inputs"),
         );
     }
+    for state in match_states {
+        warnings.extend(state.warnings);
+    }
     warnings.sort();
     warnings.dedup();
     warnings
 }
 
-fn send_fingerprint_progress(
-    progress: &Option<Sender<ExposureScanProgress>>,
-    completed: usize,
-    total: usize,
-    text: String,
-) {
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::Fingerprinting,
-        ExposureScanPhaseState::Running,
-        completed as f32 / total.max(1) as f32,
-        text,
-    );
-}
-
-fn seed_curated_detections(endpoint: &EndpointScan) -> HashMap<String, AccumulatedDetection> {
-    let mut detections = HashMap::<String, AccumulatedDetection>::new();
-    for product in &endpoint.products {
-        let key = product.name.to_ascii_lowercase();
-        let detection = detections.entry(key).or_default();
-        detection.name = product.name.clone();
-        detection.categories.insert(product.layer.to_string());
-        detection.confidence_floor = detection.confidence_floor.max(product.confidence);
-        if product.version.is_some()
-            && (detection.version.is_none()
-                || confidence_score(product.confidence) >= detection.version_confidence)
-        {
-            detection.version = product.version.clone();
-            detection.version_confidence = confidence_score(product.confidence);
-        }
-        detection.evidence.extend(product.evidence.iter().cloned());
-    }
-    detections
-}
-
 impl Catalog {
-    fn scan_response(
-        &self,
-        detections: &mut HashMap<String, AccumulatedDetection>,
-        response_url: &str,
-        status: u16,
-        response_headers: &[(String, String)],
-        body: &[u8],
-        script_override: Option<bool>,
-    ) {
-        let url = sanitize_url(response_url);
-        let mut headers = HashMap::<String, Vec<&str>>::new();
-        for (name, value) in response_headers {
-            headers
-                .entry(name.to_ascii_lowercase())
-                .or_default()
-                .push(value);
-        }
-        for (name, values) in &headers {
-            let combined = values.join(", ");
-            if let Some(patterns) = self.headers.get(name) {
-                for pattern in patterns {
-                    if let Some(version) = match_single_pattern(pattern, &combined) {
-                        let key = format!("header:{name}:{url}");
-                        let label = format!("header {name}");
-                        self.add_match(
-                            detections,
-                            pattern,
-                            version,
-                            MatchContext {
-                                key: &key,
-                                label: &label,
-                                url: &url,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        for value in headers.get("set-cookie").into_iter().flatten() {
-            if let Some((name, cookie_value)) = cookie_name_value(value)
-                && let Some(patterns) = self.cookies.get(&name)
-            {
-                for pattern in patterns {
-                    if let Some(version) = match_single_pattern(pattern, cookie_value) {
-                        let key = format!("cookie:{name}:{url}");
-                        let label = format!("cookie {name}");
-                        self.add_match(
-                            detections,
-                            pattern,
-                            version,
-                            MatchContext {
-                                key: &key,
-                                label: &label,
-                                url: &url,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        let text = String::from_utf8_lossy(body);
-        let is_script =
-            script_override.unwrap_or_else(|| response_is_script(response_url, response_headers));
-        if is_script {
-            if (200..300).contains(&status) {
-                let key = format!("script-content:{url}");
-                self.scripts.visit_matches(&text, |pattern, version| {
-                    self.add_match(
-                        detections,
-                        pattern,
-                        version,
-                        MatchContext {
-                            key: &key,
-                            label: "external script content",
-                            url: &url,
-                        },
-                    );
-                });
-            }
-            let key = format!("script-url:{url}");
-            self.script_sources.visit_matches(&url, |pattern, version| {
-                self.add_match(
-                    detections,
-                    pattern,
-                    version,
-                    MatchContext {
-                        key: &key,
-                        label: "script URL",
-                        url: &url,
-                    },
-                );
-            });
-            return;
-        }
-        let html_key = format!("html:{url}");
-        self.html.visit_matches(&text, |pattern, version| {
-            self.add_match(
-                detections,
-                pattern,
-                version,
-                MatchContext {
-                    key: &html_key,
-                    label: "HTML signature",
-                    url: &url,
-                },
-            );
-        });
-        let signals = parse_html(&text);
-        for (name, content) in signals.meta {
-            if let Some(patterns) = self.meta.get(&name) {
-                for pattern in patterns {
-                    if let Some(version) = match_single_pattern(pattern, &content) {
-                        let key = format!("meta:{name}:{url}");
-                        let label = format!("meta {name}");
-                        self.add_match(
-                            detections,
-                            pattern,
-                            version,
-                            MatchContext {
-                                key: &key,
-                                label: &label,
-                                url: &url,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        for source in signals.script_sources {
-            let source = resolve_script_url(response_url, &source);
-            let key = format!("script-url:{source}");
-            self.script_sources
-                .visit_matches(&source, |pattern, version| {
-                    self.add_match(
-                        detections,
-                        pattern,
-                        version,
-                        MatchContext {
-                            key: &key,
-                            label: "script URL",
-                            url: &source,
-                        },
-                    );
-                });
-        }
-        for (index, script) in signals.inline_scripts.into_iter().enumerate() {
-            let key = format!("inline-script:{url}:{index}");
-            self.scripts.visit_matches(&script, |pattern, version| {
-                self.add_match(
-                    detections,
-                    pattern,
-                    version,
-                    MatchContext {
-                        key: &key,
-                        label: "inline script content",
-                        url: &url,
-                    },
-                );
-            });
-        }
-    }
-
-    fn scan_external_script(
-        &self,
-        detections: &mut HashMap<String, AccumulatedDetection>,
-        source_url: &str,
-        response: &HttpObservation,
-    ) {
-        let source = sanitize_url(source_url);
-        let response_url = sanitize_url(&response.url);
-        self.scan_response(
-            detections,
-            &response.url,
-            response.status,
-            &response.headers,
-            &response.body,
-            Some(true),
-        );
-        if source != response_url {
-            let key = format!("script-url:{source}");
-            self.script_sources
-                .visit_matches(&source, |pattern, version| {
-                    self.add_match(
-                        detections,
-                        pattern,
-                        version,
-                        MatchContext {
-                            key: &key,
-                            label: "script URL",
-                            url: &source,
-                        },
-                    );
-                });
-        }
-    }
-
-    fn add_match(
-        &self,
-        detections: &mut HashMap<String, AccumulatedDetection>,
-        pattern: &CompiledPattern,
-        version: Option<String>,
-        context: MatchContext<'_>,
-    ) {
-        let mut path = HashSet::new();
-        self.add_recursive(
-            detections,
-            pattern.technology,
-            pattern.confidence,
-            version,
-            &context,
-            &mut path,
-            None,
-        );
-    }
-
     fn add_recursive(
         &self,
         detections: &mut HashMap<String, AccumulatedDetection>,
@@ -1187,8 +7817,13 @@ impl Catalog {
         detection
             .categories
             .extend(technology.categories.iter().cloned());
-        if detection.signal_keys.insert(key) {
-            detection.score = detection.score.saturating_add(confidence).min(100);
+        let signal_score = detection.signal_scores.entry(key).or_default();
+        if confidence > *signal_score {
+            detection.score = detection
+                .score
+                .saturating_add(confidence - *signal_score)
+                .min(100);
+            *signal_score = confidence;
         }
         if let Some(version) = version.filter(|value| !value.is_empty())
             && (detection.version.is_none()
@@ -1224,142 +7859,4 @@ impl Catalog {
         }
         path.remove(&technology_index);
     }
-}
-
-fn parse_html(text: &str) -> HtmlSignals {
-    let input = BufferQueue::default();
-    input.push_back(StrTendril::from(text));
-    let tokenizer = Tokenizer::new(HtmlSink::default(), Default::default());
-    let _ = tokenizer.feed(&input);
-    tokenizer.end();
-    tokenizer.sink.0.into_inner().signals
-}
-
-fn cookie_name_value(value: &str) -> Option<(String, &str)> {
-    let pair = value.split(';').next()?.trim();
-    let (name, value) = pair.split_once('=')?;
-    let name = name.trim().to_ascii_lowercase();
-    (!name.is_empty()).then_some((name, value.trim()))
-}
-
-fn response_is_script(url: &str, headers: &[(String, String)]) -> bool {
-    headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("content-type") && {
-            let value = value.to_ascii_lowercase();
-            value.contains("javascript") || value.contains("ecmascript")
-        }
-    }) || Url::parse(url)
-        .ok()
-        .is_some_and(|url| url.path().to_ascii_lowercase().ends_with(".js"))
-}
-
-fn resolve_script_url(document_url: &str, source: &str) -> String {
-    Url::parse(document_url)
-        .ok()
-        .and_then(|base| base.join(source).ok())
-        .map(|url| sanitize_url(url.as_str()))
-        .unwrap_or_else(|| sanitize_url(source))
-}
-
-fn sanitize_url(source: &str) -> String {
-    let Ok(mut url) = Url::parse(source) else {
-        return source.chars().take(512).collect();
-    };
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.set_query(None);
-    url.set_fragment(None);
-    url.to_string()
-}
-
-fn finalize_detection(detection: AccumulatedDetection) -> WebTechnologyDetection {
-    let confidence = detection.confidence_floor.max(match detection.score {
-        100 => Confidence::High,
-        50..=99 => Confidence::Medium,
-        1..=49 => Confidence::Low,
-        _ => Confidence::None,
-    });
-    WebTechnologyDetection {
-        name: detection.name,
-        category_names: detection.categories.into_iter().collect(),
-        version: detection.version,
-        confidence,
-        evidence_urls: detection.evidence_urls.into_iter().collect(),
-        evidence: detection.evidence.into_iter().collect(),
-    }
-}
-
-fn confidence_score(confidence: Confidence) -> u16 {
-    match confidence {
-        Confidence::None => 0,
-        Confidence::Low => 25,
-        Confidence::Medium => 75,
-        Confidence::High => 100,
-    }
-}
-
-fn promote_detections(products: &mut Vec<ProductDetection>, detections: &[WebTechnologyDetection]) {
-    for detection in detections {
-        for layer in detection
-            .category_names
-            .iter()
-            .filter_map(|name| category_layer(name))
-        {
-            let evidence = detection.evidence.clone();
-            let name = if matches!(layer, ProductLayer::Server | ProductLayer::Proxy) {
-                match crate::web_server::canonical_product_name(&detection.name) {
-                    Some(name) => name,
-                    None => detection.name.as_str(),
-                }
-            } else {
-                detection.name.as_str()
-            };
-            if let Some(existing) = products
-                .iter_mut()
-                .find(|product| product.layer == layer && product.name.eq_ignore_ascii_case(name))
-            {
-                let previous_confidence = existing.confidence;
-                if detection.version.is_some()
-                    && (existing.version.is_none() || detection.confidence >= previous_confidence)
-                {
-                    existing.version = detection.version.clone();
-                }
-                existing.confidence = existing.confidence.max(detection.confidence);
-                existing.evidence.extend(evidence);
-                existing.evidence.sort();
-                existing.evidence.dedup();
-            } else {
-                products.push(ProductDetection {
-                    name: name.to_owned(),
-                    layer,
-                    version: detection.version.clone(),
-                    confidence: detection.confidence,
-                    evidence,
-                });
-            }
-        }
-    }
-    products.sort_by(|left, right| {
-        left.layer.to_string().cmp(&right.layer.to_string()).then(
-            left.name
-                .to_ascii_lowercase()
-                .cmp(&right.name.to_ascii_lowercase()),
-        )
-    });
-}
-
-fn category_layer(name: &str) -> Option<ProductLayer> {
-    Some(match name.to_ascii_lowercase().as_str() {
-        "cms" => ProductLayer::Cms,
-        "ecommerce" | "ecommerce frontends" => ProductLayer::Ecommerce,
-        "javascript frameworks" | "web frameworks" | "mobile frameworks" | "ui frameworks" => {
-            ProductLayer::Framework
-        }
-        "programming languages" => ProductLayer::Runtime,
-        "web servers" | "web server extensions" => ProductLayer::Server,
-        "cdn" => ProductLayer::Cdn,
-        "caching" | "reverse proxies" | "load balancers" => ProductLayer::Proxy,
-        "paas" | "iaas" | "hosting" => ProductLayer::Cloud,
-        _ => return None,
-    })
 }

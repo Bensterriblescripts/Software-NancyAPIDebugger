@@ -4,14 +4,14 @@ use crate::network::{ConnectionRateLimiter, non_public_reason};
 use ::http::{HeaderName, HeaderValue, Method};
 use std::collections::HashSet;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, mpsc};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::dns::{finish_interrupted_dns_attempt, resolve_host, resolve_host_exhaustive};
 use super::fingerprint;
-use super::http::{self, add_automatic_headers, header_map_to_trace, parse_request_headers};
+use super::http::{self, add_automatic_headers, parse_request_headers};
 use super::http3;
 use super::stages::*;
 
@@ -68,55 +68,16 @@ async fn run_diagnostic_session_inner(
     public_only: bool,
     limiter: Option<Arc<ConnectionRateLimiter>>,
 ) -> Vec<DiagnosticTrace> {
-    let progress = progress.unwrap_or_else(|| {
-        let (progress, receiver) = mpsc::channel();
-        drop(receiver);
-        progress
-    });
     let mut traces = Vec::new();
     let mut visited_urls = HashSet::new();
     let mut redirects_followed = 0;
     let mut index = initial_index;
 
     loop {
-        let mut trace = run_diagnostic_inner(
-            index,
-            request,
-            auth_store.clone(),
-            cancel.clone(),
-            progress.clone(),
-            pinned_ip.take(),
-            public_only,
-            limiter.clone(),
-        )
-        .await;
-        let next_request = prepare_redirect(&mut trace, &mut visited_urls, redirects_followed);
-        fingerprint::analyze(&mut trace);
-        let _ = progress.send(DiagnosticProgress::HttpHopCompleted(trace.clone()));
-        traces.push(trace);
-        let Some(next_request) = next_request else {
-            break;
-        };
-        redirects_followed += 1;
-        index += 1;
-        request = next_request;
-    }
+        let mut trace = ({
+let (index, request, auth_store, cancel, progress, pinned_ip, public_only, limiter,): (usize, DiagnosticRequest, SharedAuthStore, CancellationToken, Option < Sender < DiagnosticProgress > >, Option < IpAddr >, bool, Option < Arc < ConnectionRateLimiter > >,) = (index, request, auth_store.clone(), cancel.clone(), progress.clone(), pinned_ip.take(), public_only, limiter.clone(),);
+async move {
 
-    let _ = progress.send(DiagnosticProgress::SessionCompleted);
-
-    traces
-}
-
-async fn run_diagnostic_inner(
-    index: usize,
-    request: DiagnosticRequest,
-    auth_store: SharedAuthStore,
-    cancel: CancellationToken,
-    progress: Sender<DiagnosticProgress>,
-    pinned_ip: Option<IpAddr>,
-    public_only: bool,
-    limiter: Option<Arc<ConnectionRateLimiter>>,
-) -> DiagnosticTrace {
     let mut trace = DiagnosticTrace::new(index, request);
     if let Some(ip) = pinned_ip {
         trace.connection_mode = format!("Pinned exposure endpoint ({ip})");
@@ -132,7 +93,6 @@ async fn run_diagnostic_inner(
                 StageStatus::Failed,
                 url_started,
                 error.to_string(),
-                &progress,
             );
         }
     };
@@ -144,7 +104,6 @@ async fn run_diagnostic_inner(
             StageStatus::Failed,
             url_started,
             format!("Unsupported URL scheme: {}", url.scheme()),
-            &progress,
         );
     }
     if trace.request.protocol == ProtocolPreference::Http3 && url.scheme() != "https" {
@@ -154,7 +113,6 @@ async fn run_diagnostic_inner(
             StageStatus::Failed,
             url_started,
             "HTTP/3 requires an HTTPS URL".to_owned(),
-            &progress,
         );
     }
     let host = match url.host_str() {
@@ -166,7 +124,6 @@ async fn run_diagnostic_inner(
                 StageStatus::Failed,
                 url_started,
                 "URL has no host".to_owned(),
-                &progress,
             );
         }
     };
@@ -209,7 +166,6 @@ async fn run_diagnostic_inner(
                     StageStatus::Failed,
                     authentication_started,
                     error,
-                    &progress,
                 );
             }
         }
@@ -259,7 +215,6 @@ async fn run_diagnostic_inner(
                         status,
                         authentication_started,
                         error,
-                        &progress,
                     );
                 }
             }
@@ -288,7 +243,6 @@ async fn run_diagnostic_inner(
                 StageStatus::Failed,
                 started,
                 error,
-                &progress,
             );
         }
     };
@@ -305,7 +259,6 @@ async fn run_diagnostic_inner(
                     "Custom {} header conflicts with the selected authentication profile",
                     auth.header_name
                 ),
-                &progress,
             );
         }
         let value = match HeaderValue::from_str(auth.header_value.as_str()) {
@@ -318,7 +271,6 @@ async fn run_diagnostic_inner(
                     StageStatus::Failed,
                     started,
                     format!("Authentication produced an invalid header value: {error}"),
-                    &progress,
                 );
             }
         };
@@ -334,7 +286,6 @@ async fn run_diagnostic_inner(
                 StageStatus::Failed,
                 started,
                 error.to_string(),
-                &progress,
             );
         }
     };
@@ -344,7 +295,7 @@ async fn run_diagnostic_inner(
         trace.request.body.len(),
         trace.request.user_agent,
     );
-    trace.http.request_headers = header_map_to_trace(&headers);
+    trace.http.request_headers = (&headers).iter().map(|(name, value)| crate::diagnostics::HeaderTrace { name: name.to_string(), value: value.as_bytes().to_vec(), pseudo: false }).collect::<Vec<_>>();
     for input in input_headers {
         if let Some(header) = trace.http.request_headers.iter_mut().find(|header| {
             header.name.eq_ignore_ascii_case(&input.name) && header.value == input.value
@@ -378,7 +329,6 @@ async fn run_diagnostic_inner(
                 StageStatus::Failed,
                 dns_started,
                 error,
-                &progress,
             );
         }
         Err(WaitError::TimedOut) => {
@@ -390,7 +340,6 @@ async fn run_diagnostic_inner(
                     StageStatus::TimedOut,
                     dns_started,
                     "DNS stage timed out".to_owned(),
-                    &progress,
                 );
             }
             true
@@ -403,7 +352,6 @@ async fn run_diagnostic_inner(
                 StageStatus::Cancelled,
                 dns_started,
                 "Request cancelled".to_owned(),
-                &progress,
             );
         }
     };
@@ -416,7 +364,6 @@ async fn run_diagnostic_inner(
                 StageStatus::Failed,
                 dns_started,
                 format!("Pinned destination {ip} is not publicly routable"),
-                &progress,
             );
         }
         addresses.clear();
@@ -429,7 +376,6 @@ async fn run_diagnostic_inner(
                 StageStatus::Failed,
                 dns_started,
                 "DNS returned no A or AAAA addresses".to_owned(),
-                &progress,
             );
         }
         if public_only {
@@ -441,7 +387,6 @@ async fn run_diagnostic_inner(
                     StageStatus::Failed,
                     dns_started,
                     "Destination has no publicly routable A or AAAA address".to_owned(),
-                    &progress,
                 );
             }
         }
@@ -491,102 +436,139 @@ async fn run_diagnostic_inner(
         )
         .await
     }
-}
 
-fn prepare_redirect(
-    trace: &mut DiagnosticTrace,
-    visited_urls: &mut HashSet<String>,
-    redirects_followed: usize,
-) -> Option<DiagnosticRequest> {
-    if !trace.url.normalized.is_empty() {
-        visited_urls.insert(trace.url.normalized.clone());
-    }
-    if !trace.request.follow_redirects {
-        return None;
-    }
-    let target = trace.redirect_target.as_ref()?.clone();
-    if trace.outcome != TraceOutcome::Success {
-        trace.redirect_stop_reason = Some(
+}
+})
+        .await;
+        let next_request = {
+            let (trace, visited_urls, redirects_followed): (
+                &mut DiagnosticTrace,
+                &mut HashSet<String>,
+                usize,
+            ) = (&mut trace, &mut visited_urls, redirects_followed);
+            {
+                'inlined_prepare_redirect: {
+                    if !trace.url.normalized.is_empty() {
+                        visited_urls.insert(trace.url.normalized.clone());
+                    }
+                    if !trace.request.follow_redirects {
+                        break 'inlined_prepare_redirect None;
+                    }
+                    let target = match trace.redirect_target.as_ref() {
+                        Some(value) => value,
+                        None => break 'inlined_prepare_redirect None,
+                    };
+                    if trace.outcome != TraceOutcome::Success {
+                        trace.redirect_stop_reason = Some(
             "Redirect not followed because the request did not complete successfully".to_owned(),
         );
-        return None;
+                        break 'inlined_prepare_redirect None;
+                    }
+                    if !matches!(trace.http.status, Some(301 | 302 | 303 | 307 | 308)) {
+                        trace.redirect_stop_reason = Some(format!(
+                            "HTTP status {} is not followed automatically",
+                            trace.http.status.unwrap_or_default()
+                        ));
+                        break 'inlined_prepare_redirect None;
+                    }
+                    if redirects_followed >= MAX_REDIRECTS {
+                        trace.redirect_stop_reason =
+                            Some(format!("Redirect limit of {MAX_REDIRECTS} reached"));
+                        break 'inlined_prepare_redirect None;
+                    }
+                    if visited_urls.contains(target) {
+                        trace.redirect_stop_reason = Some("Redirect loop detected".to_owned());
+                        break 'inlined_prepare_redirect None;
+                    }
+                    trace.redirect_followed = true;
+                    trace.redirect_stop_reason = None;
+                    Some({
+                        let (trace, target): (&DiagnosticTrace, &str) = (trace, target);
+                        let inlined_result: DiagnosticRequest = {
+                            let mut request = trace.request.clone();
+                            request.url = target.to_owned();
+                            let switch_to_get = matches!(trace.http.status, Some(303))
+                                && !trace.request.method.eq_ignore_ascii_case("HEAD")
+                                || matches!(trace.http.status, Some(301 | 302))
+                                    && trace.request.method.eq_ignore_ascii_case("POST");
+                            let (crosses_origin, crosses_host) =
+                                match (Url::parse(&trace.url.normalized), Url::parse(target)) {
+                                    (Ok(source), Ok(target)) => (
+                                        source.origin() != target.origin(),
+                                        source.host_str().zip(target.host_str()).is_none_or(
+                                            |(source, target)| !source.eq_ignore_ascii_case(target),
+                                        ),
+                                    ),
+                                    _ => (true, true),
+                                };
+                            if switch_to_get {
+                                request.method = "GET".to_owned();
+                                request.body = Arc::from([]);
+                            }
+                            if crosses_origin {
+                                request.auth = None;
+                            }
+                            if crosses_host {
+                                request.client_certificate = None;
+                            }
+                            request.headers = trace
+                                .request
+                                .headers
+                                .lines()
+                                .filter(|line| {
+                                    line.split_once(':').is_none_or(|(name, _)| {
+                                        let name = name.trim();
+                                        !name.eq_ignore_ascii_case("host")
+                                            && !(switch_to_get
+                                                && [
+                                                    "content-encoding",
+                                                    "content-length",
+                                                    "content-type",
+                                                    "transfer-encoding",
+                                                ]
+                                                .iter()
+                                                .any(|removed| name.eq_ignore_ascii_case(removed)))
+                                            && !(crosses_origin
+                                                && [
+                                                    "authorization",
+                                                    "cookie",
+                                                    "proxy-authorization",
+                                                ]
+                                                .iter()
+                                                .any(|removed| name.eq_ignore_ascii_case(removed)))
+                                    })
+                                })
+                                .enumerate()
+                                .fold(String::new(), |mut headers, (index, line)| {
+                                    if index > 0 {
+                                        headers.push('\n');
+                                    }
+                                    headers.push_str(line);
+                                    headers
+                                });
+                            request
+                        };
+                        inlined_result
+                    })
+                }
+            }
+        };
+        fingerprint::analyze(&mut trace);
+        if let Some(progress) = &progress {
+            let _ = progress.send(DiagnosticProgress::HttpHopCompleted(trace.clone()));
+        }
+        traces.push(trace);
+        let Some(next_request) = next_request else {
+            break;
+        };
+        redirects_followed += 1;
+        index += 1;
+        request = next_request;
     }
-    if !matches!(trace.http.status, Some(301 | 302 | 303 | 307 | 308)) {
-        trace.redirect_stop_reason = Some(format!(
-            "HTTP status {} is not followed automatically",
-            trace.http.status.unwrap_or_default()
-        ));
-        return None;
-    }
-    if redirects_followed >= MAX_REDIRECTS {
-        trace.redirect_stop_reason = Some(format!("Redirect limit of {MAX_REDIRECTS} reached"));
-        return None;
-    }
-    if visited_urls.contains(&target) {
-        trace.redirect_stop_reason = Some("Redirect loop detected".to_owned());
-        return None;
-    }
-    trace.redirect_followed = true;
-    trace.redirect_stop_reason = None;
-    Some(redirect_request(trace, target))
-}
 
-fn redirect_request(trace: &DiagnosticTrace, target: String) -> DiagnosticRequest {
-    let mut request = trace.request.clone();
-    request.url = target.clone();
-    let mut removed_headers = vec!["host"];
-    let switch_to_get = matches!(trace.http.status, Some(303))
-        && !trace.request.method.eq_ignore_ascii_case("HEAD")
-        || matches!(trace.http.status, Some(301 | 302))
-            && trace.request.method.eq_ignore_ascii_case("POST");
-    if switch_to_get {
-        request.method = "GET".to_owned();
-        request.body = Arc::from([]);
-        removed_headers.extend([
-            "content-encoding",
-            "content-length",
-            "content-type",
-            "transfer-encoding",
-        ]);
+    if let Some(progress) = &progress {
+        let _ = progress.send(DiagnosticProgress::SessionCompleted);
     }
-    if redirect_crosses_origin(&trace.url.normalized, &target) {
-        removed_headers.extend(["authorization", "cookie", "proxy-authorization"]);
-        request.auth = None;
-    }
-    if redirect_crosses_host(&trace.url.normalized, &target) {
-        request.client_certificate = None;
-    }
-    request.headers = remove_headers(&request.headers, &removed_headers);
-    request
-}
 
-fn redirect_crosses_host(source: &str, target: &str) -> bool {
-    match (Url::parse(source), Url::parse(target)) {
-        (Ok(source), Ok(target)) => source
-            .host_str()
-            .zip(target.host_str())
-            .is_none_or(|(source, target)| !source.eq_ignore_ascii_case(target)),
-        _ => true,
-    }
-}
-
-fn redirect_crosses_origin(source: &str, target: &str) -> bool {
-    match (Url::parse(source), Url::parse(target)) {
-        (Ok(source), Ok(target)) => source.origin() != target.origin(),
-        _ => true,
-    }
-}
-
-fn remove_headers(headers: &str, names: &[&str]) -> String {
-    headers
-        .lines()
-        .filter(|line| {
-            line.split_once(':').is_none_or(|(name, _)| {
-                !names
-                    .iter()
-                    .any(|removed| name.trim().eq_ignore_ascii_case(removed))
-            })
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    traces
 }

@@ -12,7 +12,7 @@ pub use profiles::{
 
 use cookies::{parse_http_url, validate_host};
 use oauth::{acquire_client_credentials, refresh_interactive};
-use profiles::{CachedToken, StoredProfileKind};
+use profiles::StoredProfileKind;
 use rustls::pki_types::CertificateDer;
 use rustls::sign::CertifiedKey;
 use std::fmt;
@@ -130,7 +130,9 @@ pub async fn resolve(
         .ok_or_else(|| "Authentication profile no longer exists".to_owned())?;
     match profile.kind {
         StoredProfileKind::AzureInteractive(config) => {
-            let token = if let Some(token) = config.token.clone().filter(CachedToken::is_valid) {
+            let token = if let Some(token) = config.token.clone().filter(|token| {
+                token.expires_at > std::time::Instant::now() + std::time::Duration::from_secs(60)
+            }) {
                 token
             } else if let Some(refresh_token) = config
                 .token
@@ -156,7 +158,9 @@ pub async fn resolve(
             })
         }
         StoredProfileKind::AzureClientCredentials(config) => {
-            let token = if let Some(token) = config.token.clone().filter(CachedToken::is_valid) {
+            let token = if let Some(token) = config.token.clone().filter(|token| {
+                token.expires_at > std::time::Instant::now() + std::time::Duration::from_secs(60)
+            }) {
                 token
             } else {
                 let token = acquire_client_credentials(&config, timeout, &cancel).await?;

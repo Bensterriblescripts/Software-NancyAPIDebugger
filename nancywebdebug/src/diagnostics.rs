@@ -332,16 +332,6 @@ pub fn escaped_bytes(bytes: &[u8]) -> Cow<'_, str> {
     Cow::Owned(escaped)
 }
 
-pub(crate) fn format_byte_size(bytes: usize) -> String {
-    if bytes >= 1_000_000 {
-        format!("{:.2} MB", bytes as f64 / 1_000_000.0)
-    } else if bytes >= 1_000 {
-        format!("{:.2} KB", bytes as f64 / 1_000.0)
-    } else {
-        format!("{bytes} bytes")
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct HttpTrace {
     pub requested_protocol: String,
@@ -371,29 +361,96 @@ pub struct BodyTrace {
 
 impl BodyTrace {
     pub fn raw_capture_status(&self) -> String {
-        capture_status(self.raw.len(), self.raw_truncated)
+        {
+            let (length, truncated): (usize, bool) = (self.raw.len(), self.raw_truncated);
+
+            if truncated {
+                format!(
+                    "{} (truncated at {})",
+                    ({
+                        let bytes: usize = length;
+                        if bytes >= 1_000_000 {
+                            format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+                        } else if bytes >= 1_000 {
+                            format!("{:.2} KB", bytes as f64 / 1_000.0)
+                        } else {
+                            format!("{bytes} bytes")
+                        }
+                    }),
+                    ({
+                        let bytes: usize = MAX_CAPTURE_BYTES;
+                        if bytes >= 1_000_000 {
+                            format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+                        } else if bytes >= 1_000 {
+                            format!("{:.2} KB", bytes as f64 / 1_000.0)
+                        } else {
+                            format!("{bytes} bytes")
+                        }
+                    })
+                )
+            } else {
+                {
+                    let bytes: usize = length;
+                    if bytes >= 1_000_000 {
+                        format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+                    } else if bytes >= 1_000 {
+                        format!("{:.2} KB", bytes as f64 / 1_000.0)
+                    } else {
+                        format!("{bytes} bytes")
+                    }
+                }
+            }
+        }
     }
 
     pub fn decoded_capture_status(&self) -> String {
         if self.decoded_is_text {
-            capture_status(self.decoded.len(), self.decoded_truncated)
+            {
+                let (length, truncated): (usize, bool) =
+                    (self.decoded.len(), self.decoded_truncated);
+
+                if truncated {
+                    format!(
+                        "{} (truncated at {})",
+                        ({
+                            let bytes: usize = length;
+                            if bytes >= 1_000_000 {
+                                format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+                            } else if bytes >= 1_000 {
+                                format!("{:.2} KB", bytes as f64 / 1_000.0)
+                            } else {
+                                format!("{bytes} bytes")
+                            }
+                        }),
+                        ({
+                            let bytes: usize = MAX_CAPTURE_BYTES;
+                            if bytes >= 1_000_000 {
+                                format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+                            } else if bytes >= 1_000 {
+                                format!("{:.2} KB", bytes as f64 / 1_000.0)
+                            } else {
+                                format!("{bytes} bytes")
+                            }
+                        })
+                    )
+                } else {
+                    {
+                        let bytes: usize = length;
+                        if bytes >= 1_000_000 {
+                            format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+                        } else if bytes >= 1_000 {
+                            format!("{:.2} KB", bytes as f64 / 1_000.0)
+                        } else {
+                            format!("{bytes} bytes")
+                        }
+                    }
+                }
+            }
         } else if self.decoded_truncated {
             "Not decoded as text (source or decoded data truncated)".to_owned()
         } else {
             "Not decoded as text".to_owned()
         }
-    }
-}
-
-fn capture_status(length: usize, truncated: bool) -> String {
-    if truncated {
-        format!(
-            "{} (truncated at {})",
-            format_byte_size(length),
-            format_byte_size(MAX_CAPTURE_BYTES)
-        )
-    } else {
-        format_byte_size(length)
     }
 }
 
@@ -422,16 +479,6 @@ pub struct FingerprintTrace {
     pub confidence: String,
 }
 
-impl FingerprintTrace {
-    fn new() -> Self {
-        Self {
-            status: FingerprintStatus::Pending,
-            web_server: "Unknown".to_owned(),
-            confidence: "None".to_owned(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct DiagnosticTrace {
     pub index: usize,
@@ -455,18 +502,37 @@ pub struct DiagnosticTrace {
 
 impl DiagnosticTrace {
     pub fn new(index: usize, request: DiagnosticRequest) -> Self {
-        let fingerprint = FingerprintTrace::new();
-        let mut stage_kinds = vec![StageKind::Url, StageKind::Authentication, StageKind::Dns];
-        if request.protocol == ProtocolPreference::Http3 {
-            stage_kinds.push(StageKind::QuicTls);
+        let fingerprint = {
+            {
+                FingerprintTrace {
+                    status: FingerprintStatus::Pending,
+                    web_server: "Unknown".to_owned(),
+                    confidence: "None".to_owned(),
+                }
+            }
+        };
+        let stage_kinds: &[StageKind] = if request.protocol == ProtocolPreference::Http3 {
+            &[
+                StageKind::Url,
+                StageKind::Authentication,
+                StageKind::Dns,
+                StageKind::QuicTls,
+                StageKind::HttpHeaders,
+                StageKind::FirstByte,
+                StageKind::Body,
+            ]
         } else {
-            stage_kinds.extend([StageKind::Tcp, StageKind::Tls]);
-        }
-        stage_kinds.extend([
-            StageKind::HttpHeaders,
-            StageKind::FirstByte,
-            StageKind::Body,
-        ]);
+            &[
+                StageKind::Url,
+                StageKind::Authentication,
+                StageKind::Dns,
+                StageKind::Tcp,
+                StageKind::Tls,
+                StageKind::HttpHeaders,
+                StageKind::FirstByte,
+                StageKind::Body,
+            ]
+        };
         Self {
             index,
             complete: false,
@@ -482,7 +548,8 @@ impl DiagnosticTrace {
             outcome: TraceOutcome::Running,
             error: None,
             stages: stage_kinds
-                .into_iter()
+                .iter()
+                .copied()
                 .map(|kind| StageTrace {
                     kind,
                     status: StageStatus::Pending,

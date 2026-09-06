@@ -1,4 +1,5 @@
 use super::*;
+use crate::scan_limits as limits;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum PortSelection {
@@ -16,7 +17,109 @@ impl PortSelection {
         } else if value.eq_ignore_ascii_case("all") {
             Ok(Self::All)
         } else {
-            parse_custom_ports(value).map(Self::Custom)
+            ({
+                let (value,): (&str,) = (value,);
+                let inlined_result: Result<Vec<u16>, String> =
+                    {
+                        'inlined_parse_custom_ports: {
+                            let mut ports = Vec::new();
+                            for part in value.split(',') {
+                                let part = part.trim();
+                                if part.is_empty() {
+                                    break 'inlined_parse_custom_ports Err(
+                                        "Port list contains an empty item".to_owned(),
+                                    );
+                                }
+                                if let Some((start, end)) = part.split_once('-') {
+                                    let start = match {
+                                        let (value,): (&str,) = (start,);
+                                        let inlined_result: Result<u16, String> = {
+                                            value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("Invalid port '{value}'"))
+        .and_then(|port| {
+            if port == 0 {
+                Err("Port 0 is not a valid destination port".to_owned())
+            } else {
+                Ok(port)
+            }
+        })
+                                        };
+                                        inlined_result
+                                    } {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            break 'inlined_parse_custom_ports Err(
+                                                ::core::convert::From::from(error),
+                                            );
+                                        }
+                                    };
+                                    let end = match {
+                                        let (value,): (&str,) = (end,);
+                                        let inlined_result: Result<u16, String> = {
+                                            value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("Invalid port '{value}'"))
+        .and_then(|port| {
+            if port == 0 {
+                Err("Port 0 is not a valid destination port".to_owned())
+            } else {
+                Ok(port)
+            }
+        })
+                                        };
+                                        inlined_result
+                                    } {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            break 'inlined_parse_custom_ports Err(
+                                                ::core::convert::From::from(error),
+                                            );
+                                        }
+                                    };
+                                    if start > end {
+                                        break 'inlined_parse_custom_ports Err(format!(
+                                            "Port range {part} is reversed"
+                                        ));
+                                    }
+                                    ports.extend(start..=end);
+                                } else {
+                                    ports.push(
+                                        match {
+                                            let (value,): (&str,) = (part,);
+                                            let inlined_result: Result<u16, String> = {
+                                                value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("Invalid port '{value}'"))
+        .and_then(|port| {
+            if port == 0 {
+                Err("Port 0 is not a valid destination port".to_owned())
+            } else {
+                Ok(port)
+            }
+        })
+                                            };
+                                            inlined_result
+                                        } {
+                                            Ok(value) => value,
+                                            Err(error) => {
+                                                break 'inlined_parse_custom_ports Err(
+                                                    ::core::convert::From::from(error),
+                                                );
+                                            }
+                                        },
+                                    );
+                                }
+                            }
+                            normalize_ports(ports)
+                        }
+                    };
+                inlined_result
+            })
+            .map(Self::Custom)
         }
     }
 
@@ -41,27 +144,6 @@ impl FromStr for PortSelection {
     }
 }
 
-fn parse_custom_ports(value: &str) -> Result<Vec<u16>, String> {
-    let mut ports = Vec::new();
-    for part in value.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            return Err("Port list contains an empty item".to_owned());
-        }
-        if let Some((start, end)) = part.split_once('-') {
-            let start = parse_port(start)?;
-            let end = parse_port(end)?;
-            if start > end {
-                return Err(format!("Port range {part} is reversed"));
-            }
-            ports.extend(start..=end);
-        } else {
-            ports.push(parse_port(part)?);
-        }
-    }
-    normalize_ports(ports)
-}
-
 fn normalize_ports(mut ports: Vec<u16>) -> Result<Vec<u16>, String> {
     ports.sort_unstable();
     ports.dedup();
@@ -70,20 +152,6 @@ fn normalize_ports(mut ports: Vec<u16>) -> Result<Vec<u16>, String> {
         Some(_) => Ok(ports),
         None => Err("Port selection contains no ports".to_owned()),
     }
-}
-
-fn parse_port(value: &str) -> Result<u16, String> {
-    value
-        .trim()
-        .parse::<u16>()
-        .map_err(|_| format!("Invalid port '{value}'"))
-        .and_then(|port| {
-            if port == 0 {
-                Err("Port 0 is not a valid destination port".to_owned())
-            } else {
-                Ok(port)
-            }
-        })
 }
 
 #[derive(Debug, Clone)]
@@ -147,31 +215,125 @@ impl ExposureScanRequest {
 
     pub fn validate(&self) -> Result<(), String> {
         parse_target(&self.diagnostic_request.url)?;
-        self.ports.ports(TransportProtocol::Tcp)?;
-        self.udp_ports.ports(TransportProtocol::Udp)?;
-        require(self.connection_timeout.is_zero(), "Connection timeout")?;
-        require(self.probe_timeout.is_zero(), "Probe timeout")?;
-        require(self.concurrency == 0, "Concurrency")?;
-        require(self.connection_starts_per_second == 0, "Connection rate")?;
-        require(self.crawl_max_urls == 0, "Crawl URL limit")?;
-        require(self.crawl_concurrency == 0, "Crawl concurrency")?;
-        require(self.crawl_requests_per_second == 0, "Crawl rate")?;
-        require(
-            self.active_requests_per_origin == 0,
-            "Active requests per origin",
+        self.ports
+            .ports(TransportProtocol::Tcp)
+            .map_err(|error| format!("TCP ports: {error}"))?;
+        if self.udp_scanning {
+            self.udp_ports
+                .ports(TransportProtocol::Udp)
+                .map_err(|error| format!("UDP ports: {error}"))?;
+        }
+        limits::validate_timeout(
+            self.connection_timeout,
+            limits::CONNECTION_TIMEOUT,
+            "Connection timeout (seconds)",
         )?;
-        require(self.active_requests_total == 0, "Total active requests")?;
-        require(self.ct_hostname_limit == 0, "CT hostname limit")?;
-        if self.ct_hostname_limit > 5_000 {
-            return Err("CT hostname limit must not exceed 5000".to_owned());
+        limits::validate_timeout(
+            self.probe_timeout,
+            limits::PROBE_TIMEOUT,
+            "Probe timeout (seconds)",
+        )?;
+        let timeouts = &self.diagnostic_request.timeouts;
+        limits::validate_timeout(
+            timeouts.authentication,
+            limits::STAGE_TIMEOUT,
+            "Authentication stage timeout (seconds)",
+        )?;
+        limits::validate_timeout(
+            timeouts.dns,
+            limits::STAGE_TIMEOUT,
+            "DNS stage timeout (seconds)",
+        )?;
+        limits::validate_timeout(
+            timeouts.transport,
+            limits::STAGE_TIMEOUT,
+            "TCP / QUIC stage timeout (seconds)",
+        )?;
+        limits::validate_timeout(
+            timeouts.tls,
+            limits::STAGE_TIMEOUT,
+            "TLS stage timeout (seconds)",
+        )?;
+        limits::validate_timeout(
+            timeouts.headers,
+            limits::STAGE_TIMEOUT,
+            "HTTP headers stage timeout (seconds)",
+        )?;
+        limits::validate_timeout(
+            timeouts.first_byte,
+            limits::STAGE_TIMEOUT,
+            "First byte stage timeout (seconds)",
+        )?;
+        limits::validate_timeout(
+            timeouts.body,
+            limits::STAGE_TIMEOUT,
+            "Body stage timeout (seconds)",
+        )?;
+        limits::validate(
+            self.concurrency,
+            limits::CONCURRENCY,
+            "Concurrent endpoints",
+        )?;
+        limits::validate(
+            self.connection_starts_per_second,
+            limits::CONNECTION_RATE,
+            "Connection starts / second",
+        )?;
+        if self.security_operations {
+            limits::validate(
+                self.crawl_max_urls,
+                limits::CRAWL_URLS,
+                "Crawl URLs / domain",
+            )?;
+            limits::validate(
+                self.crawl_concurrency,
+                limits::CRAWL_CONCURRENCY,
+                "Concurrent crawl requests",
+            )?;
+            limits::validate(
+                self.crawl_requests_per_second,
+                limits::CRAWL_RATE,
+                "Crawl requests / second",
+            )?;
         }
-        for selector in &self.dkim_selectors {
-            if !valid_dns_label(selector) {
-                return Err(format!("Invalid DKIM selector '{selector}'"));
+        if self.web_probe_level != WebProbeLevel::Passive {
+            limits::validate(
+                self.active_requests_per_origin,
+                limits::ACTIVE_PER_ORIGIN,
+                "Active requests / origin",
+            )?;
+            limits::validate(
+                self.active_requests_total,
+                limits::ACTIVE_TOTAL,
+                "Total active requests",
+            )?;
+        }
+        if self.asset_discovery {
+            limits::validate(
+                self.ct_hostname_limit,
+                limits::CT_HOSTNAMES,
+                "CT hostname limit",
+            )?;
+        }
+        if self.dns_assessment {
+            if self.dkim_selectors.len() > 100 {
+                return Err("No more than 100 DKIM selectors may be supplied".to_owned());
             }
-        }
-        if self.dkim_selectors.len() > 100 {
-            return Err("No more than 100 DKIM selectors may be supplied".to_owned());
+            for selector in &self.dkim_selectors {
+                let value = selector.trim();
+                if value.is_empty()
+                    || value.len() > 63
+                    || value.starts_with('-')
+                    || value.ends_with('-')
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                {
+                    return Err(format!(
+                        "Invalid DKIM selector '{selector}': use 1-63 letters, digits, hyphens or underscores, with no leading or trailing hyphen"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -189,31 +351,6 @@ display_enum! {
 
 impl WebProbeLevel {
     pub const ALL: [Self; 3] = [Self::Passive, Self::Active, Self::StateChanging];
-
-    pub const fn active(self) -> bool {
-        matches!(self, Self::Active | Self::StateChanging)
-    }
-
-    pub const fn state_changing(self) -> bool {
-        matches!(self, Self::StateChanging)
-    }
-}
-
-fn valid_dns_label(value: &str) -> bool {
-    let value = value.trim();
-    !value.is_empty()
-        && value.len() <= 63
-        && !value.starts_with('-')
-        && !value.ends_with('-')
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
-fn require(invalid: bool, name: &str) -> Result<(), String> {
-    (!invalid)
-        .then_some(())
-        .ok_or_else(|| format!("{name} must be greater than zero"))
 }
 
 display_enum! {
@@ -269,6 +406,8 @@ display_enum! {
 display_enum! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum DnsObservationStatus {
+        Error => "Error",
+        Recommendation => "Recommendation",
         Pass => "Pass",
         Informational => "Informational",
         Warning => "Warning",
@@ -559,11 +698,8 @@ pub struct WebTechnologyDetection {
 pub struct TlsObservation {
     pub requested_version: TlsVersion,
     pub supported: bool,
-    pub verified: bool,
     pub unverified: bool,
-    pub negotiated_version: Option<String>,
     pub alpn: Option<String>,
-    pub cipher: Option<String>,
     pub validation_error: Option<String>,
     pub hostname_valid: Option<bool>,
     pub certificate_expired: Option<bool>,
@@ -622,7 +758,6 @@ pub struct HttpObservation {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub body_truncated: bool,
-    pub tls_unverified: bool,
     pub redirect_location: Option<String>,
     pub duration_ms: f64,
     pub framing: ResponseFraming,
@@ -732,6 +867,7 @@ pub struct UdpEndpointScan {
     pub port: u16,
     pub transport: TransportProtocol,
     pub state: UdpEndpointState,
+    pub attempted: bool,
     pub service: ServiceKind,
     pub elapsed_ms: f64,
     pub evidence: Vec<String>,
@@ -766,6 +902,8 @@ pub struct DnsObservation {
     pub check: String,
     pub status: DnsObservationStatus,
     pub summary: String,
+    pub impact: String,
+    pub remediation: String,
     pub evidence: Vec<String>,
 }
 
@@ -889,6 +1027,7 @@ pub struct EndpointScan {
     pub port: u16,
     pub transport: TransportProtocol,
     pub state: PortState,
+    pub attempted: bool,
     pub connect_duration_ms: f64,
     pub service: ServiceKind,
     pub service_confidence: Confidence,
@@ -916,6 +1055,7 @@ impl EndpointScan {
             port,
             transport: TransportProtocol::Tcp,
             state: PortState::Error,
+            attempted: false,
             connect_duration_ms: 0.0,
             service: ServiceKind::Unknown,
             service_confidence: Confidence::None,
@@ -952,6 +1092,36 @@ pub struct ExposureScanTimings {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConnectivityCheck {
+    pub label: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointHealthResolution {
+    Inconclusive,
+    Recovered,
+    Stopped,
+}
+
+#[derive(Debug, Clone)]
+pub struct EndpointHealthObservation {
+    pub ip: IpAddr,
+    pub port: u16,
+    pub transport: TransportProtocol,
+    pub request_number: usize,
+    pub elapsed_ms: f64,
+    pub timeouts: usize,
+    pub rejections: usize,
+    pub had_baseline: bool,
+    pub connectivity: Vec<ConnectivityCheck>,
+    pub retries: Vec<String>,
+    pub resolution: EndpointHealthResolution,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ExposureScanReport {
     pub request: ExposureScanRequest,
     pub hostname: String,
@@ -959,6 +1129,7 @@ pub struct ExposureScanReport {
     pub resolved_addresses: Vec<IpAddr>,
     pub ignored_addresses: Vec<IgnoredAddress>,
     pub warnings: Vec<String>,
+    pub endpoint_health: Vec<EndpointHealthObservation>,
     pub endpoints: Vec<EndpointScan>,
     pub udp_endpoints: Vec<UdpEndpointScan>,
     pub service_access: Vec<ServiceAccessResult>,

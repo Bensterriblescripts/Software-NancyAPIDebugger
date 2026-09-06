@@ -43,44 +43,48 @@ pub(in crate::ui) fn show(ui: &mut egui::Ui, trace: &DiagnosticTrace, view: &mut
                     "<empty>"
                 });
             } else {
-                egui::ScrollArea::both().show(ui, |ui| show_text(ui, trace.body.decoded.as_ref()));
+                egui::ScrollArea::both().show(ui, |ui| {
+                    let (ui, text): (&mut eframe::egui::Ui, &str) =
+                        (ui, trace.body.decoded.as_ref());
+                    ui.add(
+                        eframe::egui::Label::new(eframe::egui::RichText::new(text).monospace())
+                            .selectable(true),
+                    );
+                });
             }
         }
-        BodyView::Hex => show_hex(ui, trace.body.raw.as_ref()),
-    }
-}
-
-pub(super) fn show_text(ui: &mut egui::Ui, text: &str) {
-    ui.add(egui::Label::new(egui::RichText::new(text).monospace()).selectable(true));
-}
-
-fn show_hex(ui: &mut egui::Ui, bytes: &[u8]) {
-    if bytes.is_empty() {
-        ui.weak("<empty>");
-        return;
-    }
-    let rows = bytes.len().div_ceil(16);
-    egui::ScrollArea::both().show_rows(ui, 18.0, rows, |ui, range| {
-        for row in range {
-            let offset = row * 16;
-            let end = (offset + 16).min(bytes.len());
-            let chunk = &bytes[offset..end];
-            let hex = chunk
-                .iter()
-                .map(|byte| format!("{byte:02X}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let ascii = chunk
-                .iter()
-                .map(|byte| {
-                    if byte.is_ascii_graphic() || *byte == b' ' {
-                        char::from(*byte)
-                    } else {
-                        '.'
+        BodyView::Hex => {
+            let (ui, bytes): (&mut egui::Ui, &[u8]) = (ui, trace.body.raw.as_ref());
+            'inlined_show_hex: {
+                if bytes.is_empty() {
+                    ui.weak("<empty>");
+                    break 'inlined_show_hex;
+                }
+                let rows = bytes.len().div_ceil(16);
+                egui::ScrollArea::both().show_rows(ui, 18.0, rows, |ui, range| {
+                    for row in range {
+                        let offset = row * 16;
+                        let end = (offset + 16).min(bytes.len());
+                        let chunk = &bytes[offset..end];
+                        let hex = chunk
+                            .iter()
+                            .map(|byte| format!("{byte:02X}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let ascii = chunk
+                            .iter()
+                            .map(|byte| {
+                                if byte.is_ascii_graphic() || *byte == b' ' {
+                                    char::from(*byte)
+                                } else {
+                                    '.'
+                                }
+                            })
+                            .collect::<String>();
+                        ui.monospace(format!("{offset:08X}  {hex:<47}  |{ascii}|"));
                     }
-                })
-                .collect::<String>();
-            ui.monospace(format!("{offset:08X}  {hex:<47}  |{ascii}|"));
+                });
+            }
         }
-    });
+    }
 }

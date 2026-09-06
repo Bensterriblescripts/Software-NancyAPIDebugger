@@ -1,5 +1,6 @@
 use crate::auth::LoadedClientCertificate;
 use crate::diagnostics::{ConnectionAttempt, ConnectionOutcome, ProtocolPreference};
+use crate::exposure::endpoint_health;
 use crate::network::ConnectionRateLimiter;
 use futures_util::future::join_all;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -12,11 +13,12 @@ use tokio::net::{TcpSocket, TcpStream};
 use tokio_rustls::client::TlsStream;
 use tokio_util::sync::CancellationToken;
 
-use super::stages::{WaitError, address_family, elapsed_ms, wait_for};
+use super::stages::{WaitError, wait_for};
 use super::tls::{CertificateCapture, make_tls_config};
 
 pub(crate) struct TcpCandidate {
     pub(crate) attempt: ConnectionAttempt,
+    pub(crate) attempted: bool,
     pub(crate) stream: Option<TcpStream>,
 }
 
@@ -127,15 +129,39 @@ pub(super) async fn connect_tcp_all(
         async move {
             let remote = SocketAddr::new(ip, port);
             let started = Instant::now();
+            let health_attempt = match endpoint_health::begin(ip, port, &cancel).await {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    return TcpCandidate {
+                        attempted: false,
+                        attempt: ConnectionAttempt {
+                            remote,
+                            local: None,
+                            family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                            duration_ms: 0.0,
+                            outcome: if cancel.is_cancelled() {
+                                ConnectionOutcome::Cancelled
+                            } else {
+                                ConnectionOutcome::Failed
+                            },
+                            error: Some(error),
+                            os_error: None,
+                            selected: false,
+                        },
+                        stream: None,
+                    };
+                }
+            };
             if let Some(limiter) = limiter
                 && limiter.wait(&cancel).await.is_err()
             {
                 return TcpCandidate {
+                    attempted: false,
                     attempt: ConnectionAttempt {
                         remote,
                         local: None,
-                        family: address_family(ip),
-                        duration_ms: elapsed_ms(started),
+                        family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                        duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                         outcome: ConnectionOutcome::Cancelled,
                         error: Some("Scan cancelled".to_owned()),
                         os_error: None,
@@ -153,11 +179,12 @@ pub(super) async fn connect_tcp_all(
                 Ok(socket) => socket,
                 Err(error) => {
                     return TcpCandidate {
+                        attempted: false,
                         attempt: ConnectionAttempt {
                             remote,
                             local: None,
-                            family: address_family(ip),
-                            duration_ms: elapsed_ms(started),
+                            family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                            duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                             outcome: ConnectionOutcome::Failed,
                             error: Some(error.to_string()),
                             os_error: error.raw_os_error(),
@@ -174,11 +201,12 @@ pub(super) async fn connect_tcp_all(
             };
             if let Err(error) = socket.bind(bind) {
                 return TcpCandidate {
+                    attempted: false,
                     attempt: ConnectionAttempt {
                         remote,
                         local: None,
-                        family: address_family(ip),
-                        duration_ms: elapsed_ms(started),
+                        family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                        duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                         outcome: ConnectionOutcome::Failed,
                         error: Some(error.to_string()),
                         os_error: error.raw_os_error(),
@@ -188,14 +216,24 @@ pub(super) async fn connect_tcp_all(
                 };
             }
             let local = socket.local_addr().ok();
-            let result = wait_for(timeout, &cancel, socket.connect(remote)).await;
-            match result {
+            let mut attempted = false;
+            let result = if cancel.is_cancelled() {
+                Err(WaitError::Cancelled)
+            } else {
+                wait_for(timeout, &cancel, async {
+                    attempted = true;
+                    socket.connect(remote).await
+                })
+                .await
+            };
+            let candidate = match result {
                 Ok(Ok(stream)) => TcpCandidate {
+                    attempted,
                     attempt: ConnectionAttempt {
                         remote,
                         local: stream.local_addr().ok(),
-                        family: address_family(ip),
-                        duration_ms: elapsed_ms(started),
+                        family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                        duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                         outcome: ConnectionOutcome::Succeeded,
                         error: None,
                         os_error: None,
@@ -204,11 +242,12 @@ pub(super) async fn connect_tcp_all(
                     stream: Some(stream),
                 },
                 Ok(Err(error)) => TcpCandidate {
+                    attempted,
                     attempt: ConnectionAttempt {
                         remote,
                         local,
-                        family: address_family(ip),
-                        duration_ms: elapsed_ms(started),
+                        family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                        duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                         outcome: ConnectionOutcome::Failed,
                         error: Some(error.to_string()),
                         os_error: error.raw_os_error(),
@@ -217,11 +256,12 @@ pub(super) async fn connect_tcp_all(
                     stream: None,
                 },
                 Err(WaitError::TimedOut) => TcpCandidate {
+                    attempted,
                     attempt: ConnectionAttempt {
                         remote,
                         local,
-                        family: address_family(ip),
-                        duration_ms: elapsed_ms(started),
+                        family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                        duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                         outcome: ConnectionOutcome::TimedOut,
                         error: Some("Connection timed out".to_owned()),
                         os_error: None,
@@ -230,11 +270,12 @@ pub(super) async fn connect_tcp_all(
                     stream: None,
                 },
                 Err(WaitError::Cancelled) => TcpCandidate {
+                    attempted,
                     attempt: ConnectionAttempt {
                         remote,
                         local,
-                        family: address_family(ip),
-                        duration_ms: elapsed_ms(started),
+                        family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                        duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                         outcome: ConnectionOutcome::Cancelled,
                         error: Some("Request cancelled".to_owned()),
                         os_error: None,
@@ -242,7 +283,11 @@ pub(super) async fn connect_tcp_all(
                     },
                     stream: None,
                 },
+            };
+            if let Some(attempt) = health_attempt {
+                attempt.finish_tcp(&candidate, timeout, &cancel).await;
             }
+            candidate
         }
     });
     join_all(futures).await
@@ -295,8 +340,8 @@ pub(super) async fn connect_quic_all(
                     attempt: ConnectionAttempt {
                         remote,
                         local: None,
-                        family: address_family(ip),
-                        duration_ms: elapsed_ms(started),
+                        family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                        duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                         outcome: ConnectionOutcome::Cancelled,
                         error: Some("Scan cancelled".to_owned()),
                         os_error: None,
@@ -319,8 +364,8 @@ pub(super) async fn connect_quic_all(
                         attempt: ConnectionAttempt {
                             remote,
                             local: None,
-                            family: address_family(ip),
-                            duration_ms: elapsed_ms(started),
+                            family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                            duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                             outcome: ConnectionOutcome::Failed,
                             error: Some(error.to_string()),
                             os_error: None,
@@ -355,8 +400,8 @@ pub(super) async fn connect_quic_all(
                     attempt: ConnectionAttempt {
                         remote,
                         local: endpoint.local_addr().ok(),
-                        family: address_family(ip),
-                        duration_ms: elapsed_ms(started),
+                        family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                        duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                         outcome: ConnectionOutcome::Succeeded,
                         error: None,
                         os_error: None,
@@ -370,8 +415,8 @@ pub(super) async fn connect_quic_all(
                     attempt: ConnectionAttempt {
                         remote,
                         local,
-                        family: address_family(ip),
-                        duration_ms: elapsed_ms(started),
+                        family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                        duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                         outcome: ConnectionOutcome::Failed,
                         error: Some(error),
                         os_error: None,
@@ -385,8 +430,8 @@ pub(super) async fn connect_quic_all(
                     attempt: ConnectionAttempt {
                         remote,
                         local,
-                        family: address_family(ip),
-                        duration_ms: elapsed_ms(started),
+                        family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                        duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                         outcome: ConnectionOutcome::TimedOut,
                         error: Some("QUIC handshake timed out".to_owned()),
                         os_error: None,
@@ -400,8 +445,8 @@ pub(super) async fn connect_quic_all(
                     attempt: ConnectionAttempt {
                         remote,
                         local,
-                        family: address_family(ip),
-                        duration_ms: elapsed_ms(started),
+                        family: (if (ip).is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()),
+                        duration_ms: ((started).elapsed().as_secs_f64() * 1000.0),
                         outcome: ConnectionOutcome::Cancelled,
                         error: Some("Request cancelled".to_owned()),
                         os_error: None,

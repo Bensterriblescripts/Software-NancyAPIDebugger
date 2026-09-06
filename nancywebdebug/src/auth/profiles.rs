@@ -1,16 +1,15 @@
 use crate::diagnostics::{CertificateTrace, RequestAuth, RequestClientCertificate};
 use http::HeaderValue;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::browser::CookieRecord;
 use super::cookies::{
-    cookie_path_matches, normalize_cookie, normalize_cookie_path, parse_http_url,
-    require_host_scope, unix_timestamp_now, validate_host,
+    cookie_path_matches, normalize_cookie, parse_http_url, require_host_scope, validate_host,
 };
-use super::oauth::{normalize_scopes, validate_azure};
+use super::oauth::validate_azure;
 
 pub type SharedAuthStore = Arc<Mutex<AuthStore>>;
 
@@ -105,12 +104,6 @@ pub(super) struct CachedToken {
     pub(super) expires_at: Instant,
 }
 
-impl CachedToken {
-    pub(super) fn is_valid(&self) -> bool {
-        self.expires_at > Instant::now() + Duration::from_secs(60)
-    }
-}
-
 #[derive(Clone)]
 pub(super) struct AzureInteractiveProfile {
     pub(super) tenant: String,
@@ -156,7 +149,14 @@ impl BrowserCookie {
         let value = Zeroizing::new(std::mem::take(&mut record.value));
         Ok(Self {
             domain: record.domain.trim().to_ascii_lowercase(),
-            path: normalize_cookie_path(&record.path),
+            path: ({
+                let path: &str = &record.path;
+                if path.starts_with('/') {
+                    path.to_owned()
+                } else {
+                    "/".to_owned()
+                }
+            }),
             secure: record.secure,
             expires_at: record.expires_at,
             name: record.name.trim().to_owned(),
@@ -168,10 +168,13 @@ impl BrowserCookie {
         if self.secure && url.scheme() != "https" {
             return false;
         }
-        if self
-            .expires_at
-            .is_some_and(|expiry| expiry <= unix_timestamp_now())
-        {
+        if self.expires_at.is_some_and(|expiry| {
+            expiry
+                <= (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64)
+        }) {
             return false;
         }
         let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
@@ -218,28 +221,6 @@ impl StoredProfileKind {
             Self::ClientCertificate(_) => ProfileType::ClientCertificate,
         }
     }
-
-    fn status(&self) -> String {
-        match self {
-            Self::AzureInteractive(profile) => match &profile.token {
-                Some(token) if token.is_valid() => "Signed in".to_owned(),
-                Some(_) => "Token expired; refresh available".to_owned(),
-                None => "Sign-in required".to_owned(),
-            },
-            Self::AzureClientCredentials(profile) => match &profile.token {
-                Some(token) if token.is_valid() => "Token cached".to_owned(),
-                _ => "Token acquired when sent".to_owned(),
-            },
-            Self::BrowserCookies(profile) => match &profile.captured_for {
-                Some(target) => format!("{} cookies captured for {target}", profile.cookies.len()),
-                None => "Cookie capture required".to_owned(),
-            },
-            Self::ManualCookie(_) => "Ready".to_owned(),
-            Self::ClientCertificate(profile) => {
-                format!("Ready — {}", profile.certificate.subject)
-            }
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -275,7 +256,49 @@ impl AuthStore {
                 id: profile.id,
                 name: profile.name.clone(),
                 profile_type: profile.kind.profile_type(),
-                status: profile.kind.status(),
+                status: ({
+                    let (inlined_self,): (&StoredProfileKind,) = (&(profile.kind),);
+                    {
+                        match inlined_self {
+                            StoredProfileKind::AzureInteractive(profile) => match &profile.token {
+                                Some(token)
+                                    if ((token).expires_at
+                                        > std::time::Instant::now()
+                                            + std::time::Duration::from_secs(60)) =>
+                                {
+                                    "Signed in".to_owned()
+                                }
+                                Some(_) => "Token expired; refresh available".to_owned(),
+                                None => "Sign-in required".to_owned(),
+                            },
+                            StoredProfileKind::AzureClientCredentials(profile) => {
+                                match &profile.token {
+                                    Some(token)
+                                        if ((token).expires_at
+                                            > std::time::Instant::now()
+                                                + std::time::Duration::from_secs(60)) =>
+                                    {
+                                        "Token cached".to_owned()
+                                    }
+                                    _ => "Token acquired when sent".to_owned(),
+                                }
+                            }
+                            StoredProfileKind::BrowserCookies(profile) => {
+                                match &profile.captured_for {
+                                    Some(target) => format!(
+                                        "{} cookies captured for {target}",
+                                        profile.cookies.len()
+                                    ),
+                                    None => "Cookie capture required".to_owned(),
+                                }
+                            }
+                            StoredProfileKind::ManualCookie(_) => "Ready".to_owned(),
+                            StoredProfileKind::ClientCertificate(profile) => {
+                                format!("Ready — {}", profile.certificate.subject)
+                            }
+                        }
+                    }
+                }),
             })
             .collect()
     }
@@ -363,7 +386,10 @@ impl AuthStore {
                 StoredProfileKind::AzureInteractive(AzureInteractiveProfile {
                     tenant: input.tenant.trim().to_owned(),
                     client_id: input.client_id.trim().to_owned(),
-                    scopes: normalize_scopes(&input.scopes),
+                    scopes: (&input.scopes)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
                     token: None,
                 })
             }
@@ -372,7 +398,10 @@ impl AuthStore {
                 if input.client_secret.is_empty() {
                     return Err("Client secret is required".to_owned());
                 }
-                let scope = normalize_scopes(&input.scopes);
+                let scope = (&input.scopes)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 if scope.split_whitespace().count() != 1 || !scope.ends_with("/.default") {
                     return Err(
                         "Client credentials require one scope ending in /.default".to_owned()
@@ -437,7 +466,42 @@ impl AuthStore {
                 .find(|profile| profile.id == id)
                 .ok_or_else(|| "Authentication profile no longer exists".to_owned())?;
             profile.name = name;
-            if same_configuration(&profile.kind, &kind) {
+            if {
+                let (current, replacement): (&StoredProfileKind, &StoredProfileKind) =
+                    (&profile.kind, &kind);
+
+                match (current, replacement) {
+                    (
+                        StoredProfileKind::AzureInteractive(a),
+                        StoredProfileKind::AzureInteractive(b),
+                    ) => a.tenant == b.tenant && a.client_id == b.client_id && a.scopes == b.scopes,
+                    (
+                        StoredProfileKind::AzureClientCredentials(a),
+                        StoredProfileKind::AzureClientCredentials(b),
+                    ) => {
+                        a.tenant == b.tenant
+                            && a.client_id == b.client_id
+                            && a.client_secret.as_str() == b.client_secret.as_str()
+                            && a.scope == b.scope
+                    }
+                    (
+                        StoredProfileKind::BrowserCookies(a),
+                        StoredProfileKind::BrowserCookies(b),
+                    ) => a.login_url == b.login_url && a.host_scope == b.host_scope,
+                    (StoredProfileKind::ManualCookie(a), StoredProfileKind::ManualCookie(b)) => {
+                        a.host_scope == b.host_scope && a.cookie.as_str() == b.cookie.as_str()
+                    }
+                    (
+                        StoredProfileKind::ClientCertificate(a),
+                        StoredProfileKind::ClientCertificate(b),
+                    ) => {
+                        a.host_scope == b.host_scope
+                            && a.certificate_chain_path == b.certificate_chain_path
+                            && a.private_key_path == b.private_key_path
+                    }
+                    _ => false,
+                }
+            } {
                 return Ok(id);
             }
             profile.kind = kind;
@@ -503,34 +567,5 @@ impl AuthStore {
         config.cookies = cookies;
         config.captured_for = Some(host);
         Ok(())
-    }
-}
-
-fn same_configuration(current: &StoredProfileKind, replacement: &StoredProfileKind) -> bool {
-    match (current, replacement) {
-        (StoredProfileKind::AzureInteractive(a), StoredProfileKind::AzureInteractive(b)) => {
-            a.tenant == b.tenant && a.client_id == b.client_id && a.scopes == b.scopes
-        }
-        (
-            StoredProfileKind::AzureClientCredentials(a),
-            StoredProfileKind::AzureClientCredentials(b),
-        ) => {
-            a.tenant == b.tenant
-                && a.client_id == b.client_id
-                && a.client_secret.as_str() == b.client_secret.as_str()
-                && a.scope == b.scope
-        }
-        (StoredProfileKind::BrowserCookies(a), StoredProfileKind::BrowserCookies(b)) => {
-            a.login_url == b.login_url && a.host_scope == b.host_scope
-        }
-        (StoredProfileKind::ManualCookie(a), StoredProfileKind::ManualCookie(b)) => {
-            a.host_scope == b.host_scope && a.cookie.as_str() == b.cookie.as_str()
-        }
-        (StoredProfileKind::ClientCertificate(a), StoredProfileKind::ClientCertificate(b)) => {
-            a.host_scope == b.host_scope
-                && a.certificate_chain_path == b.certificate_chain_path
-                && a.private_key_path == b.private_key_path
-        }
-        _ => false,
     }
 }

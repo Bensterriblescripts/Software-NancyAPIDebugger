@@ -30,7 +30,7 @@ pub(super) async fn run(
     headers: HeaderMap,
     addresses: Vec<IpAddr>,
     cancel: CancellationToken,
-    progress: Sender<DiagnosticProgress>,
+    progress: Option<Sender<DiagnosticProgress>>,
     limiter: Option<Arc<ConnectionRateLimiter>>,
     client_certificate: Option<LoadedClientCertificate>,
 ) -> DiagnosticTrace {
@@ -55,7 +55,6 @@ pub(super) async fn run(
             StageStatus::Cancelled,
             tcp_started,
             "Request cancelled".to_owned(),
-            &progress,
         );
     }
     let stream = match selected {
@@ -91,7 +90,6 @@ pub(super) async fn run(
                 status,
                 tcp_started,
                 "All TCP connection attempts failed".to_owned(),
-                &progress,
             );
         }
     };
@@ -113,7 +111,6 @@ pub(super) async fn run(
                     StageStatus::Failed,
                     tls_started,
                     error,
-                    &progress,
                 );
             }
         };
@@ -126,7 +123,6 @@ pub(super) async fn run(
                     StageStatus::Failed,
                     tls_started,
                     error.to_string(),
-                    &progress,
                 );
             }
         };
@@ -166,7 +162,6 @@ pub(super) async fn run(
                     StageStatus::Failed,
                     tls_started,
                     error.to_string(),
-                    &progress,
                 );
             }
             Err(WaitError::TimedOut) => {
@@ -177,7 +172,6 @@ pub(super) async fn run(
                     StageStatus::TimedOut,
                     tls_started,
                     "TLS handshake timed out".to_owned(),
-                    &progress,
                 );
             }
             Err(WaitError::Cancelled) => {
@@ -188,7 +182,6 @@ pub(super) async fn run(
                     StageStatus::Cancelled,
                     tls_started,
                     "Request cancelled".to_owned(),
-                    &progress,
                 );
             }
         }
@@ -205,7 +198,48 @@ pub(super) async fn run(
         IoStream::Plain(stream)
     };
 
-    let version = select_http_version(&trace, &io);
+    let version = {
+        let (trace, io): (&DiagnosticTrace, &IoStream) = (&trace, &io);
+        let inlined_result: Result<Version, String> = {
+            let negotiated = match io {
+                IoStream::Tls(stream) => stream
+                    .get_ref()
+                    .1
+                    .alpn_protocol()
+                    .map(|value| value.to_vec()),
+                IoStream::Plain(_) => None,
+            };
+            match trace.request.protocol {
+                ProtocolPreference::Auto => Ok(if negotiated.as_deref() == Some(b"h2") {
+                    Version::HTTP_2
+                } else {
+                    Version::HTTP_11
+                }),
+                ProtocolPreference::Http11 => {
+                    if negotiated
+                        .as_deref()
+                        .is_some_and(|value| value != b"http/1.1")
+                    {
+                        Err(format!(
+                            "Server negotiated unexpected ALPN: {:?}",
+                            negotiated
+                        ))
+                    } else {
+                        Ok(Version::HTTP_11)
+                    }
+                }
+                ProtocolPreference::Http2 => {
+                    if trace.url.scheme == "https" && negotiated.as_deref() != Some(b"h2") {
+                        Err("Server did not negotiate HTTP/2".to_owned())
+                    } else {
+                        Ok(Version::HTTP_2)
+                    }
+                }
+                ProtocolPreference::Http3 => Ok(Version::HTTP_3),
+            }
+        };
+        inlined_result
+    };
     if let Err(error) = &version {
         let started = begin_stage(&mut trace, StageKind::HttpHeaders, &progress);
         return fail_trace(
@@ -214,7 +248,6 @@ pub(super) async fn run(
             StageStatus::Failed,
             started,
             error.clone(),
-            &progress,
         );
     }
     let version = version.unwrap();
@@ -225,7 +258,7 @@ pub(super) async fn run(
         "Actual transmitted HTTP/1.1 header bytes".to_owned()
     };
     let request = match build_request(&trace, method, headers, version) {
-        Ok(request) => request,
+        Ok(request) => request.map(|()| Full::new(Bytes::from_owner(trace.request.body.clone()))),
         Err(error) => {
             let started = begin_stage(&mut trace, StageKind::HttpHeaders, &progress);
             return fail_trace(
@@ -234,7 +267,6 @@ pub(super) async fn run(
                 StageStatus::Failed,
                 started,
                 error,
-                &progress,
             );
         }
     };
@@ -242,18 +274,104 @@ pub(super) async fn run(
 
     let headers_started = begin_stage(&mut trace, StageKind::HttpHeaders, &progress);
     let response = if version == Version::HTTP_2 {
-        execute_http2(io, request, trace.request.timeouts.headers, &cancel).await
+        ({
+            let (io, request, timeout, cancel): (
+                IoStream,
+                Request<Full<Bytes>>,
+                Duration,
+                &CancellationToken,
+            ) = (io, request, trace.request.timeouts.headers, &cancel);
+            async move {
+                let io = TokioIo::new(io);
+                let operation = async {
+                    let (mut sender, connection) =
+                        hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+                            .handshake(io)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    sender
+                        .send_request(request)
+                        .await
+                        .map_err(|error| error.to_string())
+                };
+                match wait_for(timeout, cancel, operation).await {
+                    Ok(Ok(response)) => Ok(response),
+                    Ok(Err(error)) => Err((StageStatus::Failed, error)),
+                    Err(WaitError::TimedOut) => Err((
+                        StageStatus::TimedOut,
+                        "HTTP header stage timed out".to_owned(),
+                    )),
+                    Err(WaitError::Cancelled) => {
+                        Err((StageStatus::Cancelled, "Request cancelled".to_owned()))
+                    }
+                }
+            }
+        })
+        .await
     } else {
         let writes = Arc::new(Mutex::new(Vec::new()));
-        let response = execute_http1(
-            io,
-            request,
-            trace.request.timeouts.headers,
-            &cancel,
-            writes.clone(),
-        )
+        let response = ({
+            let (io, request, timeout, cancel, writes): (
+                IoStream,
+                Request<Full<Bytes>>,
+                Duration,
+                &CancellationToken,
+                Arc<Mutex<Vec<u8>>>,
+            ) = (
+                io,
+                request,
+                trace.request.timeouts.headers,
+                &cancel,
+                writes.clone(),
+            );
+            async move {
+                let io = TokioIo::new(RecordingIo { inner: io, writes });
+                let operation = async {
+                    let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    sender
+                        .send_request(request)
+                        .await
+                        .map_err(|error| error.to_string())
+                };
+                match wait_for(timeout, cancel, operation).await {
+                    Ok(Ok(response)) => Ok(response),
+                    Ok(Err(error)) => Err((StageStatus::Failed, error)),
+                    Err(WaitError::TimedOut) => Err((
+                        StageStatus::TimedOut,
+                        "HTTP header stage timed out".to_owned(),
+                    )),
+                    Err(WaitError::Cancelled) => {
+                        Err((StageStatus::Cancelled, "Request cancelled".to_owned()))
+                    }
+                }
+            }
+        })
         .await;
-        trace.http.actual_http1_request_headers = captured_http1_headers(&writes);
+        trace.http.actual_http1_request_headers = {
+            let (writes,): (&Arc<Mutex<Vec<u8>>>,) = (&writes,);
+            {
+                'inlined_captured_http1_headers: {
+                    let writes = writes.lock().unwrap();
+                    let end = match writes
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    {
+                        Some(value) => value,
+                        None => break 'inlined_captured_http1_headers None,
+                    };
+                    Some(Arc::from(&writes[..end]))
+                }
+            }
+        };
         response
     };
     let response = match response {
@@ -265,11 +383,20 @@ pub(super) async fn run(
                 status,
                 headers_started,
                 error,
-                &progress,
             );
         }
     };
-    apply_response_headers(&mut trace, &response);
+    ({
+        let (trace, response): (&mut DiagnosticTrace, &http::Response<Incoming>) =
+            (&mut trace, &response);
+
+        apply_response_parts(
+            trace,
+            response.status(),
+            response.version(),
+            response.headers(),
+        );
+    });
     let status_text = trace.status_text();
     finish_stage(
         &mut trace,
@@ -282,123 +409,12 @@ pub(super) async fn run(
     read_hyper_body(trace, response.into_body(), cancel, progress).await
 }
 
-async fn execute_http1(
-    io: IoStream,
-    request: Request<Full<Bytes>>,
-    timeout: Duration,
-    cancel: &CancellationToken,
-    writes: Arc<Mutex<Vec<u8>>>,
-) -> Result<http::Response<Incoming>, (StageStatus, String)> {
-    let io = TokioIo::new(RecordingIo { inner: io, writes });
-    let operation = async {
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
-            .await
-            .map_err(|error| error.to_string())?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        sender
-            .send_request(request)
-            .await
-            .map_err(|error| error.to_string())
-    };
-    match wait_for(timeout, cancel, operation).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) => Err((StageStatus::Failed, error)),
-        Err(WaitError::TimedOut) => Err((
-            StageStatus::TimedOut,
-            "HTTP header stage timed out".to_owned(),
-        )),
-        Err(WaitError::Cancelled) => Err((StageStatus::Cancelled, "Request cancelled".to_owned())),
-    }
-}
-
-fn captured_http1_headers(writes: &Arc<Mutex<Vec<u8>>>) -> Option<Arc<[u8]>> {
-    let writes = writes.lock().unwrap();
-    let end = writes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| position + 4)?;
-    Some(Arc::from(&writes[..end]))
-}
-
-async fn execute_http2(
-    io: IoStream,
-    request: Request<Full<Bytes>>,
-    timeout: Duration,
-    cancel: &CancellationToken,
-) -> Result<http::Response<Incoming>, (StageStatus, String)> {
-    let io = TokioIo::new(io);
-    let operation = async {
-        let (mut sender, connection) =
-            hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-                .handshake(io)
-                .await
-                .map_err(|error| error.to_string())?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        sender
-            .send_request(request)
-            .await
-            .map_err(|error| error.to_string())
-    };
-    match wait_for(timeout, cancel, operation).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) => Err((StageStatus::Failed, error)),
-        Err(WaitError::TimedOut) => Err((
-            StageStatus::TimedOut,
-            "HTTP header stage timed out".to_owned(),
-        )),
-        Err(WaitError::Cancelled) => Err((StageStatus::Cancelled, "Request cancelled".to_owned())),
-    }
-}
-
-fn select_http_version(trace: &DiagnosticTrace, io: &IoStream) -> Result<Version, String> {
-    let negotiated = match io {
-        IoStream::Tls(stream) => stream
-            .get_ref()
-            .1
-            .alpn_protocol()
-            .map(|value| value.to_vec()),
-        IoStream::Plain(_) => None,
-    };
-    match trace.request.protocol {
-        ProtocolPreference::Auto => Ok(if negotiated.as_deref() == Some(b"h2") {
-            Version::HTTP_2
-        } else {
-            Version::HTTP_11
-        }),
-        ProtocolPreference::Http11 => {
-            if negotiated
-                .as_deref()
-                .is_some_and(|value| value != b"http/1.1")
-            {
-                Err(format!(
-                    "Server negotiated unexpected ALPN: {:?}",
-                    negotiated
-                ))
-            } else {
-                Ok(Version::HTTP_11)
-            }
-        }
-        ProtocolPreference::Http2 => {
-            if trace.url.scheme == "https" && negotiated.as_deref() != Some(b"h2") {
-                Err("Server did not negotiate HTTP/2".to_owned())
-            } else {
-                Ok(Version::HTTP_2)
-            }
-        }
-        ProtocolPreference::Http3 => Ok(Version::HTTP_3),
-    }
-}
-
 pub(super) fn build_request(
     trace: &DiagnosticTrace,
     method: Method,
     mut headers: HeaderMap,
     version: Version,
-) -> Result<Request<Full<Bytes>>, String> {
+) -> Result<Request<()>, String> {
     let uri = if version == Version::HTTP_11 {
         Uri::from_str(&trace.url.path_and_query)
     } else {
@@ -412,7 +428,7 @@ pub(super) fn build_request(
         .method(method)
         .uri(uri)
         .version(version)
-        .body(Full::new(Bytes::copy_from_slice(&trace.request.body)))
+        .body(())
         .map_err(|error| error.to_string())?;
     *request.headers_mut() = headers;
     Ok(request)
@@ -450,7 +466,22 @@ pub(super) fn add_automatic_headers(
     user_agent: UserAgentPreset,
 ) {
     if !headers.contains_key(HOST)
-        && let Ok(value) = HeaderValue::from_str(&authority(url))
+        && let Ok(value) = HeaderValue::from_str(
+            &({
+                let (url,): (&Url,) = (url,);
+                {
+                    let host = match url.host() {
+                        Some(url::Host::Ipv6(ip)) => format!("[{ip}]"),
+                        Some(host) => host.to_string(),
+                        None => String::new(),
+                    };
+                    match url.port() {
+                        Some(port) => format!("{host}:{port}"),
+                        None => host,
+                    }
+                }
+            }),
+        )
     {
         headers.insert(HOST, value);
     }
@@ -463,18 +494,6 @@ pub(super) fn add_automatic_headers(
         && let Some(value) = user_agent.header_value()
     {
         headers.insert(USER_AGENT, HeaderValue::from_static(value));
-    }
-}
-
-fn authority(url: &Url) -> String {
-    let host = match url.host() {
-        Some(url::Host::Ipv6(ip)) => format!("[{ip}]"),
-        Some(host) => host.to_string(),
-        None => String::new(),
-    };
-    match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host,
     }
 }
 
@@ -499,7 +518,23 @@ pub(super) fn request_headers_for_version(
             },
             HeaderTrace {
                 name: ":authority".to_owned(),
-                value: authority_from_trace(trace).into_bytes(),
+                value: ({
+                    let (trace,): (&DiagnosticTrace,) = (trace,);
+                    {
+                        let host = if trace.url.host.contains(':') {
+                            format!("[{}]", trace.url.host)
+                        } else {
+                            trace.url.host.clone()
+                        };
+                        let default_port = if trace.url.scheme == "https" { 443 } else { 80 };
+                        if trace.url.port == default_port {
+                            host
+                        } else {
+                            format!("{host}:{}", trace.url.port)
+                        }
+                    }
+                })
+                .into_bytes(),
                 pseudo: true,
             },
             HeaderTrace {
@@ -509,45 +544,19 @@ pub(super) fn request_headers_for_version(
             },
         ]);
     }
-    result.extend(header_map_to_trace(headers).into_iter().filter(|header| {
-        !(matches!(version, Version::HTTP_2 | Version::HTTP_3)
-            && header.name.eq_ignore_ascii_case("host"))
-    }));
-    result
-}
-
-fn authority_from_trace(trace: &DiagnosticTrace) -> String {
-    let host = if trace.url.host.contains(':') {
-        format!("[{}]", trace.url.host)
-    } else {
-        trace.url.host.clone()
-    };
-    let default_port = if trace.url.scheme == "https" { 443 } else { 80 };
-    if trace.url.port == default_port {
-        host
-    } else {
-        format!("{host}:{}", trace.url.port)
-    }
-}
-
-pub(super) fn header_map_to_trace(headers: &HeaderMap) -> Vec<HeaderTrace> {
-    headers
-        .iter()
-        .map(|(name, value)| HeaderTrace {
-            name: name.to_string(),
-            value: value.as_bytes().to_vec(),
-            pseudo: false,
-        })
-        .collect()
-}
-
-fn apply_response_headers(trace: &mut DiagnosticTrace, response: &http::Response<Incoming>) {
-    apply_response_parts(
-        trace,
-        response.status(),
-        response.version(),
-        response.headers(),
+    result.extend(
+        headers
+            .iter()
+            .filter(|(name, _)| {
+                !(matches!(version, Version::HTTP_2 | Version::HTTP_3) && *name == HOST)
+            })
+            .map(|(name, value)| HeaderTrace {
+                name: name.to_string(),
+                value: value.as_bytes().to_vec(),
+                pseudo: false,
+            }),
     );
+    result
 }
 
 pub(super) fn apply_response_parts(
@@ -569,7 +578,14 @@ pub(super) fn apply_response_parts(
         }
         .to_owned(),
     );
-    trace.http.response_headers = header_map_to_trace(headers);
+    trace.http.response_headers = (headers)
+        .iter()
+        .map(|(name, value)| crate::diagnostics::HeaderTrace {
+            name: name.to_string(),
+            value: value.as_bytes().to_vec(),
+            pseudo: false,
+        })
+        .collect::<Vec<_>>();
     trace.body.content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())

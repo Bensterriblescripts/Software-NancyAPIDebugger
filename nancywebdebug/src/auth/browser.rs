@@ -90,7 +90,17 @@ impl ApplicationHandler for CookieBrowser {
                 let target_host = target.host_str().unwrap_or_default().to_ascii_lowercase();
                 let records = cookies
                     .into_iter()
-                    .filter(|cookie| cookie_domain_matches(cookie.domain(), &target_host))
+                    .filter(|cookie| {
+                        let (domain, target_host): (Option<&str>, &str) =
+                            (cookie.domain(), &target_host);
+                        'inlined_cookie_domain_matches: {
+                            let Some(domain) = domain else {
+                                break 'inlined_cookie_domain_matches false;
+                            };
+                            let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+                            target_host == domain || target_host.ends_with(&format!(".{domain}"))
+                        }
+                    })
                     .map(|cookie| CookieRecord {
                         name: cookie.name().to_owned(),
                         value: cookie.value().to_owned(),
@@ -116,14 +126,6 @@ impl ApplicationHandler for CookieBrowser {
         }
         event_loop.exit();
     }
-}
-
-fn cookie_domain_matches(domain: Option<&str>, target_host: &str) -> bool {
-    let Some(domain) = domain else {
-        return false;
-    };
-    let domain = domain.trim_start_matches('.').to_ascii_lowercase();
-    target_host == domain || target_host.ends_with(&format!(".{domain}"))
 }
 
 pub fn run(login_url: String, target_url: String) -> Result<Zeroizing<String>, String> {

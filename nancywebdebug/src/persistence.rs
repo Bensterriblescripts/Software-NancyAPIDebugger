@@ -26,11 +26,149 @@ where
 {
     let directory = data_directory()?;
     let primary = directory.join(filename);
-    let backup = backup_path(&primary);
-    let primary_result = read_validated_json(&primary, max_bytes, &validate);
+    let backup = {
+        let (primary,): (&Path,) = (&primary,);
+        let inlined_result: PathBuf = { PathBuf::from(format!("{}.bak", primary.display())) };
+        inlined_result
+    };
+    let primary_result = {
+        let (path, max_bytes, validate): (&Path, usize, &F) = (&primary, max_bytes, &validate);
+        let inlined_result: Result<T, String> = {
+            'inlined_read_validated_json: {
+                let file = match File::open(path)
+                    .map_err(|error| format!("{}: {error}", path.display()))
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        break 'inlined_read_validated_json Err(::core::convert::From::from(error));
+                    }
+                };
+                let metadata = match file
+                    .metadata()
+                    .map_err(|error| format!("{}: {error}", path.display()))
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        break 'inlined_read_validated_json Err(::core::convert::From::from(error));
+                    }
+                };
+                if metadata.len() > max_bytes as u64 {
+                    break 'inlined_read_validated_json Err(format!(
+                        "{} exceeds the size limit",
+                        path.display()
+                    ));
+                }
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                match file
+                    .take(max_bytes as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| format!("{}: {error}", path.display()))
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        break 'inlined_read_validated_json Err(::core::convert::From::from(error));
+                    }
+                };
+                if bytes.len() > max_bytes {
+                    break 'inlined_read_validated_json Err(format!(
+                        "{} exceeds the size limit",
+                        path.display()
+                    ));
+                }
+                let value = match serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("{} contains invalid JSON: {error}", path.display()))
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        break 'inlined_read_validated_json Err(::core::convert::From::from(error));
+                    }
+                };
+                match validate(&value) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        break 'inlined_read_validated_json Err(::core::convert::From::from(error));
+                    }
+                };
+                Ok(value)
+            }
+        };
+        inlined_result
+    };
     match primary_result {
         Ok(value) => Ok((value, false)),
-        Err(primary_error) => match read_validated_json(&backup, max_bytes, &validate) {
+        Err(primary_error) => match {
+            let (path, max_bytes, validate): (&Path, usize, &F) = (&backup, max_bytes, &validate);
+            let inlined_result: Result<T, String> = {
+                'inlined_read_validated_json: {
+                    let file = match File::open(path)
+                        .map_err(|error| format!("{}: {error}", path.display()))
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            break 'inlined_read_validated_json Err(::core::convert::From::from(
+                                error,
+                            ));
+                        }
+                    };
+                    let metadata = match file
+                        .metadata()
+                        .map_err(|error| format!("{}: {error}", path.display()))
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            break 'inlined_read_validated_json Err(::core::convert::From::from(
+                                error,
+                            ));
+                        }
+                    };
+                    if metadata.len() > max_bytes as u64 {
+                        break 'inlined_read_validated_json Err(format!(
+                            "{} exceeds the size limit",
+                            path.display()
+                        ));
+                    }
+                    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                    match file
+                        .take(max_bytes as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(|error| format!("{}: {error}", path.display()))
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            break 'inlined_read_validated_json Err(::core::convert::From::from(
+                                error,
+                            ));
+                        }
+                    };
+                    if bytes.len() > max_bytes {
+                        break 'inlined_read_validated_json Err(format!(
+                            "{} exceeds the size limit",
+                            path.display()
+                        ));
+                    }
+                    let value = match serde_json::from_slice(&bytes).map_err(|error| {
+                        format!("{} contains invalid JSON: {error}", path.display())
+                    }) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            break 'inlined_read_validated_json Err(::core::convert::From::from(
+                                error,
+                            ));
+                        }
+                    };
+                    match validate(&value) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            break 'inlined_read_validated_json Err(::core::convert::From::from(
+                                error,
+                            ));
+                        }
+                    };
+                    Ok(value)
+                }
+            };
+            inlined_result
+        } {
             Ok(value) => Ok((value, true)),
             Err(backup_error) => Err(format!(
                 "primary cache unavailable ({primary_error}); backup cache unavailable ({backup_error})"
@@ -55,7 +193,11 @@ pub(crate) fn write_json_with_backup<T: Serialize>(
     }
     let directory = data_directory()?;
     let primary = directory.join(filename);
-    let backup = backup_path(&primary);
+    let backup = {
+        let (primary,): (&Path,) = (&primary,);
+        let inlined_result: PathBuf = { PathBuf::from(format!("{}.bak", primary.display())) };
+        inlined_result
+    };
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -91,33 +233,4 @@ pub(crate) fn write_json_with_backup<T: Serialize>(
         let _ = fs::remove_file(&temporary);
     }
     result
-}
-
-fn read_validated_json<T, F>(path: &Path, max_bytes: usize, validate: &F) -> Result<T, String>
-where
-    T: DeserializeOwned,
-    F: Fn(&T) -> Result<(), String>,
-{
-    let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    if metadata.len() > max_bytes as u64 {
-        return Err(format!("{} exceeds the size limit", path.display()));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    if bytes.len() > max_bytes {
-        return Err(format!("{} exceeds the size limit", path.display()));
-    }
-    let value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("{} contains invalid JSON: {error}", path.display()))?;
-    validate(&value)?;
-    Ok(value)
-}
-
-fn backup_path(primary: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.bak", primary.display()))
 }

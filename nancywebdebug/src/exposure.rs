@@ -40,6 +40,8 @@ mod asset_dns;
 mod browser_policy;
 #[path = "crawl.rs"]
 mod crawl;
+#[path = "endpoint_health.rs"]
+pub(crate) mod endpoint_health;
 #[path = "fingerprints.rs"]
 pub(crate) mod fingerprints;
 #[path = "javascript.rs"]
@@ -393,64 +395,113 @@ struct EndpointCookieJar {
 
 impl EndpointCookieJar {
     fn observe_response(&mut self, url: &Url, response: &HttpObservation) {
-        for header in header_values(response, "set-cookie") {
+        for header in {
+            let (response, name): (&crate::HttpObservation, &str) = (response, "set-cookie");
+            response
+                .headers
+                .iter()
+                .filter(move |(header, _)| header.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        } {
             if let Some(cookie) = parse_set_cookie(url, header) {
-                self.store(cookie);
+                ({
+                    let (inlined_self, cookie): (&mut EndpointCookieJar, ParsedSetCookie) =
+                        (&mut *self, cookie);
+                    'inlined_store: {
+                        inlined_self.remove_expired();
+                        if cookie.secure && cookie.source_scheme != "https" {
+                            break 'inlined_store;
+                        }
+                        if cookie.source_scheme != "https"
+                            && inlined_self.cookies.iter().any(|existing| {
+                                existing.secure
+                                    && existing.key.name == cookie.key.name
+                                    && existing.key.domain == cookie.key.domain
+                                    && ({
+                                        let (request_path, cookie_path): (&str, &str) =
+                                            (&cookie.key.path, &existing.key.path);
+                                        {
+                                            request_path == cookie_path
+                                                || request_path
+                                                    .strip_prefix(cookie_path)
+                                                    .is_some_and(|suffix| {
+                                                        cookie_path.ends_with('/')
+                                                            || suffix.starts_with('/')
+                                                    })
+                                        }
+                                    })
+                            })
+                        {
+                            break 'inlined_store;
+                        }
+                        inlined_self
+                            .cookies
+                            .retain(|existing| existing.key != cookie.key);
+                        if !cookie.deletion {
+                            inlined_self.cookies.push(StoredCookie {
+                                key: cookie.key,
+                                value: cookie.value,
+                                host_only: cookie.host_only,
+                                secure: cookie.secure,
+                                expires_at: cookie.expires_at,
+                            });
+                        }
+                    }
+                });
             }
         }
     }
 
-    fn store(&mut self, cookie: ParsedSetCookie) {
-        self.remove_expired();
-        if cookie.secure && cookie.source_scheme != "https" {
-            return;
-        }
-        if cookie.source_scheme != "https"
-            && self.cookies.iter().any(|existing| {
-                existing.secure
-                    && existing.key.name == cookie.key.name
-                    && existing.key.domain == cookie.key.domain
-                    && cookie_path_matches(&cookie.key.path, &existing.key.path)
-            })
-        {
-            return;
-        }
-        self.cookies.retain(|existing| existing.key != cookie.key);
-        if !cookie.deletion {
-            self.cookies.push(StoredCookie {
-                key: cookie.key,
-                value: cookie.value,
-                host_only: cookie.host_only,
-                secure: cookie.secure,
-                expires_at: cookie.expires_at,
-            });
-        }
-    }
-
-    fn eligible<'a>(&'a mut self, url: &Url) -> Vec<&'a StoredCookie> {
-        self.remove_expired();
-        let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
-            return Vec::new();
-        };
-        let mut cookies = self
-            .cookies
-            .iter()
-            .filter(|cookie| {
-                (!cookie.secure || url.scheme() == "https")
-                    && if cookie.host_only {
-                        host == cookie.key.domain
-                    } else {
-                        cookie_domain_matches(&host, &cookie.key.domain)
-                    }
-                    && cookie_path_matches(url.path(), &cookie.key.path)
-            })
-            .collect::<Vec<_>>();
-        cookies.sort_by_key(|cookie| std::cmp::Reverse(cookie.key.path.len()));
-        cookies
-    }
-
     fn cookie_header(&mut self, url: &Url) -> Option<String> {
-        let cookies = self.eligible(url);
+        let cookies = {
+            let (inlined_self, url): (&'_ mut EndpointCookieJar, &Url) = (&mut *self, url);
+            let inlined_result: Vec<&'_ StoredCookie> = {
+                'inlined_eligible: {
+                    inlined_self.remove_expired();
+                    let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
+                        break 'inlined_eligible Vec::new();
+                    };
+                    let mut cookies = inlined_self
+                        .cookies
+                        .iter()
+                        .filter(|cookie| {
+                            (!cookie.secure || url.scheme() == "https")
+                                && if cookie.host_only {
+                                    host == cookie.key.domain
+                                } else {
+                                    {
+                                        let (host, domain): (&str, &str) =
+                                            (&host, &cookie.key.domain);
+                                        {
+                                            host.eq_ignore_ascii_case(domain)
+                                                || (host.parse::<IpAddr>().is_err()
+                                                    && host.strip_suffix(domain).is_some_and(
+                                                        |prefix| prefix.ends_with('.'),
+                                                    ))
+                                        }
+                                    }
+                                }
+                                && ({
+                                    let (request_path, cookie_path): (&str, &str) =
+                                        (url.path(), &cookie.key.path);
+                                    {
+                                        request_path == cookie_path
+                                            || request_path.strip_prefix(cookie_path).is_some_and(
+                                                |suffix| {
+                                                    cookie_path.ends_with('/')
+                                                        || suffix.starts_with('/')
+                                                },
+                                            )
+                                    }
+                                })
+                        })
+                        .collect::<Vec<_>>();
+                    cookies.sort_by_key(|cookie| std::cmp::Reverse(cookie.key.path.len()));
+                    cookies
+                }
+            };
+            inlined_result
+        };
         let mut header = String::new();
         for (index, cookie) in cookies.iter().enumerate() {
             if index > 0 {
@@ -463,7 +514,16 @@ impl EndpointCookieJar {
     }
 
     fn remove_expired(&mut self) {
-        let now = unix_timestamp();
+        let now = {
+            let inlined_result: i64 = {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .min(i64::MAX as u64) as i64
+            };
+            inlined_result
+        };
         self.cookies
             .retain(|cookie| cookie.expires_at.is_none_or(|expires| expires > now));
     }
@@ -473,7 +533,43 @@ fn parse_set_cookie(url: &Url, header: &str) -> Option<ParsedSetCookie> {
     let parsed = Cookie::parse(header).ok()?;
     let name = parsed.name().to_owned();
     let value = parsed.value().to_owned();
-    if !valid_cookie_name(&name) || !valid_cookie_value(&value) {
+    if !{
+        let (name,): (&str,) = (&name,);
+
+        !name.is_empty()
+            && name.bytes().all(|byte| {
+                byte.is_ascii()
+                    && !byte.is_ascii_control()
+                    && !matches!(
+                        byte,
+                        b' ' | b'\t'
+                            | b'('
+                            | b')'
+                            | b'<'
+                            | b'>'
+                            | b'@'
+                            | b','
+                            | b';'
+                            | b':'
+                            | b'\\'
+                            | b'"'
+                            | b'/'
+                            | b'['
+                            | b']'
+                            | b'?'
+                            | b'='
+                            | b'{'
+                            | b'}'
+                    )
+            })
+    } || !({
+        let (value,): (&str,) = (&value,);
+        {
+            value.bytes().all(
+                |byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e),
+            )
+        }
+    }) {
         return None;
     }
     let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
@@ -484,7 +580,18 @@ fn parse_set_cookie(url: &Url, header: &str) -> Option<ParsedSetCookie> {
                 .trim_start_matches('.')
                 .trim_end_matches('.')
                 .to_ascii_lowercase();
-            if domain.is_empty() || !cookie_domain_matches(&host, &domain) {
+            if domain.is_empty()
+                || !({
+                    let (host, domain): (&str, &str) = (&host, &domain);
+                    {
+                        host.eq_ignore_ascii_case(domain)
+                            || (host.parse::<IpAddr>().is_err()
+                                && host
+                                    .strip_suffix(domain)
+                                    .is_some_and(|prefix| prefix.ends_with('.')))
+                    }
+                })
+            {
                 return None;
             }
             (domain, false, true)
@@ -495,8 +602,31 @@ fn parse_set_cookie(url: &Url, header: &str) -> Option<ParsedSetCookie> {
         .path()
         .filter(|path| path.starts_with('/'))
         .map(str::to_owned)
-        .unwrap_or_else(|| default_cookie_path(url.path()));
-    let now = unix_timestamp();
+        .unwrap_or_else(|| {
+            let (request_path,): (&str,) = (url.path(),);
+            {
+                'inlined_default_cookie_path: {
+                    if !request_path.starts_with('/') || request_path.matches('/').count() <= 1 {
+                        break 'inlined_default_cookie_path "/".to_owned();
+                    }
+                    request_path
+                        .rfind('/')
+                        .map(|index| request_path[..index].to_owned())
+                        .filter(|path| !path.is_empty())
+                        .unwrap_or_else(|| "/".to_owned())
+                }
+            }
+        });
+    let now = {
+        let inlined_result: i64 = {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .min(i64::MAX as u64) as i64
+        };
+        inlined_result
+    };
     let max_age = parsed.max_age().map(|age| age.whole_seconds());
     let expires_at = max_age
         .map(|seconds| now.saturating_add(seconds))
@@ -519,75 +649,6 @@ fn parse_set_cookie(url: &Url, header: &str) -> Option<ParsedSetCookie> {
         deletion,
         source_scheme: url.scheme().to_owned(),
     })
-}
-
-fn valid_cookie_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().all(|byte| {
-            byte.is_ascii()
-                && !byte.is_ascii_control()
-                && !matches!(
-                    byte,
-                    b' ' | b'\t'
-                        | b'('
-                        | b')'
-                        | b'<'
-                        | b'>'
-                        | b'@'
-                        | b','
-                        | b';'
-                        | b':'
-                        | b'\\'
-                        | b'"'
-                        | b'/'
-                        | b'['
-                        | b']'
-                        | b'?'
-                        | b'='
-                        | b'{'
-                        | b'}'
-                )
-        })
-}
-
-fn valid_cookie_value(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e))
-}
-
-fn default_cookie_path(request_path: &str) -> String {
-    if !request_path.starts_with('/') || request_path.matches('/').count() <= 1 {
-        return "/".to_owned();
-    }
-    request_path
-        .rfind('/')
-        .map(|index| request_path[..index].to_owned())
-        .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| "/".to_owned())
-}
-
-fn cookie_domain_matches(host: &str, domain: &str) -> bool {
-    host.eq_ignore_ascii_case(domain)
-        || (host.parse::<IpAddr>().is_err()
-            && host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.')))
-}
-
-fn cookie_path_matches(request_path: &str, cookie_path: &str) -> bool {
-    request_path == cookie_path
-        || request_path
-            .strip_prefix(cookie_path)
-            .is_some_and(|suffix| cookie_path.ends_with('/') || suffix.starts_with('/'))
-}
-
-fn unix_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .min(i64::MAX as u64) as i64
 }
 
 #[path = "scan_models.rs"]
@@ -658,6 +719,10 @@ pub async fn run_exposure_scan_with_auth_store(
     cancel: CancellationToken,
     progress: Option<Sender<ExposureScanProgress>>,
 ) -> ExposureScanReport {
+    endpoint_health::scope({
+let (request, auth_store, cancel, progress,): (ExposureScanRequest, SharedAuthStore, CancellationToken, Option < Sender < ExposureScanProgress > >,) = (request, auth_store, cancel, progress,);
+async move {
+
     fingerprints::ensure_initialized().await;
     let total_started = Instant::now();
     let parsed = match request
@@ -666,15 +731,157 @@ pub async fn run_exposure_scan_with_auth_store(
     {
         Ok(parsed) => parsed,
         Err(error) => {
-            let mut report = failed_report(request, error, total_started);
-            finish_report(&mut report, total_started, &progress);
-            send_progress(&progress, || {
+            let mut report = {
+let (request, error, started,): (ExposureScanRequest, String, Instant,) = (request, error, total_started,);
+{
+
+    ExposureScanReport {
+        request,
+        hostname: String::new(),
+        supplied_port: None,
+        resolved_addresses: Vec::new(),
+        ignored_addresses: Vec::new(),
+        warnings: Vec::new(),
+        endpoint_health: Vec::new(),
+        endpoints: Vec::new(),
+        udp_endpoints: Vec::new(),
+        service_access: Vec::new(),
+        discovered_assets: Vec::new(),
+        dns_observations: Vec::new(),
+        stream_observations: Vec::new(),
+        findings: Vec::new(),
+        security_checks: Vec::new(),
+        crawl_observed_web_surfaces: Vec::new(),
+        crawl_origins: Vec::new(),
+        crawled_resources: Vec::new(),
+        crawl_forms: Vec::new(),
+        crawl_contacts: Vec::new(),
+        crawl_external_indicators: Vec::new(),
+        crawl_skipped_urls: Vec::new(),
+        timings: ExposureScanTimings {
+            total_ms: ({
+
+let inlined_result: f64 = {
+
+    started.elapsed().as_secs_f64() * 1000.0
+
+};
+inlined_result
+}),
+            ..Default::default()
+        },
+        status: ExposureScanStatus::Failed,
+        error: Some(error),
+    }
+
+}
+
+};
+            ({
+let (report, started, progress,): (& mut ExposureScanReport, Instant, & Option < Sender < ExposureScanProgress > >,) = (&mut report, total_started, &progress,);
+
+    report.endpoint_health = endpoint_health::observations();
+    for endpoint in &mut report.endpoints {
+        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
+            let reason = endpoint_health::STOP_REASON.to_owned();
+            if !endpoint.evidence.contains(&reason) {
+                endpoint.evidence.push(reason);
+            }
+        }
+    }
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Running,
+        0.0,
+        "Building security summary",
+    );
+    report.security_checks = report
+        .endpoints
+        .iter()
+        .flat_map(|endpoint| endpoint.security_checks.iter().cloned())
+        .collect();
+    report.security_checks.sort_by(|left, right| {
+        left.ip
+            .cmp(&right.ip)
+            .then(left.port.cmp(&right.port))
+            .then(left.class.cmp(&right.class))
+            .then(left.check_id.cmp(&right.check_id))
+            .then(left.probe_url.cmp(&right.probe_url))
+    });
+    report.security_checks.dedup_by(|left, right| {
+        left.ip == right.ip
+            && left.port == right.port
+            && left.check_id == right.check_id
+            && left.probe_url == right.probe_url
+    });
+    report.findings.extend(
+        report
+            .security_checks
+            .iter()
+            .filter(|check| check.outcome == CheckOutcome::Vulnerable)
+            .map(|check| ExposureFinding {
+                title: check.title.clone(),
+                description: format!(
+                    "The {} security check confirmed the tested condition",
+                    check.class
+                ),
+                ip: check.ip,
+                port: check.port,
+                transport: TransportProtocol::Tcp,
+                evidence: check.evidence.clone(),
+                component_kind: None,
+            }),
+    );
+    let crawl_findings = std::mem::take(&mut report.findings);
+    let mut findings =
+        build_security_summary(&report.endpoints, report.request.security_operations)
+            .into_iter()
+            .map(|finding| (({ let finding = &finding; (finding.ip, finding.port, finding.transport, finding.title.clone()) }), finding))
+            .collect::<BTreeMap<_, _>>();
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Running,
+        0.65,
+        "Assembling report findings",
+    );
+    for finding in crawl_findings {
+        add_security_summary_finding(&mut findings, finding);
+    }
+    report.findings = findings.into_values().collect();
+    report.timings.total_ms = {
+
+let inlined_result: f64 = {
+
+    started.elapsed().as_secs_f64() * 1000.0
+
+};
+inlined_result
+};
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Complete,
+        1.0,
+        "Report assembled",
+    );
+
+});
+            ({
+let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
                 ExposureScanProgress::Completed(report.clone())
-            });
+            },);
+
+    if let Some(progress) = progress {
+        let _ = progress.send(event());
+    }
+
+});
             return report;
         }
     };
-    if !request.web_probe_level.active() {
+    if !matches!( request.web_probe_level, crate::WebProbeLevel::Active | crate::WebProbeLevel::StateChanging) {
         send_phase_progress(
             &progress,
             ExposureScanPhase::ActiveWebAssessment,
@@ -717,9 +924,16 @@ pub async fn run_exposure_scan_with_auth_store(
             );
         }
     }
-    send_progress(&progress, || ExposureScanProgress::Resolving {
+    ({
+let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || ExposureScanProgress::Resolving {
         target: parsed.hostname.clone(),
-    });
+    },);
+
+    if let Some(progress) = progress {
+        let _ = progress.send(event());
+    }
+
+});
     let mut report = ExposureScanReport {
         request,
         hostname: parsed.hostname,
@@ -727,6 +941,7 @@ pub async fn run_exposure_scan_with_auth_store(
         resolved_addresses: Vec::new(),
         ignored_addresses: Vec::new(),
         warnings: Vec::new(),
+        endpoint_health: Vec::new(),
         endpoints: Vec::new(),
         udp_endpoints: Vec::new(),
         service_access: Vec::new(),
@@ -762,10 +977,107 @@ pub async fn run_exposure_scan_with_auth_store(
             Err(error) => {
                 report.status = ExposureScanStatus::Failed;
                 report.error = Some(error);
-                finish_report(&mut report, total_started, &progress);
-                send_progress(&progress, || {
+                ({
+let (report, started, progress,): (& mut ExposureScanReport, Instant, & Option < Sender < ExposureScanProgress > >,) = (&mut report, total_started, &progress,);
+
+    report.endpoint_health = endpoint_health::observations();
+    for endpoint in &mut report.endpoints {
+        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
+            let reason = endpoint_health::STOP_REASON.to_owned();
+            if !endpoint.evidence.contains(&reason) {
+                endpoint.evidence.push(reason);
+            }
+        }
+    }
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Running,
+        0.0,
+        "Building security summary",
+    );
+    report.security_checks = report
+        .endpoints
+        .iter()
+        .flat_map(|endpoint| endpoint.security_checks.iter().cloned())
+        .collect();
+    report.security_checks.sort_by(|left, right| {
+        left.ip
+            .cmp(&right.ip)
+            .then(left.port.cmp(&right.port))
+            .then(left.class.cmp(&right.class))
+            .then(left.check_id.cmp(&right.check_id))
+            .then(left.probe_url.cmp(&right.probe_url))
+    });
+    report.security_checks.dedup_by(|left, right| {
+        left.ip == right.ip
+            && left.port == right.port
+            && left.check_id == right.check_id
+            && left.probe_url == right.probe_url
+    });
+    report.findings.extend(
+        report
+            .security_checks
+            .iter()
+            .filter(|check| check.outcome == CheckOutcome::Vulnerable)
+            .map(|check| ExposureFinding {
+                title: check.title.clone(),
+                description: format!(
+                    "The {} security check confirmed the tested condition",
+                    check.class
+                ),
+                ip: check.ip,
+                port: check.port,
+                transport: TransportProtocol::Tcp,
+                evidence: check.evidence.clone(),
+                component_kind: None,
+            }),
+    );
+    let crawl_findings = std::mem::take(&mut report.findings);
+    let mut findings =
+        build_security_summary(&report.endpoints, report.request.security_operations)
+            .into_iter()
+            .map(|finding| (({ let finding = &finding; (finding.ip, finding.port, finding.transport, finding.title.clone()) }), finding))
+            .collect::<BTreeMap<_, _>>();
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Running,
+        0.65,
+        "Assembling report findings",
+    );
+    for finding in crawl_findings {
+        add_security_summary_finding(&mut findings, finding);
+    }
+    report.findings = findings.into_values().collect();
+    report.timings.total_ms = {
+
+let inlined_result: f64 = {
+
+    started.elapsed().as_secs_f64() * 1000.0
+
+};
+inlined_result
+};
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Complete,
+        1.0,
+        "Report assembled",
+    );
+
+});
+                ({
+let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
                     ExposureScanProgress::Completed(report.clone())
-                });
+                },);
+
+    if let Some(progress) = progress {
+        let _ = progress.send(event());
+    }
+
+});
                 return report;
             }
         },
@@ -804,23 +1116,235 @@ pub async fn run_exposure_scan_with_auth_store(
         _ = cancel.cancelled() => Err("Scan cancelled during name resolution".to_owned()),
         result = resolve_host(&report.hostname, &mut dns) => result,
     };
-    report.timings.resolution_ms = elapsed_ms(resolution_started);
+    report.timings.resolution_ms = {
+let (started,): (Instant,) = (resolution_started,);
+let inlined_result: f64 = {
+
+    started.elapsed().as_secs_f64() * 1000.0
+
+};
+inlined_result
+};
+    let limiter = Arc::new(ConnectionRateLimiter::new(
+        request.connection_starts_per_second,
+    ));
+    if request.dns_assessment {
+        let (observations, warnings) = asset_dns::assess_dns(
+            &report.hostname, request, &cancel, limiter.as_ref(), &progress,
+        ).await;
+        report.dns_observations = observations;
+        report.warnings.extend(warnings);
+    }
     if cancel.is_cancelled() {
         report.status = ExposureScanStatus::Cancelled;
         report.error = Some("Scan cancelled".to_owned());
-        finish_report(&mut report, total_started, &progress);
-        send_progress(&progress, || {
+        ({
+let (report, started, progress,): (& mut ExposureScanReport, Instant, & Option < Sender < ExposureScanProgress > >,) = (&mut report, total_started, &progress,);
+
+    report.endpoint_health = endpoint_health::observations();
+    for endpoint in &mut report.endpoints {
+        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
+            let reason = endpoint_health::STOP_REASON.to_owned();
+            if !endpoint.evidence.contains(&reason) {
+                endpoint.evidence.push(reason);
+            }
+        }
+    }
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Running,
+        0.0,
+        "Building security summary",
+    );
+    report.security_checks = report
+        .endpoints
+        .iter()
+        .flat_map(|endpoint| endpoint.security_checks.iter().cloned())
+        .collect();
+    report.security_checks.sort_by(|left, right| {
+        left.ip
+            .cmp(&right.ip)
+            .then(left.port.cmp(&right.port))
+            .then(left.class.cmp(&right.class))
+            .then(left.check_id.cmp(&right.check_id))
+            .then(left.probe_url.cmp(&right.probe_url))
+    });
+    report.security_checks.dedup_by(|left, right| {
+        left.ip == right.ip
+            && left.port == right.port
+            && left.check_id == right.check_id
+            && left.probe_url == right.probe_url
+    });
+    report.findings.extend(
+        report
+            .security_checks
+            .iter()
+            .filter(|check| check.outcome == CheckOutcome::Vulnerable)
+            .map(|check| ExposureFinding {
+                title: check.title.clone(),
+                description: format!(
+                    "The {} security check confirmed the tested condition",
+                    check.class
+                ),
+                ip: check.ip,
+                port: check.port,
+                transport: TransportProtocol::Tcp,
+                evidence: check.evidence.clone(),
+                component_kind: None,
+            }),
+    );
+    let crawl_findings = std::mem::take(&mut report.findings);
+    let mut findings =
+        build_security_summary(&report.endpoints, report.request.security_operations)
+            .into_iter()
+            .map(|finding| (({ let finding = &finding; (finding.ip, finding.port, finding.transport, finding.title.clone()) }), finding))
+            .collect::<BTreeMap<_, _>>();
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Running,
+        0.65,
+        "Assembling report findings",
+    );
+    for finding in crawl_findings {
+        add_security_summary_finding(&mut findings, finding);
+    }
+    report.findings = findings.into_values().collect();
+    report.timings.total_ms = {
+
+let inlined_result: f64 = {
+
+    started.elapsed().as_secs_f64() * 1000.0
+
+};
+inlined_result
+};
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Complete,
+        1.0,
+        "Report assembled",
+    );
+
+});
+        ({
+let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
             ExposureScanProgress::Completed(report.clone())
-        });
+        },);
+
+    if let Some(progress) = progress {
+        let _ = progress.send(event());
+    }
+
+});
         return report;
     }
     if let Err(error) = resolution {
         report.status = ExposureScanStatus::Failed;
         report.error = Some(error);
-        finish_report(&mut report, total_started, &progress);
-        send_progress(&progress, || {
+        ({
+let (report, started, progress,): (& mut ExposureScanReport, Instant, & Option < Sender < ExposureScanProgress > >,) = (&mut report, total_started, &progress,);
+
+    report.endpoint_health = endpoint_health::observations();
+    for endpoint in &mut report.endpoints {
+        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
+            let reason = endpoint_health::STOP_REASON.to_owned();
+            if !endpoint.evidence.contains(&reason) {
+                endpoint.evidence.push(reason);
+            }
+        }
+    }
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Running,
+        0.0,
+        "Building security summary",
+    );
+    report.security_checks = report
+        .endpoints
+        .iter()
+        .flat_map(|endpoint| endpoint.security_checks.iter().cloned())
+        .collect();
+    report.security_checks.sort_by(|left, right| {
+        left.ip
+            .cmp(&right.ip)
+            .then(left.port.cmp(&right.port))
+            .then(left.class.cmp(&right.class))
+            .then(left.check_id.cmp(&right.check_id))
+            .then(left.probe_url.cmp(&right.probe_url))
+    });
+    report.security_checks.dedup_by(|left, right| {
+        left.ip == right.ip
+            && left.port == right.port
+            && left.check_id == right.check_id
+            && left.probe_url == right.probe_url
+    });
+    report.findings.extend(
+        report
+            .security_checks
+            .iter()
+            .filter(|check| check.outcome == CheckOutcome::Vulnerable)
+            .map(|check| ExposureFinding {
+                title: check.title.clone(),
+                description: format!(
+                    "The {} security check confirmed the tested condition",
+                    check.class
+                ),
+                ip: check.ip,
+                port: check.port,
+                transport: TransportProtocol::Tcp,
+                evidence: check.evidence.clone(),
+                component_kind: None,
+            }),
+    );
+    let crawl_findings = std::mem::take(&mut report.findings);
+    let mut findings =
+        build_security_summary(&report.endpoints, report.request.security_operations)
+            .into_iter()
+            .map(|finding| (({ let finding = &finding; (finding.ip, finding.port, finding.transport, finding.title.clone()) }), finding))
+            .collect::<BTreeMap<_, _>>();
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Running,
+        0.65,
+        "Assembling report findings",
+    );
+    for finding in crawl_findings {
+        add_security_summary_finding(&mut findings, finding);
+    }
+    report.findings = findings.into_values().collect();
+    report.timings.total_ms = {
+
+let inlined_result: f64 = {
+
+    started.elapsed().as_secs_f64() * 1000.0
+
+};
+inlined_result
+};
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Complete,
+        1.0,
+        "Report assembled",
+    );
+
+});
+        ({
+let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
             ExposureScanProgress::Completed(report.clone())
-        });
+        },);
+
+    if let Some(progress) = progress {
+        let _ = progress.send(event());
+    }
+
+});
         return report;
     }
     let mut seen = HashSet::new();
@@ -841,11 +1365,111 @@ pub async fn run_exposure_scan_with_auth_store(
     if report.resolved_addresses.is_empty() {
         report.status = ExposureScanStatus::Failed;
         report.error = Some("Target has no publicly routable A or AAAA address".to_owned());
-        finish_report(&mut report, total_started, &progress);
-        send_progress(&progress, || {
+        ({
+let (report, started, progress,): (& mut ExposureScanReport, Instant, & Option < Sender < ExposureScanProgress > >,) = (&mut report, total_started, &progress,);
+
+    report.endpoint_health = endpoint_health::observations();
+    for endpoint in &mut report.endpoints {
+        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
+            let reason = endpoint_health::STOP_REASON.to_owned();
+            if !endpoint.evidence.contains(&reason) {
+                endpoint.evidence.push(reason);
+            }
+        }
+    }
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Running,
+        0.0,
+        "Building security summary",
+    );
+    report.security_checks = report
+        .endpoints
+        .iter()
+        .flat_map(|endpoint| endpoint.security_checks.iter().cloned())
+        .collect();
+    report.security_checks.sort_by(|left, right| {
+        left.ip
+            .cmp(&right.ip)
+            .then(left.port.cmp(&right.port))
+            .then(left.class.cmp(&right.class))
+            .then(left.check_id.cmp(&right.check_id))
+            .then(left.probe_url.cmp(&right.probe_url))
+    });
+    report.security_checks.dedup_by(|left, right| {
+        left.ip == right.ip
+            && left.port == right.port
+            && left.check_id == right.check_id
+            && left.probe_url == right.probe_url
+    });
+    report.findings.extend(
+        report
+            .security_checks
+            .iter()
+            .filter(|check| check.outcome == CheckOutcome::Vulnerable)
+            .map(|check| ExposureFinding {
+                title: check.title.clone(),
+                description: format!(
+                    "The {} security check confirmed the tested condition",
+                    check.class
+                ),
+                ip: check.ip,
+                port: check.port,
+                transport: TransportProtocol::Tcp,
+                evidence: check.evidence.clone(),
+                component_kind: None,
+            }),
+    );
+    let crawl_findings = std::mem::take(&mut report.findings);
+    let mut findings =
+        build_security_summary(&report.endpoints, report.request.security_operations)
+            .into_iter()
+            .map(|finding| (({ let finding = &finding; (finding.ip, finding.port, finding.transport, finding.title.clone()) }), finding))
+            .collect::<BTreeMap<_, _>>();
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Running,
+        0.65,
+        "Assembling report findings",
+    );
+    for finding in crawl_findings {
+        add_security_summary_finding(&mut findings, finding);
+    }
+    report.findings = findings.into_values().collect();
+    report.timings.total_ms = {
+
+let inlined_result: f64 = {
+
+    started.elapsed().as_secs_f64() * 1000.0
+
+};
+inlined_result
+};
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Complete,
+        1.0,
+        "Report assembled",
+    );
+
+});
+        ({
+let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
             ExposureScanProgress::Completed(report.clone())
-        });
+        },);
+
+    if let Some(progress) = progress {
+        let _ = progress.send(event());
+    }
+
+});
         return report;
+    }
+    for ip in &report.resolved_addresses {
+        endpoint_health::register(*ip);
     }
     let mut ports = request
         .ports
@@ -858,14 +1482,18 @@ pub async fn run_exposure_scan_with_auth_store(
         ports.sort_unstable();
     }
     let total_endpoints = report.resolved_addresses.len().saturating_mul(ports.len());
-    send_progress(&progress, || ExposureScanProgress::Resolved {
+    ({
+let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || ExposureScanProgress::Resolved {
         public_addresses: report.resolved_addresses.clone(),
         total_endpoints,
-    });
+    },);
+
+    if let Some(progress) = progress {
+        let _ = progress.send(event());
+    }
+
+});
     let scan_started = Instant::now();
-    let limiter = Arc::new(ConnectionRateLimiter::new(
-        request.connection_starts_per_second,
-    ));
     if request.asset_discovery && !cancel.is_cancelled() {
         let (assets, warnings) = asset_dns::discover_assets(
             &report.hostname,
@@ -876,12 +1504,6 @@ pub async fn run_exposure_scan_with_auth_store(
         )
         .await;
         report.discovered_assets = assets;
-        report.warnings.extend(warnings);
-    }
-    if request.dns_assessment && !cancel.is_cancelled() {
-        let (observations, warnings) =
-            asset_dns::assess_dns(&report.hostname, request, &cancel, &progress).await;
-        report.dns_observations = observations;
         report.warnings.extend(warnings);
     }
     send_phase_progress(
@@ -923,11 +1545,18 @@ pub async fn run_exposure_scan_with_auth_store(
         }
         if let Some(endpoint) = pending.next().await {
             completed += 1;
-            send_progress(&progress, || ExposureScanProgress::EndpointCompleted {
+            ({
+let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || ExposureScanProgress::EndpointCompleted {
                 completed,
                 total: total_endpoints,
                 endpoint: endpoint.clone(),
-            });
+            },);
+
+    if let Some(progress) = progress {
+        let _ = progress.send(event());
+    }
+
+});
             send_phase_progress(
                 &progress,
                 ExposureScanPhase::PortScanning,
@@ -984,15 +1613,169 @@ pub async fn run_exposure_scan_with_auth_store(
         report.findings.extend(findings);
     }
     if !cancel.is_cancelled() {
-        run_endpoint_diagnostics(
-            &mut report.endpoints,
-            request,
-            &report.hostname,
-            auth_store,
-            &cancel,
-            limiter.clone(),
-            &progress,
-        )
+        ({
+let (endpoints, request, hostname, auth_store, cancel, limiter, progress,): (& mut [EndpointScan], & ExposureScanRequest, & str, SharedAuthStore, & CancellationToken, Arc < ConnectionRateLimiter >, & Option < Sender < ExposureScanProgress > >,) = (&mut report.endpoints, request, &report.hostname, auth_store, &cancel, limiter.clone(), &progress,);
+async move {
+
+    let jobs = endpoints
+        .iter()
+        .enumerate()
+        .filter_map(|(index, endpoint)| {
+            if endpoint_health::stopped(endpoint.ip, endpoint.port) {
+                return None;
+            }
+            ({
+let (endpoint,): (& EndpointScan,) = (endpoint,);
+{
+
+    if endpoint
+        .http
+        .iter()
+        .any(|observation| observation.url.starts_with("https://"))
+    {
+        Some("https")
+    } else if endpoint
+        .http
+        .iter()
+        .any(|observation| observation.url.starts_with("http://"))
+    {
+        Some("http")
+    } else {
+        None
+    }
+
+}
+
+}).map(|scheme| (index, endpoint.ip, endpoint.port, scheme))
+        })
+        .collect::<Vec<_>>();
+    let total = jobs.len();
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::EndpointDiagnostics,
+        ExposureScanPhaseState::Running,
+        0.0,
+        format!("0 / {total} diagnostics"),
+    );
+    let mut pending = FuturesUnordered::new();
+    let mut next = 0usize;
+    let mut completed = 0usize;
+    loop {
+        while next < jobs.len() && pending.len() < request.concurrency && !cancel.is_cancelled() {
+            let (index, ip, port, scheme) = jobs[next];
+            next += 1;
+            send_phase_progress(
+                progress,
+                ExposureScanPhase::EndpointDiagnostics,
+                ExposureScanPhaseState::Running,
+                completed as f32 / total.max(1) as f32,
+                format!("Diagnosing {scheme}://{hostname}:{port} ({completed}/{total})"),
+            );
+            let diagnostic_request =
+                {
+let (configured, hostname, scheme, port,): (& DiagnosticRequest, & str, & str, u16,) = (&request.diagnostic_request, hostname, scheme, port,);
+let inlined_result: DiagnosticRequest = {
+
+    let mut request = configured.clone();
+    let literal_ip = configured
+        .url
+        .trim()
+        .trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .is_ok();
+    let fallback_url = || {
+        let host = if hostname.contains(':') {
+            format!("[{hostname}]")
+        } else {
+            hostname.to_owned()
+        };
+        Url::parse(&format!("https://{host}/"))
+    };
+    let parsed_url = if literal_ip {
+        fallback_url()
+    } else {
+        Url::parse(&normalize_url_input(&configured.url)).or_else(|_| fallback_url())
+    };
+    if let Ok(mut url) = parsed_url {
+        let _ = url.set_scheme(scheme);
+        let url_hostname = if hostname.contains(':') {
+            format!("[{hostname}]")
+        } else {
+            hostname.to_owned()
+        };
+        let _ = url.set_host(Some(&url_hostname));
+        let _ = url.set_port(Some(port));
+        request.url = url.to_string();
+    }
+    request
+
+};
+inlined_result
+};
+            let auth_store = auth_store.clone();
+            let cancel = cancel.clone();
+            let limiter = limiter.clone();
+            pending.push(async move {
+                let Ok(attempt) = endpoint_health::begin(ip, port, &cancel).await else {
+                    return (index, ip, port, Vec::new());
+                };
+                let monitor = matches!(diagnostic_request.method.as_str(), "GET" | "HEAD");
+                let traces = endpoint_health::inside(run_diagnostic_session_for_exposure(
+                    1,
+                    diagnostic_request,
+                    auth_store,
+                    cancel.clone(),
+                    ip,
+                    limiter,
+                ))
+                .await;
+                if let Some(attempt) = attempt {
+                    let result = if monitor {
+                        traces
+                            .last()
+                            .map(|trace| {
+                                endpoint_health::outcome(
+                                    trace.http.status,
+                                    trace.error.as_ref().map(|error| error.message.as_str()),
+                                )
+                            })
+                            .unwrap_or(endpoint_health::Outcome::Ignored)
+                    } else {
+                        endpoint_health::Outcome::Ignored
+                    };
+                    attempt.finish_http(result, None, &cancel).await;
+                }
+                (index, ip, port, traces)
+            });
+        }
+        let Some((index, ip, port, traces)) = pending.next().await else {
+            break;
+        };
+        endpoints[index].diagnostics = traces;
+        completed += 1;
+        send_phase_progress(
+            progress,
+            ExposureScanPhase::EndpointDiagnostics,
+            ExposureScanPhaseState::Running,
+            completed as f32 / total.max(1) as f32,
+            format!("{completed} / {total} diagnostics — {ip}:{port}"),
+        );
+        if cancel.is_cancelled() {
+            break;
+        }
+    }
+    if !cancel.is_cancelled() {
+        send_phase_progress(
+            progress,
+            ExposureScanPhase::EndpointDiagnostics,
+            ExposureScanPhaseState::Complete,
+            1.0,
+            format!("{completed} / {total} diagnostics"),
+        );
+    }
+
+}
+})
         .await;
     }
     if request.security_operations && !cancel.is_cancelled() {
@@ -1022,7 +1805,7 @@ pub async fn run_exposure_scan_with_auth_store(
             client_certificate.as_ref(),
         )
         .await;
-        if request.web_probe_level.active() && !cancel.is_cancelled() {
+        if matches!( request.web_probe_level, crate::WebProbeLevel::Active | crate::WebProbeLevel::StateChanging) && !cancel.is_cancelled() {
             active_web::run(
                 &mut report.endpoints,
                 &crawl.resources,
@@ -1152,7 +1935,7 @@ pub async fn run_exposure_scan_with_auth_store(
         report.crawl_external_indicators = crawl.external_indicators;
         report.crawl_skipped_urls = crawl.skipped_urls;
     } else if !cancel.is_cancelled() {
-        if request.web_probe_level.active() {
+        if matches!( request.web_probe_level, crate::WebProbeLevel::Active | crate::WebProbeLevel::StateChanging) {
             active_web::run(
                 &mut report.endpoints,
                 &[],
@@ -1177,7 +1960,23 @@ pub async fn run_exposure_scan_with_auth_store(
         ));
         reconcile_web_server_products(&mut report.endpoints);
     }
-    report.timings.scan_ms = elapsed_ms(scan_started);
+    for endpoint in &mut report.endpoints {
+        exposure_probe::product_identification::record_service_results(
+            endpoint,
+            &report.service_access,
+        );
+        exposure_probe::product_identification::record_captured(endpoint);
+        crate::product_catalog::reconcile(endpoint);
+    }
+    report.timings.scan_ms = {
+let (started,): (Instant,) = (scan_started,);
+let inlined_result: f64 = {
+
+    started.elapsed().as_secs_f64() * 1000.0
+
+};
+inlined_result
+};
     report.status = if cancel.is_cancelled() {
         ExposureScanStatus::Cancelled
     } else {
@@ -1186,217 +1985,18 @@ pub async fn run_exposure_scan_with_auth_store(
     if cancel.is_cancelled() {
         report.error = Some("Scan cancelled".to_owned());
     }
-    finish_report(&mut report, total_started, &progress);
-    send_progress(&progress, || {
-        ExposureScanProgress::Completed(report.clone())
-    });
-    report
-}
+    ({
+let (report, started, progress,): (& mut ExposureScanReport, Instant, & Option < Sender < ExposureScanProgress > >,) = (&mut report, total_started, &progress,);
 
-fn public_stream_finding(
-    ip: IpAddr,
-    port: u16,
-    transport: TransportProtocol,
-    protocol: &str,
-    method: &str,
-    mut evidence: Vec<String>,
-) -> ExposureFinding {
-    evidence.insert(0, format!("Handshake method: {method}"));
-    ExposureFinding {
-        title: format!("Public {protocol} endpoint confirmed"),
-        description: format!(
-            "A protocol-valid {protocol} response confirmed a publicly reachable protocol endpoint. The bounded check did not access media, credentials, stream keys, or application content."
-        ),
-        ip,
-        port,
-        transport,
-        evidence,
-        component_kind: None,
-    }
-}
-
-async fn run_endpoint_diagnostics(
-    endpoints: &mut [EndpointScan],
-    request: &ExposureScanRequest,
-    hostname: &str,
-    auth_store: SharedAuthStore,
-    cancel: &CancellationToken,
-    limiter: Arc<ConnectionRateLimiter>,
-    progress: &Option<Sender<ExposureScanProgress>>,
-) {
-    let jobs = endpoints
-        .iter()
-        .enumerate()
-        .filter_map(|(index, endpoint)| {
-            diagnostic_scheme(endpoint).map(|scheme| (index, endpoint.ip, endpoint.port, scheme))
-        })
-        .collect::<Vec<_>>();
-    let total = jobs.len();
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::EndpointDiagnostics,
-        ExposureScanPhaseState::Running,
-        0.0,
-        format!("0 / {total} diagnostics"),
-    );
-    let mut pending = FuturesUnordered::new();
-    let mut next = 0usize;
-    let mut completed = 0usize;
-    loop {
-        while next < jobs.len() && pending.len() < request.concurrency && !cancel.is_cancelled() {
-            let (index, ip, port, scheme) = jobs[next];
-            next += 1;
-            send_phase_progress(
-                progress,
-                ExposureScanPhase::EndpointDiagnostics,
-                ExposureScanPhaseState::Running,
-                completed as f32 / total.max(1) as f32,
-                format!("Diagnosing {scheme}://{hostname}:{port} ({completed}/{total})"),
-            );
-            let diagnostic_request =
-                endpoint_diagnostic_request(&request.diagnostic_request, hostname, scheme, port);
-            let auth_store = auth_store.clone();
-            let cancel = cancel.clone();
-            let limiter = limiter.clone();
-            pending.push(async move {
-                let traces = run_diagnostic_session_for_exposure(
-                    1,
-                    diagnostic_request,
-                    auth_store,
-                    cancel,
-                    ip,
-                    limiter,
-                )
-                .await;
-                (index, ip, port, traces)
-            });
-        }
-        let Some((index, ip, port, traces)) = pending.next().await else {
-            break;
-        };
-        endpoints[index].diagnostics = traces;
-        completed += 1;
-        send_phase_progress(
-            progress,
-            ExposureScanPhase::EndpointDiagnostics,
-            ExposureScanPhaseState::Running,
-            completed as f32 / total.max(1) as f32,
-            format!("{completed} / {total} diagnostics — {ip}:{port}"),
-        );
-        if cancel.is_cancelled() {
-            break;
+    report.endpoint_health = endpoint_health::observations();
+    for endpoint in &mut report.endpoints {
+        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
+            let reason = endpoint_health::STOP_REASON.to_owned();
+            if !endpoint.evidence.contains(&reason) {
+                endpoint.evidence.push(reason);
+            }
         }
     }
-    if !cancel.is_cancelled() {
-        send_phase_progress(
-            progress,
-            ExposureScanPhase::EndpointDiagnostics,
-            ExposureScanPhaseState::Complete,
-            1.0,
-            format!("{completed} / {total} diagnostics"),
-        );
-    }
-}
-
-fn diagnostic_scheme(endpoint: &EndpointScan) -> Option<&'static str> {
-    if endpoint
-        .http
-        .iter()
-        .any(|observation| observation.url.starts_with("https://"))
-    {
-        Some("https")
-    } else if endpoint
-        .http
-        .iter()
-        .any(|observation| observation.url.starts_with("http://"))
-    {
-        Some("http")
-    } else {
-        None
-    }
-}
-
-fn endpoint_diagnostic_request(
-    configured: &DiagnosticRequest,
-    hostname: &str,
-    scheme: &str,
-    port: u16,
-) -> DiagnosticRequest {
-    let mut request = configured.clone();
-    let literal_ip = configured
-        .url
-        .trim()
-        .trim_matches(['[', ']'])
-        .parse::<IpAddr>()
-        .is_ok();
-    let fallback_url = || {
-        let host = if hostname.contains(':') {
-            format!("[{hostname}]")
-        } else {
-            hostname.to_owned()
-        };
-        Url::parse(&format!("https://{host}/"))
-    };
-    let parsed_url = if literal_ip {
-        fallback_url()
-    } else {
-        Url::parse(&normalize_url_input(&configured.url)).or_else(|_| fallback_url())
-    };
-    if let Ok(mut url) = parsed_url {
-        let _ = url.set_scheme(scheme);
-        let url_hostname = if hostname.contains(':') {
-            format!("[{hostname}]")
-        } else {
-            hostname.to_owned()
-        };
-        let _ = url.set_host(Some(&url_hostname));
-        let _ = url.set_port(Some(port));
-        request.url = url.to_string();
-    }
-    request
-}
-
-fn failed_report(
-    request: ExposureScanRequest,
-    error: String,
-    started: Instant,
-) -> ExposureScanReport {
-    ExposureScanReport {
-        request,
-        hostname: String::new(),
-        supplied_port: None,
-        resolved_addresses: Vec::new(),
-        ignored_addresses: Vec::new(),
-        warnings: Vec::new(),
-        endpoints: Vec::new(),
-        udp_endpoints: Vec::new(),
-        service_access: Vec::new(),
-        discovered_assets: Vec::new(),
-        dns_observations: Vec::new(),
-        stream_observations: Vec::new(),
-        findings: Vec::new(),
-        security_checks: Vec::new(),
-        crawl_observed_web_surfaces: Vec::new(),
-        crawl_origins: Vec::new(),
-        crawled_resources: Vec::new(),
-        crawl_forms: Vec::new(),
-        crawl_contacts: Vec::new(),
-        crawl_external_indicators: Vec::new(),
-        crawl_skipped_urls: Vec::new(),
-        timings: ExposureScanTimings {
-            total_ms: elapsed_ms(started),
-            ..Default::default()
-        },
-        status: ExposureScanStatus::Failed,
-        error: Some(error),
-    }
-}
-
-fn finish_report(
-    report: &mut ExposureScanReport,
-    started: Instant,
-    progress: &Option<Sender<ExposureScanProgress>>,
-) {
     send_phase_progress(
         progress,
         ExposureScanPhase::FinalizingReport,
@@ -1445,7 +2045,7 @@ fn finish_report(
     let mut findings =
         build_security_summary(&report.endpoints, report.request.security_operations)
             .into_iter()
-            .map(|finding| (security_summary_finding_key(&finding), finding))
+            .map(|finding| (({ let finding = &finding; (finding.ip, finding.port, finding.transport, finding.title.clone()) }), finding))
             .collect::<BTreeMap<_, _>>();
     send_phase_progress(
         progress,
@@ -1458,7 +2058,15 @@ fn finish_report(
         add_security_summary_finding(&mut findings, finding);
     }
     report.findings = findings.into_values().collect();
-    report.timings.total_ms = elapsed_ms(started);
+    report.timings.total_ms = {
+
+let inlined_result: f64 = {
+
+    started.elapsed().as_secs_f64() * 1000.0
+
+};
+inlined_result
+};
     send_phase_progress(
         progress,
         ExposureScanPhase::FinalizingReport,
@@ -1466,22 +2074,50 @@ fn finish_report(
         1.0,
         "Report assembled",
     );
+
+});
+    ({
+let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
+        ExposureScanProgress::Completed(report.clone())
+    },);
+
+    if let Some(progress) = progress {
+        let _ = progress.send(event());
+    }
+
+});
+    report
+
+}
+})
+    .await
+}
+
+fn public_stream_finding(
+    ip: IpAddr,
+    port: u16,
+    transport: TransportProtocol,
+    protocol: &str,
+    method: &str,
+    mut evidence: Vec<String>,
+) -> ExposureFinding {
+    evidence.insert(0, format!("Handshake method: {method}"));
+    ExposureFinding {
+        title: format!("Public {protocol} endpoint confirmed"),
+        description: format!(
+            "A protocol-valid {protocol} response confirmed a publicly reachable protocol endpoint. The bounded check did not access media, credentials, stream keys, or application content."
+        ),
+        ip,
+        port,
+        transport,
+        evidence,
+        component_kind: None,
+    }
 }
 
 #[path = "security_analysis.rs"]
 mod security_analysis;
-use security_analysis::{
-    add_security_summary_finding, build_security_summary, security_summary_finding_key,
-};
-
-fn send_progress(
-    progress: &Option<Sender<ExposureScanProgress>>,
-    event: impl FnOnce() -> ExposureScanProgress,
-) {
-    if let Some(progress) = progress {
-        let _ = progress.send(event());
-    }
-}
+use security_analysis::{add_security_summary_finding, build_security_summary};
 
 pub(super) fn send_phase_progress(
     progress: &Option<Sender<ExposureScanProgress>>,
@@ -1495,24 +2131,28 @@ pub(super) fn send_phase_progress(
     } else {
         0.0
     };
-    send_progress(progress, || ExposureScanProgress::PhaseProgress {
-        phase,
-        state,
-        fraction,
-        text: text.into(),
-    });
-}
+    ({
+        let (progress, event): (&Option<Sender<ExposureScanProgress>>, _) =
+            (progress, || ExposureScanProgress::PhaseProgress {
+                phase,
+                state,
+                fraction,
+                text: text.into(),
+            });
 
-fn elapsed_ms(started: Instant) -> f64 {
-    started.elapsed().as_secs_f64() * 1000.0
+        if let Some(progress) = progress {
+            let _ = progress.send(event());
+        }
+    });
 }
 
 #[path = "exposure_probe.rs"]
 mod exposure_probe;
+pub(crate) use exposure_probe::add_product;
 use exposure_probe::{
-    ProbeContext, ScanContext, active_http_request, active_raw_http_exchange, add_product,
-    header_values, html_attribute, looks_like_soft_404, same_origin, scan_endpoint,
-    single_http_request_with_limit, url_host, url_path, websocket_upgrade_exchange,
+    ProbeContext, ScanContext, active_http_request, active_raw_http_exchange, html_attribute,
+    looks_like_soft_404, same_origin, scan_endpoint, single_http_request, url_path,
+    websocket_upgrade_exchange,
 };
 
 #[path = "product_analysis.rs"]
@@ -1520,3 +2160,87 @@ mod product_analysis;
 use product_analysis::{
     apply_product_rules, reconcile_web_server_products, record_observed_web_surfaces,
 };
+
+impl EndpointCookieJar {
+    fn eligible<'a>(&'a mut self, url: &Url) -> Vec<&'a StoredCookie> {
+        self.remove_expired();
+        let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
+            return Vec::new();
+        };
+        let mut cookies = self
+            .cookies
+            .iter()
+            .filter(|cookie| {
+                (!cookie.secure || url.scheme() == "https")
+                    && if cookie.host_only {
+                        host == cookie.key.domain
+                    } else {
+                        {
+                            let (host, domain): (&str, &str) = (&host, &cookie.key.domain);
+                            {
+                                host.eq_ignore_ascii_case(domain)
+                                    || (host.parse::<IpAddr>().is_err()
+                                        && host
+                                            .strip_suffix(domain)
+                                            .is_some_and(|prefix| prefix.ends_with('.')))
+                            }
+                        }
+                    }
+                    && ({
+                        let (request_path, cookie_path): (&str, &str) =
+                            (url.path(), &cookie.key.path);
+                        {
+                            request_path == cookie_path
+                                || request_path
+                                    .strip_prefix(cookie_path)
+                                    .is_some_and(|suffix| {
+                                        cookie_path.ends_with('/') || suffix.starts_with('/')
+                                    })
+                        }
+                    })
+            })
+            .collect::<Vec<_>>();
+        cookies.sort_by_key(|cookie| std::cmp::Reverse(cookie.key.path.len()));
+        cookies
+    }
+}
+
+impl EndpointCookieJar {
+    fn store(&mut self, cookie: ParsedSetCookie) {
+        self.remove_expired();
+        if cookie.secure && cookie.source_scheme != "https" {
+            return;
+        }
+        if cookie.source_scheme != "https"
+            && self.cookies.iter().any(|existing| {
+                existing.secure
+                    && existing.key.name == cookie.key.name
+                    && existing.key.domain == cookie.key.domain
+                    && ({
+                        let (request_path, cookie_path): (&str, &str) =
+                            (&cookie.key.path, &existing.key.path);
+                        {
+                            request_path == cookie_path
+                                || request_path
+                                    .strip_prefix(cookie_path)
+                                    .is_some_and(|suffix| {
+                                        cookie_path.ends_with('/') || suffix.starts_with('/')
+                                    })
+                        }
+                    })
+            })
+        {
+            return;
+        }
+        self.cookies.retain(|existing| existing.key != cookie.key);
+        if !cookie.deletion {
+            self.cookies.push(StoredCookie {
+                key: cookie.key,
+                value: cookie.value,
+                host_only: cookie.host_only,
+                secure: cookie.secure,
+                expires_at: cookie.expires_at,
+            });
+        }
+    }
+}

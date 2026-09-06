@@ -28,19 +28,14 @@ pub mod diagnostics;
 mod exposure;
 mod network;
 mod persistence;
+mod product_catalog;
 mod request;
+mod scan_limits;
 mod ui;
 mod web_server;
+mod worker;
 
 pub use exposure::*;
 pub use request::run_diagnostic_session;
 
-pub(crate) fn matches_ascii(value: &str, candidates: &[&str]) -> bool {
-    candidates
-        .iter()
-        .any(|candidate| value.eq_ignore_ascii_case(candidate))
-}
-
-pub fn run_gui() -> Result<(), eframe::Error> {
-    ui::run()
-}
+pub use ui::run as run_gui;

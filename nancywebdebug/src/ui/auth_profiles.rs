@@ -127,88 +127,268 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App) {
 
                         match app.profile_draft.profile_type {
                             ProfileType::AzureInteractive => {
-                                profile_text_row(
-                                    ui,
-                                    "Tenant",
-                                    &mut app.profile_draft.tenant,
-                                    false,
-                                );
-                                profile_text_row(
-                                    ui,
-                                    "Client ID",
-                                    &mut app.profile_draft.client_id,
-                                    false,
-                                );
-                                profile_text_row(
-                                    ui,
-                                    "Scopes",
-                                    &mut app.profile_draft.scopes,
-                                    false,
-                                );
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (ui, "Tenant", &mut app.profile_draft.tenant, false);
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (ui, "Client ID", &mut app.profile_draft.client_id, false);
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (ui, "Scopes", &mut app.profile_draft.scopes, false);
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
                             }
                             ProfileType::AzureClientCredentials => {
-                                profile_text_row(
-                                    ui,
-                                    "Tenant",
-                                    &mut app.profile_draft.tenant,
-                                    false,
-                                );
-                                profile_text_row(
-                                    ui,
-                                    "Client ID",
-                                    &mut app.profile_draft.client_id,
-                                    false,
-                                );
-                                profile_text_row(
-                                    ui,
-                                    "Client secret",
-                                    &mut app.profile_draft.client_secret,
-                                    true,
-                                );
-                                profile_text_row(ui, "Scope", &mut app.profile_draft.scopes, false);
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (ui, "Tenant", &mut app.profile_draft.tenant, false);
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (ui, "Client ID", &mut app.profile_draft.client_id, false);
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (
+                                        ui,
+                                        "Client secret",
+                                        &mut app.profile_draft.client_secret,
+                                        true,
+                                    );
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (ui, "Scope", &mut app.profile_draft.scopes, false);
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
                             }
                             ProfileType::BrowserCookies => {
-                                profile_text_row(
-                                    ui,
-                                    "Login URL",
-                                    &mut app.profile_draft.login_url,
-                                    false,
-                                );
-                                profile_text_row(
-                                    ui,
-                                    "Host scope",
-                                    &mut app.profile_draft.host_scope,
-                                    false,
-                                );
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (ui, "Login URL", &mut app.profile_draft.login_url, false);
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (
+                                        ui,
+                                        "Host scope",
+                                        &mut app.profile_draft.host_scope,
+                                        false,
+                                    );
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
                             }
                             ProfileType::ManualCookie => {
-                                profile_text_row(
-                                    ui,
-                                    "Host scope",
-                                    &mut app.profile_draft.host_scope,
-                                    false,
-                                );
-                                profile_text_row(ui, "Cookie", &mut app.profile_draft.cookie, true);
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (
+                                        ui,
+                                        "Host scope",
+                                        &mut app.profile_draft.host_scope,
+                                        false,
+                                    );
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (ui, "Cookie", &mut app.profile_draft.cookie, true);
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
                             }
                             ProfileType::ClientCertificate => {
-                                profile_text_row(
-                                    ui,
-                                    "Exact host scope",
-                                    &mut app.profile_draft.host_scope,
-                                    false,
-                                );
-                                profile_text_row(
-                                    ui,
-                                    "PEM certificate chain",
-                                    &mut app.profile_draft.certificate_chain_path,
-                                    false,
-                                );
-                                profile_text_row(
-                                    ui,
-                                    "PEM private key",
-                                    &mut app.profile_draft.private_key_path,
-                                    true,
-                                );
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (
+                                        ui,
+                                        "Exact host scope",
+                                        &mut app.profile_draft.host_scope,
+                                        false,
+                                    );
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (
+                                        ui,
+                                        "PEM certificate chain",
+                                        &mut app.profile_draft.certificate_chain_path,
+                                        false,
+                                    );
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
+                                ({
+                                    let (ui, label, value, password): (
+                                        &mut egui::Ui,
+                                        &str,
+                                        &mut String,
+                                        bool,
+                                    ) = (
+                                        ui,
+                                        "PEM private key",
+                                        &mut app.profile_draft.private_key_path,
+                                        true,
+                                    );
+
+                                    ui.label(label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .password(password)
+                                            .desired_width(420.0),
+                                    );
+                                    ui.end_row();
+                                });
                             }
                         }
                     });
@@ -297,14 +477,4 @@ pub(super) fn show(ctx: &egui::Context, app: &mut App) {
         app.editing_auth_profile = None;
         app.profile_editor_open = false;
     }
-}
-
-fn profile_text_row(ui: &mut egui::Ui, label: &str, value: &mut String, password: bool) {
-    ui.label(label);
-    ui.add(
-        egui::TextEdit::singleline(value)
-            .password(password)
-            .desired_width(420.0),
-    );
-    ui.end_row();
 }

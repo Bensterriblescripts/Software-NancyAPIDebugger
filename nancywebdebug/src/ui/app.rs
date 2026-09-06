@@ -7,12 +7,11 @@ use crate::{
 };
 use eframe::egui;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::exposure_view::{self, DiagnosticViewState, ExposureDetailTab, ScanForm};
-use super::widgets::normalized_url;
+
 use super::{auth_profiles, history};
 
 struct ActiveScan {
@@ -27,7 +26,7 @@ pub(super) struct ExposureLiveState {
     pub(super) total: usize,
     pub(super) open_endpoints: Vec<EndpointScan>,
     pub(super) last_endpoint: Option<EndpointScan>,
-    pub(super) phases: Vec<ExposureLivePhase>,
+    pub(super) phases: [ExposureLivePhase; ExposureScanPhase::ALL.len()],
 }
 
 pub(super) struct ExposureLivePhase {
@@ -37,9 +36,30 @@ pub(super) struct ExposureLivePhase {
     pub(super) text: String,
 }
 
-struct AuthEvent {
-    profile_id: u64,
-    result: Result<String, String>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerKind {
+    Scan,
+    SignIn,
+    CookieCapture,
+    Fingerprints,
+}
+
+struct WorkerError {
+    kind: WorkerKind,
+    message: String,
+}
+
+enum WorkerEvent {
+    ScanCompleted {
+        scan_number: usize,
+        report: Box<ExposureScanReport>,
+    },
+    AuthCompleted {
+        kind: WorkerKind,
+        profile_id: u64,
+        result: Result<String, String>,
+    },
+    FingerprintsCompleted(Result<(), String>),
 }
 
 pub(super) struct App {
@@ -52,13 +72,14 @@ pub(super) struct App {
     pub(super) auth_busy: Option<u64>,
     pub(super) auth_cancel: Option<CancellationToken>,
     pub(super) auth_notice: Option<String>,
-    auth_event_tx: Sender<AuthEvent>,
-    auth_event_rx: Receiver<AuthEvent>,
+    worker_event_tx: Sender<WorkerEvent>,
+    worker_event_rx: Receiver<WorkerEvent>,
+    worker_errors: Vec<WorkerError>,
+    ctx: egui::Context,
     history: Vec<history::HistoryEntry>,
     latest_report: Option<ExposureScanReport>,
     active: Option<ActiveScan>,
     next_scan_number: usize,
-    progress_tx: Sender<ExposureScanProgress>,
     progress_rx: Receiver<ExposureScanProgress>,
     exposure_live: Option<ExposureLiveState>,
     exposure_detail_tab: ExposureDetailTab,
@@ -69,38 +90,6 @@ pub(super) struct App {
 }
 
 impl App {
-    fn new() -> Self {
-        let (progress_tx, progress_rx) = mpsc::channel();
-        let (auth_event_tx, auth_event_rx) = mpsc::channel();
-        let app = Self {
-            scan_form: ScanForm::default(),
-            auth_store: auth::AuthStore::shared(),
-            show_auth_profiles: false,
-            profile_editor_open: false,
-            editing_auth_profile: None,
-            profile_draft: ProfileInput::default(),
-            auth_busy: None,
-            auth_cancel: None,
-            auth_notice: None,
-            auth_event_tx,
-            auth_event_rx,
-            history: Vec::new(),
-            latest_report: None,
-            active: None,
-            next_scan_number: 1,
-            progress_tx,
-            progress_rx,
-            exposure_live: None,
-            exposure_detail_tab: ExposureDetailTab::Diagnostics,
-            diagnostic_view: DiagnosticViewState::default(),
-            show_exposure_scan: true,
-            scan_set_focus: true,
-            ui_error: None,
-        };
-        app.spawn_fingerprint_initialization(false);
-        app
-    }
-
     fn start_scan(&mut self, request: ExposureScanRequest) -> Result<(), String> {
         if !matches!(
             fingerprints::initialization_status(),
@@ -112,6 +101,7 @@ impl App {
             return Err("Another scan is already running".to_owned());
         }
         request.validate()?;
+        self.clear_worker_error(WorkerKind::Scan);
         self.latest_report = None;
         let scan_number = self.next_scan_number;
         self.next_scan_number += 1;
@@ -120,7 +110,7 @@ impl App {
             scan_number,
             cancel: cancel.clone(),
         });
-        self.exposure_detail_tab = ExposureDetailTab::Diagnostics;
+        self.exposure_detail_tab = ExposureDetailTab::Summary;
         self.diagnostic_view = DiagnosticViewState::default();
         self.exposure_live = Some(ExposureLiveState {
             message: "Starting public exposure scan...".to_owned(),
@@ -129,183 +119,88 @@ impl App {
             total: 0,
             open_endpoints: Vec::new(),
             last_endpoint: None,
-            phases: ExposureScanPhase::ALL
-                .into_iter()
-                .map(|phase| {
-                    let skipped = !request.web_probe_level.active()
-                        && phase == ExposureScanPhase::ActiveWebAssessment;
-                    let skipped = skipped
-                        || (!request.security_operations
-                            && matches!(
-                                phase,
-                                ExposureScanPhase::Crawl
-                                    | ExposureScanPhase::JavaScriptAnalysis
-                                    | ExposureScanPhase::TechnologyAnalysis
-                            ))
-                        || (phase == ExposureScanPhase::UdpScanning && !request.udp_scanning)
-                        || (phase == ExposureScanPhase::ServiceAccess
-                            && !request.service_access_checks)
-                        || (phase == ExposureScanPhase::AssetDiscovery && !request.asset_discovery)
-                        || (phase == ExposureScanPhase::DnsAssessment && !request.dns_assessment);
-                    ExposureLivePhase {
-                        phase,
-                        state: if skipped {
-                            ExposureScanPhaseState::Skipped
-                        } else {
-                            ExposureScanPhaseState::Pending
-                        },
-                        fraction: if skipped { 1.0 } else { 0.0 },
-                        text: if skipped { "Skipped" } else { "Pending" }.to_owned(),
-                    }
-                })
-                .collect(),
+            phases: ExposureScanPhase::ALL.map(|phase| {
+                let skipped = !matches!(
+                    request.web_probe_level,
+                    crate::WebProbeLevel::Active | crate::WebProbeLevel::StateChanging
+                ) && phase == ExposureScanPhase::ActiveWebAssessment;
+                let skipped = skipped
+                    || (!request.security_operations
+                        && matches!(
+                            phase,
+                            ExposureScanPhase::Crawl
+                                | ExposureScanPhase::JavaScriptAnalysis
+                                | ExposureScanPhase::TechnologyAnalysis
+                        ))
+                    || (phase == ExposureScanPhase::UdpScanning && !request.udp_scanning)
+                    || (phase == ExposureScanPhase::ServiceAccess
+                        && !request.service_access_checks)
+                    || (phase == ExposureScanPhase::AssetDiscovery && !request.asset_discovery)
+                    || (phase == ExposureScanPhase::DnsAssessment && !request.dns_assessment);
+                ExposureLivePhase {
+                    phase,
+                    state: if skipped {
+                        ExposureScanPhaseState::Skipped
+                    } else {
+                        ExposureScanPhaseState::Pending
+                    },
+                    fraction: if skipped { 1.0 } else { 0.0 },
+                    text: if skipped { "Skipped" } else { "Pending" }.to_owned(),
+                }
+            }),
         });
-        self.spawn_scan(request, cancel);
+        let (progress, progress_rx) = mpsc::channel();
+        self.progress_rx = progress_rx;
+        let auth_store = self.auth_store.clone();
+        let failed_request = request.clone();
+        let events = self.worker_event_tx.clone();
+        let ctx = self.ctx.clone();
+        crate::worker::spawn(
+            "Exposure scan",
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("Unable to create async runtime: {error}"))?;
+                Ok(runtime.block_on(run_exposure_scan_with_auth_store(
+                    request,
+                    auth_store,
+                    cancel,
+                    Some(progress),
+                )))
+            },
+            move |result| {
+                let report = result
+                    .unwrap_or_else(|error| failed_scan_report(failed_request.clone(), error));
+                let _ = events.send(WorkerEvent::ScanCompleted {
+                    scan_number,
+                    report: Box::new(report),
+                });
+                ctx.request_repaint();
+            },
+        );
+        self.show_exposure_scan = false;
         Ok(())
     }
 
-    fn start_scan_form(&mut self) -> Result<(), String> {
-        let request = self.scan_form.to_request(&self.auth_store)?;
-        self.start_scan(request)
-    }
-
-    fn process_progress(&mut self) {
-        while let Ok(update) = self.progress_rx.try_recv() {
-            match update {
-                ExposureScanProgress::Resolving { target } => {
-                    if let Some(live) = &mut self.exposure_live {
-                        live.message = format!("Resolving {target}...");
-                    }
-                }
-                ExposureScanProgress::Resolved {
-                    public_addresses,
-                    total_endpoints,
+    fn receive_worker_events(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.worker_event_rx.try_recv() {
+            match event {
+                WorkerEvent::ScanCompleted {
+                    scan_number,
+                    report,
                 } => {
-                    if let Some(live) = &mut self.exposure_live {
-                        live.resolving = false;
-                        live.total = total_endpoints;
-                        live.message = format!(
-                            "Scanning {} public address{}...",
-                            public_addresses.len(),
-                            if public_addresses.len() == 1 {
-                                ""
-                            } else {
-                                "es"
-                            }
-                        );
+                    if self.active.as_ref().map(|scan| scan.scan_number) != Some(scan_number) {
+                        continue;
                     }
-                }
-                ExposureScanProgress::EndpointCompleted {
-                    completed,
-                    total,
-                    endpoint,
-                } => {
-                    if let Some(live) = &mut self.exposure_live {
-                        live.completed = completed;
-                        live.total = total;
-                        live.last_endpoint = Some(endpoint.clone());
-                        if endpoint.state == PortState::Open {
-                            live.open_endpoints.push(endpoint);
-                        }
-                        if completed == total {
-                            live.message = "Running endpoint diagnostics...".to_owned();
+                    if report.status == ExposureScanStatus::Failed {
+                        if let Some(error) = &report.error {
+                            self.set_worker_error(
+                                WorkerKind::Scan,
+                                format!("Scan {scan_number}: {error}"),
+                            );
                         }
                     }
-                }
-                ExposureScanProgress::UdpEndpointCompleted {
-                    completed,
-                    total,
-                    endpoint,
-                } => {
-                    if let Some(live) = &mut self.exposure_live {
-                        live.message = format!(
-                            "UDP {completed}/{total}: {}:{} — {}",
-                            endpoint.ip, endpoint.port, endpoint.state
-                        );
-                    }
-                }
-                ExposureScanProgress::ServiceAccessCompleted {
-                    completed,
-                    total,
-                    result,
-                } => {
-                    if let Some(live) = &mut self.exposure_live {
-                        live.message = format!(
-                            "Service check {completed}/{total}: {}:{} — {}",
-                            result.ip, result.port, result.status
-                        );
-                    }
-                }
-                ExposureScanProgress::AssetDiscovered {
-                    completed,
-                    total,
-                    asset,
-                } => {
-                    if let Some(live) = &mut self.exposure_live {
-                        live.message = format!(
-                            "CT asset {completed}/{total}: {} — {}",
-                            asset.hostname, asset.state
-                        );
-                    }
-                }
-                ExposureScanProgress::DnsObservationCompleted {
-                    completed,
-                    total,
-                    observation,
-                } => {
-                    if let Some(live) = &mut self.exposure_live {
-                        live.message = format!(
-                            "DNS observation {completed}/{total}: {} — {}",
-                            observation.check, observation.status
-                        );
-                    }
-                }
-                ExposureScanProgress::CrawlProgress {
-                    origin,
-                    queued,
-                    completed,
-                    current_url,
-                } => {
-                    if let Some(live) = &mut self.exposure_live {
-                        live.message =
-                            format!("Crawling {origin}: {completed}/{queued} — {current_url}");
-                    }
-                }
-                ExposureScanProgress::PhaseProgress {
-                    phase,
-                    state,
-                    fraction,
-                    text,
-                } => {
-                    if let Some(live) = &mut self.exposure_live {
-                        if state == ExposureScanPhaseState::Running {
-                            live.message = text.clone();
-                        }
-                        if phase == ExposureScanPhase::PortScanning {
-                            live.resolving = false;
-                        }
-                        if let Some(live_phase) = live
-                            .phases
-                            .iter_mut()
-                            .find(|live_phase| live_phase.phase == phase)
-                        {
-                            live_phase.state = state;
-                            live_phase.fraction = match state {
-                                ExposureScanPhaseState::Pending => 0.0,
-                                ExposureScanPhaseState::Running => fraction.clamp(0.0, 1.0),
-                                ExposureScanPhaseState::Complete
-                                | ExposureScanPhaseState::Skipped => 1.0,
-                            };
-                            live_phase.text = text;
-                        }
-                    }
-                }
-                ExposureScanProgress::Completed(report) => {
-                    let scan_number = self
-                        .active
-                        .as_ref()
-                        .map(|active| active.scan_number)
-                        .unwrap_or_else(|| self.next_scan_number.saturating_sub(1));
                     self.history.insert(
                         0,
                         history::HistoryEntry {
@@ -314,95 +209,73 @@ impl App {
                             error: report.error.clone(),
                         },
                     );
-                    self.latest_report = Some(report);
+                    self.latest_report = Some(*report);
                     self.diagnostic_view = DiagnosticViewState::default();
                     self.active = None;
                     self.exposure_live = None;
+                    self.spawn_fingerprint_initialization(true, ctx);
+                }
+                WorkerEvent::AuthCompleted {
+                    kind,
+                    profile_id,
+                    result,
+                } => {
+                    if self.auth_busy != Some(profile_id) {
+                        continue;
+                    }
+                    self.auth_busy = None;
+                    self.auth_cancel = None;
+                    self.auth_notice = None;
+                    match result {
+                        Ok(message) => self.auth_notice = Some(message),
+                        Err(error) => self.set_worker_error(kind, error),
+                    }
+                }
+                WorkerEvent::FingerprintsCompleted(result) => {
+                    if let Err(error) = result {
+                        self.set_worker_error(WorkerKind::Fingerprints, error);
+                    }
                 }
             }
         }
     }
 
-    fn spawn_scan(&self, request: ExposureScanRequest, cancel: CancellationToken) {
-        let progress = self.progress_tx.clone();
-        let auth_store = self.auth_store.clone();
-        thread::spawn(move || {
-            match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => {
-                    runtime.block_on(run_exposure_scan_with_auth_store(
-                        request,
-                        auth_store,
-                        cancel,
-                        Some(progress),
-                    ));
-                }
-                Err(error) => {
-                    let report = ExposureScanReport {
-                        request,
-                        hostname: String::new(),
-                        supplied_port: None,
-                        resolved_addresses: Vec::new(),
-                        ignored_addresses: Vec::new(),
-                        warnings: Vec::new(),
-                        endpoints: Vec::new(),
-                        udp_endpoints: Vec::new(),
-                        service_access: Vec::new(),
-                        discovered_assets: Vec::new(),
-                        dns_observations: Vec::new(),
-                        stream_observations: Vec::new(),
-                        findings: Vec::new(),
-                        security_checks: Vec::new(),
-                        crawl_observed_web_surfaces: Vec::new(),
-                        crawl_origins: Vec::new(),
-                        crawled_resources: Vec::new(),
-                        crawl_forms: Vec::new(),
-                        crawl_contacts: Vec::new(),
-                        crawl_external_indicators: Vec::new(),
-                        crawl_skipped_urls: Vec::new(),
-                        timings: ExposureScanTimings::default(),
-                        status: ExposureScanStatus::Failed,
-                        error: Some(format!("Unable to create async runtime: {error}")),
-                    };
-                    let _ = progress.send(ExposureScanProgress::Completed(report));
-                }
-            }
+    fn spawn_fingerprint_initialization(&self, force: bool, ctx: &egui::Context) {
+        let ctx = ctx.clone();
+        let events = self.worker_event_tx.clone();
+        fingerprints::spawn_initialization(force, move |result| {
+            let _ = events.send(WorkerEvent::FingerprintsCompleted(result));
+            ctx.request_repaint();
         });
     }
 
-    fn spawn_fingerprint_initialization(&self, force: bool) {
-        if !fingerprints::start_initialization(force) {
-            return;
-        }
-        thread::spawn(move || {
-            match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime.block_on(fingerprints::run_started_initialization()),
-                Err(error) => fingerprints::complete_runtime_failure(format!(
-                    "unable to create fingerprint initialization runtime: {error}"
-                )),
-            }
-        });
+    fn clear_worker_error(&mut self, kind: WorkerKind) {
+        self.worker_errors.retain(|error| error.kind != kind);
     }
 
-    fn process_auth_events(&mut self) {
-        while let Ok(event) = self.auth_event_rx.try_recv() {
-            if self.auth_busy == Some(event.profile_id) {
-                self.auth_busy = None;
-                self.auth_cancel = None;
-            }
-            match event.result {
-                Ok(message) => {
-                    self.auth_notice = Some(message);
-                    self.ui_error = None;
-                }
-                Err(error) => self.ui_error = Some(error),
-            }
-        }
+    fn set_worker_error(&mut self, kind: WorkerKind, message: String) {
+        self.clear_worker_error(kind);
+        self.worker_errors.push(WorkerError { kind, message });
+    }
+
+    fn spawn_auth_worker(
+        &mut self,
+        kind: WorkerKind,
+        name: &'static str,
+        profile_id: u64,
+        work: impl FnOnce() -> Result<String, String> + Send + 'static,
+    ) {
+        self.clear_worker_error(kind);
+        let events = self.worker_event_tx.clone();
+        let ctx = self.ctx.clone();
+        crate::worker::spawn(name, work, move |result| {
+            let _ = events.send(WorkerEvent::AuthCompleted {
+                kind,
+                profile_id,
+                result,
+            });
+            ctx.request_repaint();
+        });
     }
 
     pub(super) fn start_interactive_sign_in(&mut self, profile_id: u64) {
@@ -414,17 +287,18 @@ impl App {
         self.auth_cancel = Some(cancel.clone());
         self.auth_notice = Some("Waiting for Azure sign-in in the system browser...".to_owned());
         let store = self.auth_store.clone();
-        let events = self.auth_event_tx.clone();
-        thread::spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| format!("Unable to create authentication runtime: {error}"))
-                .and_then(|runtime| {
-                    runtime.block_on(auth::sign_in_interactive(store, profile_id, cancel))
-                });
-            let _ = events.send(AuthEvent { profile_id, result });
-        });
+        self.spawn_auth_worker(
+            WorkerKind::SignIn,
+            "Interactive sign-in",
+            profile_id,
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("Unable to create authentication runtime: {error}"))?;
+                runtime.block_on(auth::sign_in_interactive(store, profile_id, cancel))
+            },
+        );
     }
 
     pub(super) fn start_browser_cookie_capture(&mut self, profile_id: u64) {
@@ -443,16 +317,19 @@ impl App {
             "Sign in through WebView2, then close the browser window to capture cookies".to_owned(),
         );
         let store = self.auth_store.clone();
-        let events = self.auth_event_tx.clone();
-        thread::spawn(move || {
-            let result = auth::capture_browser_cookies(store, profile_id, &target, cancel);
-            let _ = events.send(AuthEvent { profile_id, result });
-        });
+        self.spawn_auth_worker(
+            WorkerKind::CookieCapture,
+            "Cookie capture",
+            profile_id,
+            move || auth::capture_browser_cookies(store, profile_id, &target, cancel),
+        );
     }
 
     pub(super) fn new_profile_draft(&self) -> ProfileInput {
         let mut draft = ProfileInput::default();
-        if let Ok(url) = normalized_url(&self.scan_form.diagnostic.url) {
+        if let Ok(url) = url::Url::parse(&crate::diagnostics::normalize_url_input(
+            &self.scan_form.diagnostic.url,
+        )) {
             draft.login_url = url.origin().ascii_serialization();
             draft.host_scope = url.host_str().unwrap_or_default().to_owned();
         }
@@ -473,8 +350,144 @@ impl Drop for App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.process_progress();
-        self.process_auth_events();
+        ({
+            let (inlined_self,): (&mut App,) = (&mut *self,);
+
+            while let Ok(update) = inlined_self.progress_rx.try_recv() {
+                match update {
+                    ExposureScanProgress::Resolving { target } => {
+                        if let Some(live) = &mut inlined_self.exposure_live {
+                            live.message = format!("Resolving {target}...");
+                        }
+                    }
+                    ExposureScanProgress::Resolved {
+                        public_addresses,
+                        total_endpoints,
+                    } => {
+                        if let Some(live) = &mut inlined_self.exposure_live {
+                            live.resolving = false;
+                            live.total = total_endpoints;
+                            live.message = format!(
+                                "Scanning {} public address{}...",
+                                public_addresses.len(),
+                                if public_addresses.len() == 1 {
+                                    ""
+                                } else {
+                                    "es"
+                                }
+                            );
+                        }
+                    }
+                    ExposureScanProgress::EndpointCompleted {
+                        completed,
+                        total,
+                        endpoint,
+                    } => {
+                        if let Some(live) = &mut inlined_self.exposure_live {
+                            live.completed = completed;
+                            live.total = total;
+                            live.last_endpoint = Some(endpoint.clone());
+                            if endpoint.state == PortState::Open {
+                                live.open_endpoints.push(endpoint);
+                            }
+                            if completed == total {
+                                live.message = "Running endpoint diagnostics...".to_owned();
+                            }
+                        }
+                    }
+                    ExposureScanProgress::UdpEndpointCompleted {
+                        completed,
+                        total,
+                        endpoint,
+                    } => {
+                        if let Some(live) = &mut inlined_self.exposure_live {
+                            live.message = format!(
+                                "UDP {completed}/{total}: {}:{} — {}",
+                                endpoint.ip, endpoint.port, endpoint.state
+                            );
+                        }
+                    }
+                    ExposureScanProgress::ServiceAccessCompleted {
+                        completed,
+                        total,
+                        result,
+                    } => {
+                        if let Some(live) = &mut inlined_self.exposure_live {
+                            live.message = format!(
+                                "Service check {completed}/{total}: {}:{} — {}",
+                                result.ip, result.port, result.status
+                            );
+                        }
+                    }
+                    ExposureScanProgress::AssetDiscovered {
+                        completed,
+                        total,
+                        asset,
+                    } => {
+                        if let Some(live) = &mut inlined_self.exposure_live {
+                            live.message = format!(
+                                "CT asset {completed}/{total}: {} — {}",
+                                asset.hostname, asset.state
+                            );
+                        }
+                    }
+                    ExposureScanProgress::DnsObservationCompleted {
+                        completed,
+                        total,
+                        observation,
+                    } => {
+                        if let Some(live) = &mut inlined_self.exposure_live {
+                            live.message = format!(
+                                "DNS observation {completed}/{total}: {} — {}",
+                                observation.check, observation.status
+                            );
+                        }
+                    }
+                    ExposureScanProgress::CrawlProgress {
+                        origin,
+                        queued,
+                        completed,
+                        current_url,
+                    } => {
+                        if let Some(live) = &mut inlined_self.exposure_live {
+                            live.message =
+                                format!("Crawling {origin}: {completed}/{queued} — {current_url}");
+                        }
+                    }
+                    ExposureScanProgress::PhaseProgress {
+                        phase,
+                        state,
+                        fraction,
+                        text,
+                    } => {
+                        if let Some(live) = &mut inlined_self.exposure_live {
+                            if state == ExposureScanPhaseState::Running {
+                                live.message = text.clone();
+                            }
+                            if phase == ExposureScanPhase::PortScanning {
+                                live.resolving = false;
+                            }
+                            if let Some(live_phase) = live
+                                .phases
+                                .iter_mut()
+                                .find(|live_phase| live_phase.phase == phase)
+                            {
+                                live_phase.state = state;
+                                live_phase.fraction = match state {
+                                    ExposureScanPhaseState::Pending => 0.0,
+                                    ExposureScanPhaseState::Running => fraction.clamp(0.0, 1.0),
+                                    ExposureScanPhaseState::Complete
+                                    | ExposureScanPhaseState::Skipped => 1.0,
+                                };
+                                live_phase.text = text;
+                            }
+                        }
+                    }
+                    ExposureScanProgress::Completed(_) => {}
+                }
+            }
+        });
+        self.receive_worker_events(ctx);
         let fingerprint_status = fingerprints::initialization_status();
         let fingerprints_ready = matches!(fingerprint_status, InitializationStatus::Ready { .. });
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
@@ -494,6 +507,14 @@ impl eframe::App for App {
             if let Some(error) = &self.ui_error {
                 ui.colored_label(egui::Color32::RED, error);
             }
+            self.worker_errors.retain(|error| {
+                let mut dismissed = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(egui::Color32::RED, &error.message);
+                    dismissed = ui.small_button("Dismiss").clicked();
+                });
+                !dismissed
+            });
             if let Some(notice) = &self.auth_notice {
                 ui.weak(notice);
             }
@@ -509,8 +530,14 @@ impl eframe::App for App {
                     using_curated_fallback,
                 } => {
                     ui.colored_label(egui::Color32::YELLOW, warning);
-                    if *using_curated_fallback && ui.button("Retry fingerprint catalog").clicked() {
-                        self.spawn_fingerprint_initialization(true);
+                    let retry_label = if *using_curated_fallback {
+                        "Retry fingerprint catalog"
+                    } else {
+                        "Retry fingerprint refresh"
+                    };
+                    if ui.button(retry_label).clicked() {
+                        self.clear_worker_error(WorkerKind::Fingerprints);
+                        self.spawn_fingerprint_initialization(true, ctx);
                     }
                 }
                 InitializationStatus::Ready { warning: None, .. } => {}
@@ -551,24 +578,48 @@ impl eframe::App for App {
             auth_profiles::show(ctx, self);
         }
         if start && self.active.is_none() {
-            match self.start_scan_form() {
-                Ok(()) => {
-                    self.show_exposure_scan = false;
-                    self.ui_error = None;
-                }
-                Err(error) => self.ui_error = Some(error),
-            }
+            let result = self
+                .scan_form
+                .to_request(&self.auth_store)
+                .and_then(|request| self.start_scan(request));
+            self.ui_error = result.err();
         }
         if let Some(request) = rescan {
-            if let Err(error) = self.start_scan(request) {
-                self.ui_error = Some(error);
-            } else {
-                self.ui_error = None;
-            }
+            self.ui_error = self.start_scan(request).err();
         }
         if self.active.is_some() || self.auth_busy.is_some() || !fingerprints_ready {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
+    }
+}
+
+fn failed_scan_report(request: ExposureScanRequest, error: String) -> ExposureScanReport {
+    ExposureScanReport {
+        request,
+        hostname: String::new(),
+        supplied_port: None,
+        resolved_addresses: Vec::new(),
+        ignored_addresses: Vec::new(),
+        warnings: Vec::new(),
+        endpoint_health: Vec::new(),
+        endpoints: Vec::new(),
+        udp_endpoints: Vec::new(),
+        service_access: Vec::new(),
+        discovered_assets: Vec::new(),
+        dns_observations: Vec::new(),
+        stream_observations: Vec::new(),
+        findings: Vec::new(),
+        security_checks: Vec::new(),
+        crawl_observed_web_surfaces: Vec::new(),
+        crawl_origins: Vec::new(),
+        crawled_resources: Vec::new(),
+        crawl_forms: Vec::new(),
+        crawl_contacts: Vec::new(),
+        crawl_external_indicators: Vec::new(),
+        crawl_skipped_urls: Vec::new(),
+        timings: ExposureScanTimings::default(),
+        status: ExposureScanStatus::Failed,
+        error: Some(error),
     }
 }
 
@@ -601,6 +652,42 @@ pub fn run() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Nancy Web Debugger",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(|_cc| {
+            Ok(Box::new({
+                let inlined_result: App = {
+                    let (_, progress_rx) = mpsc::channel();
+                    let (worker_event_tx, worker_event_rx) = mpsc::channel();
+                    let app = App {
+                        scan_form: ScanForm::default(),
+                        auth_store: auth::AuthStore::shared(),
+                        show_auth_profiles: false,
+                        profile_editor_open: false,
+                        editing_auth_profile: None,
+                        profile_draft: ProfileInput::default(),
+                        auth_busy: None,
+                        auth_cancel: None,
+                        auth_notice: None,
+                        worker_event_tx,
+                        worker_event_rx,
+                        worker_errors: Vec::new(),
+                        ctx: _cc.egui_ctx.clone(),
+                        history: Vec::new(),
+                        latest_report: None,
+                        active: None,
+                        next_scan_number: 1,
+                        progress_rx,
+                        exposure_live: None,
+                        exposure_detail_tab: ExposureDetailTab::Summary,
+                        diagnostic_view: DiagnosticViewState::default(),
+                        show_exposure_scan: true,
+                        scan_set_focus: true,
+                        ui_error: None,
+                    };
+                    app.spawn_fingerprint_initialization(false, &_cc.egui_ctx);
+                    app
+                };
+                inlined_result
+            }))
+        }),
     )
 }

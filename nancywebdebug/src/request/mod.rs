@@ -8,7 +8,7 @@ mod stages;
 mod tls;
 mod transport;
 
-pub(crate) use dns::{resolve_host, resolve_host_exhaustive};
+pub(crate) use dns::resolve_host;
 pub(crate) use tls::{
     CertificateCapture, make_exposure_tls_config, parse_certificate, tls_trace_from_capture,
     tls_trace_from_stream,

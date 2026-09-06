@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
-static PROVIDER_TOKENS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
+static PROVIDER_TOKENS: LazyLock<[(&'static str, Regex); 8]> = LazyLock::new(|| {
     [
         ("AWS access key", r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
         ("GitHub access token", r"\bgh[pousr]_[A-Za-z0-9]{36,255}\b"),
@@ -17,9 +17,7 @@ static PROVIDER_TOKENS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| 
         ),
         ("Twilio API key", r"\bSK[0-9a-fA-F]{32}\b"),
     ]
-    .into_iter()
     .map(|(name, pattern)| (name, Regex::new(pattern).expect("valid credential regex")))
-    .collect()
 });
 
 static CREDENTIAL_URL: LazyLock<Regex> = LazyLock::new(|| {
@@ -68,7 +66,15 @@ pub(super) fn source_map_issues(url: &str, body: &[u8]) -> Vec<ArtifactIssue> {
             issues.extend(secret_issues(&safe_url, content, Some(source)));
         }
     }
-    deduplicate(issues)
+    {
+        let (issues,): (Vec<ArtifactIssue>,) = (issues,);
+
+        let mut seen = BTreeSet::new();
+        issues
+            .into_iter()
+            .filter(|issue| seen.insert((issue.title, issue.evidence.clone())))
+            .collect()
+    }
 }
 
 pub(super) fn text_artifact_secret_issues(
@@ -85,11 +91,48 @@ pub(super) fn text_artifact_secret_issues(
 fn secret_issues(url: &str, text: &str, source: Option<&str>) -> Vec<ArtifactIssue> {
     let mut issues = Vec::new();
     for (category, pattern) in PROVIDER_TOKENS.iter() {
-        if pattern
-            .find_iter(text)
-            .any(|matched| !placeholder_token(matched.as_str()))
-        {
-            issues.push(secret_issue(url, category, None, source));
+        if pattern.find_iter(text).any(|matched| !{
+            let (value,): (&str,) = (matched.as_str(),);
+
+            let lower = value.to_ascii_lowercase();
+            lower.contains("example")
+                || lower.contains("placeholder")
+                || lower.contains("changeme")
+                || lower.contains(":password@")
+                || lower.contains(":passwd@")
+                || lower.contains(":secret@")
+                || lower.contains("your_")
+                || lower.contains("your-")
+                || value
+                    .bytes()
+                    .filter(|byte| byte.is_ascii_alphanumeric())
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    < 8
+        }) {
+            issues.push({
+let (url, category, key, source,): (& str, & str, Option < & str >, Option < & str >,) = (url, category, None, source,);
+
+    let key = key.map(|key| format!(", key {key}")).unwrap_or_default();
+    let source = source
+        .map(|value: & str| {
+    value
+        .chars()
+        .filter(|value| !value.is_control())
+        .take(240)
+        .collect::<String>()
+})
+        .map(|source| format!(", source {source}"))
+        .unwrap_or_default();
+    ArtifactIssue {
+        title: "Secret material exposed in public artifact",
+        description: "A public source map or configuration artifact contains a high-confidence credential",
+        evidence: format!(
+            "Artifact {url}, category {category}{key}{source}; secret value withheld"
+        ),
+    }
+
+});
         }
     }
     if text.contains("-----BEGIN PRIVATE KEY-----")
@@ -97,18 +140,72 @@ fn secret_issues(url: &str, text: &str, source: Option<&str>) -> Vec<ArtifactIss
         || text.contains("-----BEGIN EC PRIVATE KEY-----")
         || text.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
     {
-        issues.push(secret_issue(url, "Private key", None, source));
+        issues.push({
+let (url, category, key, source,): (& str, & str, Option < & str >, Option < & str >,) = (url, "Private key", None, source,);
+
+    let key = key.map(|key| format!(", key {key}")).unwrap_or_default();
+    let source = source
+        .map(|value: & str| {
+    value
+        .chars()
+        .filter(|value| !value.is_control())
+        .take(240)
+        .collect::<String>()
+})
+        .map(|source| format!(", source {source}"))
+        .unwrap_or_default();
+    ArtifactIssue {
+        title: "Secret material exposed in public artifact",
+        description: "A public source map or configuration artifact contains a high-confidence credential",
+        evidence: format!(
+            "Artifact {url}, category {category}{key}{source}; secret value withheld"
+        ),
     }
-    if CREDENTIAL_URL
-        .find_iter(text)
-        .any(|matched| !placeholder_token(matched.as_str()))
-    {
-        issues.push(secret_issue(
-            url,
-            "Credential-bearing connection URL",
-            None,
-            source,
-        ));
+
+});
+    }
+    if CREDENTIAL_URL.find_iter(text).any(|matched| !{
+        let (value,): (&str,) = (matched.as_str(),);
+
+        let lower = value.to_ascii_lowercase();
+        lower.contains("example")
+            || lower.contains("placeholder")
+            || lower.contains("changeme")
+            || lower.contains(":password@")
+            || lower.contains(":passwd@")
+            || lower.contains(":secret@")
+            || lower.contains("your_")
+            || lower.contains("your-")
+            || value
+                .bytes()
+                .filter(|byte| byte.is_ascii_alphanumeric())
+                .collect::<BTreeSet<_>>()
+                .len()
+                < 8
+    }) {
+        issues.push({
+let (url, category, key, source,): (& str, & str, Option < & str >, Option < & str >,) = (url, "Credential-bearing connection URL", None, source,);
+
+    let key = key.map(|key| format!(", key {key}")).unwrap_or_default();
+    let source = source
+        .map(|value: & str| {
+    value
+        .chars()
+        .filter(|value| !value.is_control())
+        .take(240)
+        .collect::<String>()
+})
+        .map(|source| format!(", source {source}"))
+        .unwrap_or_default();
+    ArtifactIssue {
+        title: "Secret material exposed in public artifact",
+        description: "A public source map or configuration artifact contains a high-confidence credential",
+        evidence: format!(
+            "Artifact {url}, category {category}{key}{source}; secret value withheld"
+        ),
+    }
+
+});
     }
     for line in text.lines().take(100_000) {
         let line = line.trim();
@@ -132,77 +229,52 @@ fn secret_issues(url: &str, text: &str, source: Option<&str>) -> Vec<ArtifactIss
         if !matches!(
             normalized.as_str(),
             "client_secret" | "private_key" | "password" | "api_key" | "access_token"
-        ) || !literal_secret(value)
-        {
+        ) || !{
+            let (value,): (&str,) = (value,);
+            'inlined_literal_secret: {
+                let value = value
+                    .trim()
+                    .trim_end_matches([',', ';'])
+                    .trim()
+                    .trim_matches(['\'', '"'])
+                    .trim();
+                if value.len() < 8 || value.len() > 4096 || value.chars().any(char::is_whitespace) {
+                    break 'inlined_literal_secret false;
+                }
+                let lower = value.to_ascii_lowercase();
+                !lower.starts_with('$')
+                    && !lower.starts_with('%')
+                    && !lower.starts_with("{{")
+                    && !lower.starts_with('<')
+                    && !lower.contains("process.env")
+                    && !lower.contains("os.environ")
+                    && !lower.contains("getenv(")
+                    && !lower.contains("secretref")
+                    && !lower.contains("changeme")
+                    && !lower.contains("placeholder")
+                    && !lower.contains("example")
+                    && !lower.contains("your_")
+                    && !lower.contains("your-")
+                    && !lower.contains("replace_me")
+                    && !lower
+                        .chars()
+                        .all(|value| matches!(value, 'x' | '*' | '-' | '_' | '.'))
+            }
+        } {
             continue;
         }
-        issues.push(secret_issue(
-            url,
-            "High-confidence literal credential",
-            Some(&normalized),
-            source,
-        ));
-    }
-    deduplicate(issues)
-}
+        issues.push({
+let (url, category, key, source,): (& str, & str, Option < & str >, Option < & str >,) = (url, "High-confidence literal credential", Some(&normalized), source,);
 
-fn placeholder_token(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("example")
-        || lower.contains("placeholder")
-        || lower.contains("changeme")
-        || lower.contains(":password@")
-        || lower.contains(":passwd@")
-        || lower.contains(":secret@")
-        || lower.contains("your_")
-        || lower.contains("your-")
-        || value
-            .bytes()
-            .filter(|byte| byte.is_ascii_alphanumeric())
-            .collect::<BTreeSet<_>>()
-            .len()
-            < 8
-}
-
-fn literal_secret(value: &str) -> bool {
-    let value = value
-        .trim()
-        .trim_end_matches([',', ';'])
-        .trim()
-        .trim_matches(['\'', '"'])
-        .trim();
-    if value.len() < 8 || value.len() > 4096 || value.chars().any(char::is_whitespace) {
-        return false;
-    }
-    let lower = value.to_ascii_lowercase();
-    !lower.starts_with('$')
-        && !lower.starts_with('%')
-        && !lower.starts_with("{{")
-        && !lower.starts_with('<')
-        && !lower.contains("process.env")
-        && !lower.contains("os.environ")
-        && !lower.contains("getenv(")
-        && !lower.contains("secretref")
-        && !lower.contains("changeme")
-        && !lower.contains("placeholder")
-        && !lower.contains("example")
-        && !lower.contains("your_")
-        && !lower.contains("your-")
-        && !lower.contains("replace_me")
-        && !lower
-            .chars()
-            .all(|value| matches!(value, 'x' | '*' | '-' | '_' | '.'))
-}
-
-fn secret_issue(
-    url: &str,
-    category: &str,
-    key: Option<&str>,
-    source: Option<&str>,
-) -> ArtifactIssue {
     let key = key.map(|key| format!(", key {key}")).unwrap_or_default();
     let source = source
-        .map(safe_source)
+        .map(|value: & str| {
+    value
+        .chars()
+        .filter(|value| !value.is_control())
+        .take(240)
+        .collect::<String>()
+})
         .map(|source| format!(", source {source}"))
         .unwrap_or_default();
     ArtifactIssue {
@@ -212,14 +284,18 @@ fn secret_issue(
             "Artifact {url}, category {category}{key}{source}; secret value withheld"
         ),
     }
-}
 
-fn safe_source(value: &str) -> String {
-    value
-        .chars()
-        .filter(|value| !value.is_control())
-        .take(240)
-        .collect()
+});
+    }
+    {
+        let (issues,): (Vec<ArtifactIssue>,) = (issues,);
+
+        let mut seen = BTreeSet::new();
+        issues
+            .into_iter()
+            .filter(|issue| seen.insert((issue.title, issue.evidence.clone())))
+            .collect()
+    }
 }
 
 fn safe_url(value: &str) -> String {
@@ -229,12 +305,4 @@ fn safe_url(value: &str) -> String {
     url.set_query(None);
     url.set_fragment(None);
     url.to_string()
-}
-
-fn deduplicate(issues: Vec<ArtifactIssue>) -> Vec<ArtifactIssue> {
-    let mut seen = BTreeSet::new();
-    issues
-        .into_iter()
-        .filter(|issue| seen.insert((issue.title, issue.evidence.clone())))
-        .collect()
 }

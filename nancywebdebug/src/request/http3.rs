@@ -1,7 +1,6 @@
 use crate::auth::LoadedClientCertificate;
 use crate::diagnostics::{
     ConnectionOutcome, DiagnosticProgress, DiagnosticTrace, StageKind, StageStatus,
-    format_byte_size,
 };
 use crate::network::ConnectionRateLimiter;
 use bytes::{Buf, Bytes};
@@ -24,7 +23,7 @@ pub(super) async fn run(
     headers: HeaderMap,
     addresses: Vec<IpAddr>,
     cancel: CancellationToken,
-    progress: Sender<DiagnosticProgress>,
+    progress: Option<Sender<DiagnosticProgress>>,
     limiter: Option<Arc<ConnectionRateLimiter>>,
     client_certificate: Option<LoadedClientCertificate>,
 ) -> DiagnosticTrace {
@@ -80,7 +79,6 @@ pub(super) async fn run(
             status,
             quic_started,
             "All QUIC connection attempts failed".to_owned(),
-            &progress,
         );
     };
     let selected = &mut candidates[selected_index];
@@ -113,7 +111,7 @@ pub(super) async fn run(
     trace.http.request_headers =
         request_headers_for_version(&trace, &headers, &method, Version::HTTP_3);
     let request = match build_request(&trace, method, headers, Version::HTTP_3) {
-        Ok(request) => request.map(|_| ()),
+        Ok(request) => request,
         Err(error) => {
             let started = begin_stage(&mut trace, StageKind::HttpHeaders, &progress);
             return fail_trace(
@@ -122,7 +120,6 @@ pub(super) async fn run(
                 StageStatus::Failed,
                 started,
                 error,
-                &progress,
             );
         }
     };
@@ -138,7 +135,6 @@ pub(super) async fn run(
                 StageStatus::Failed,
                 started,
                 error.to_string(),
-                &progress,
             );
         }
     };
@@ -151,7 +147,7 @@ pub(super) async fn run(
             .map_err(|error| error.to_string())?;
         if !trace.request.body.is_empty() {
             stream
-                .send_data(Bytes::copy_from_slice(&trace.request.body))
+                .send_data(Bytes::from_owner(trace.request.body.clone()))
                 .await
                 .map_err(|error| error.to_string())?;
         }
@@ -173,7 +169,6 @@ pub(super) async fn run(
                 StageStatus::Failed,
                 headers_started,
                 error,
-                &progress,
             );
         }
         Err(WaitError::TimedOut) => {
@@ -184,7 +179,6 @@ pub(super) async fn run(
                 StageStatus::TimedOut,
                 headers_started,
                 "HTTP header stage timed out".to_owned(),
-                &progress,
             );
         }
         Err(WaitError::Cancelled) => {
@@ -195,7 +189,6 @@ pub(super) async fn run(
                 StageStatus::Cancelled,
                 headers_started,
                 "Request cancelled".to_owned(),
-                &progress,
             );
         }
     };
@@ -215,7 +208,10 @@ pub(super) async fn run(
         &progress,
     );
 
-    let mut captured_body = BoundedCapture::new();
+    let mut captured_body = BoundedCapture {
+        bytes: Vec::new(),
+        truncated: false,
+    };
     let first_started = begin_stage(&mut trace, StageKind::FirstByte, &progress);
     let first_data = async {
         loop {
@@ -239,13 +235,22 @@ pub(super) async fn run(
                     break;
                 }
             }
-            let length = captured_body.len();
+            let length = (captured_body).bytes.len();
             finish_stage(
                 &mut trace,
                 StageKind::FirstByte,
                 StageStatus::Succeeded,
                 first_started,
-                format_byte_size(length),
+                {
+                    let bytes: usize = length;
+                    if bytes >= 1_000_000 {
+                        format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+                    } else if bytes >= 1_000 {
+                        format!("{:.2} KB", bytes as f64 / 1_000.0)
+                    } else {
+                        format!("{bytes} bytes")
+                    }
+                },
                 &progress,
             );
         }
@@ -267,7 +272,6 @@ pub(super) async fn run(
                 StageStatus::Failed,
                 first_started,
                 error.to_string(),
-                &progress,
             );
         }
         Err(WaitError::TimedOut) => {
@@ -278,7 +282,6 @@ pub(super) async fn run(
                 StageStatus::TimedOut,
                 first_started,
                 "First response byte timed out".to_owned(),
-                &progress,
             );
         }
         Err(WaitError::Cancelled) => {
@@ -289,7 +292,6 @@ pub(super) async fn run(
                 StageStatus::Cancelled,
                 first_started,
                 "Request cancelled".to_owned(),
-                &progress,
             );
         }
     }
@@ -297,7 +299,7 @@ pub(super) async fn run(
     let body_started = begin_stage(&mut trace, StageKind::Body, &progress);
     let body_timeout = trace.request.timeouts.body;
     let body_read = async {
-        while !captured_body.is_truncated() {
+        while !(captured_body).truncated {
             match stream.recv_data().await {
                 Ok(Some(mut bytes)) => {
                     while bytes.has_remaining() {
@@ -315,16 +317,22 @@ pub(super) async fn run(
                 Err(error) => return Err(error.to_string()),
             }
         }
-        if !captured_body.is_truncated()
+        if !(captured_body).truncated
             && let Some(trailers) = stream
                 .recv_trailers()
                 .await
                 .map_err(|error| error.to_string())?
         {
-            trace
-                .http
-                .response_trailers
-                .extend(super::http::header_map_to_trace(&trailers));
+            trace.http.response_trailers.extend(
+                (&trailers)
+                    .iter()
+                    .map(|(name, value)| crate::diagnostics::HeaderTrace {
+                        name: name.to_string(),
+                        value: value.as_bytes().to_vec(),
+                        pseudo: false,
+                    })
+                    .collect::<Vec<_>>(),
+            );
         }
         Ok(())
     };
@@ -332,44 +340,57 @@ pub(super) async fn run(
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             driver_task.abort();
-            captured_body.store(&mut trace);
+            ({
+                let trace: &mut crate::diagnostics::DiagnosticTrace = &mut trace;
+                trace.body.raw = std::sync::Arc::from((captured_body).bytes);
+                trace.body.raw_truncated = (captured_body).truncated;
+            });
             return fail_trace(
                 trace,
                 StageKind::Body,
                 StageStatus::Failed,
                 body_started,
                 error,
-                &progress,
             );
         }
         Err(WaitError::TimedOut) => {
             driver_task.abort();
-            captured_body.store(&mut trace);
+            ({
+                let trace: &mut crate::diagnostics::DiagnosticTrace = &mut trace;
+                trace.body.raw = std::sync::Arc::from((captured_body).bytes);
+                trace.body.raw_truncated = (captured_body).truncated;
+            });
             return fail_trace(
                 trace,
                 StageKind::Body,
                 StageStatus::TimedOut,
                 body_started,
                 "Response body timed out".to_owned(),
-                &progress,
             );
         }
         Err(WaitError::Cancelled) => {
             driver_task.abort();
-            captured_body.store(&mut trace);
+            ({
+                let trace: &mut crate::diagnostics::DiagnosticTrace = &mut trace;
+                trace.body.raw = std::sync::Arc::from((captured_body).bytes);
+                trace.body.raw_truncated = (captured_body).truncated;
+            });
             return fail_trace(
                 trace,
                 StageKind::Body,
                 StageStatus::Cancelled,
                 body_started,
                 "Request cancelled".to_owned(),
-                &progress,
             );
         }
     }
     driver_task.abort();
     connection.close(0u32.into(), b"complete");
     endpoint.wait_idle().await;
-    captured_body.store(&mut trace);
-    finish_body(trace, body_started, progress)
+    ({
+        let trace: &mut crate::diagnostics::DiagnosticTrace = &mut trace;
+        trace.body.raw = std::sync::Arc::from((captured_body).bytes);
+        trace.body.raw_truncated = (captured_body).truncated;
+    });
+    finish_body(trace, body_started)
 }

@@ -1,0 +1,196 @@
+{
+  "apps": {
+    "WordPress": {
+      "cats": [1],
+      "headers": {
+        "link": "rel\\s*=\\s*[\"']https://api\\.w\\.org/[\"']"
+      },
+      "meta": {
+        "generator": ["^WordPress(?:\\s+([0-9]+(?:\\.[0-9]+)+))?(?:\\s|$)\\;version:\\1"]
+      },
+      "scriptSrc": ["/wp-(?:content|includes)/"],
+      "html": ["<link\\b[^>]*\\bhref\\s*=\\s*[\"'][^\"']*/wp-(?:content|includes)/[^\"']*\\.css(?:[?\"'])\\;confidence:75"]
+    },
+    "Drupal": {
+      "cats": [1],
+      "headers": {
+        "x-drupal-cache": "",
+        "x-drupal-dynamic-cache": "",
+        "x-generator": "^Drupal(?:\\s+([0-9]+(?:\\.[0-9]+)*))?\\b\\;version:\\1"
+      },
+      "meta": {
+        "generator": ["^Drupal(?:\\s+([0-9]+(?:\\.[0-9]+)*))?\\b\\;version:\\1"]
+      },
+      "scriptSrc": ["/(?:core|misc)/drupal(?:\\.min)?\\.js$"]
+    },
+    "Joomla": {
+      "cats": [1],
+      "headers": {
+        "x-content-encoded-by": "^Joomla!(?:\\s+([0-9]+(?:\\.[0-9]+)+))?(?:\\s|$)\\;version:\\1"
+      },
+      "meta": {
+        "generator": ["^Joomla!(?:\\s+([0-9]+(?:\\.[0-9]+)+))?(?:\\s|$)\\;version:\\1"]
+      },
+      "scriptSrc": ["/media/system/js/joomla-[^/]+\\.js$\\;confidence:75"]
+    },
+    "Ghost": {
+      "cats": [1],
+      "headers": {
+        "x-ghost-cache-status": ""
+      },
+      "meta": {
+        "generator": ["^Ghost(?:\\s+([0-9]+(?:\\.[0-9]+)+))?(?:\\s|$)\\;version:\\1"]
+      }
+    },
+    "Shopify": {
+      "cats": [2],
+      "headers": {
+        "powered-by": "^Shopify$",
+        "x-shopify-stage": "",
+        "x-shopid": "^[0-9]+$\\;confidence:75"
+      },
+      "cookies": {
+        "_shopify_s": "\\;confidence:75",
+        "_shopify_y": "\\;confidence:75"
+      },
+      "scripts": ["\\bShopify\\.shop\\s*=\\s*[\"'][a-z0-9-]+\\.myshopify\\.com[\"']"]
+    },
+    "Magento": {
+      "cats": [2],
+      "headers": {
+        "x-magento-cache-debug": ""
+      },
+      "cookies": {
+        "mage-cache-storage": "",
+        "mage-cache-storage-section-invalidation": "",
+        "x-magento-vary": ""
+      },
+      "meta": {
+        "generator": ["^Magento(?:\\s+([0-9]+(?:\\.[0-9]+)+))?(?:\\s|$)\\;version:\\1"]
+      },
+      "html": ["<script\\b[^>]*\\btype\\s*=\\s*[\"']text/x-magento-init[\"']"]
+    },
+    "PrestaShop": {
+      "cats": [2],
+      "headers": {
+        "powered-by": "^PrestaShop$"
+      },
+      "meta": {
+        "generator": ["^PrestaShop(?:\\s+([0-9]+(?:\\.[0-9]+)+))?(?:\\s|$)\\;version:\\1"]
+      },
+      "scriptSrc": ["/modules/ps_[a-z0-9_]+/[^?#]+\\.js$\\;confidence:75"]
+    },
+    "WooCommerce": {
+      "cats": [2],
+      "meta": {
+        "generator": ["^WooCommerce(?:\\s+([0-9]+(?:\\.[0-9]+)+))?(?:\\s|$)\\;version:\\1"]
+      },
+      "scriptSrc": ["/wp-content/plugins/woocommerce/"],
+      "implies": ["WordPress"]
+    },
+    "Grafana": {
+      "cats": [3],
+      "html": ["<title\\b[^>]*>\\s*Grafana\\s*</title>\\;confidence:75"],
+      "scripts": ["\\b(?:window\\.)?grafanaBootData\\s*=\\s*\\{"]
+    },
+    "Jenkins": {
+      "cats": [3],
+      "headers": {
+        "x-jenkins": "^(?:([0-9]+(?:\\.[0-9]+)+))?\\;version:\\1"
+      },
+      "html": ["<title\\b[^>]*>[^<]*\\[Jenkins\\]\\s*</title>\\;confidence:75"]
+    },
+    "GitLab": {
+      "cats": [3],
+      "cookies": {
+        "_gitlab_session": ""
+      },
+      "meta": {
+        "og:site_name": ["^GitLab$\\;confidence:75"]
+      },
+      "html": ["<meta\\b[^>]*\\bcontent\\s*=\\s*[\"'][^\"']*/assets/gitlab_logo-[^\"']+[\"']\\;confidence:75"]
+    },
+    "Portainer": {
+      "cats": [3],
+      "html": [
+        "<title\\b[^>]*>\\s*Portainer(?:\\s+(?:CE|BE|Community Edition|Business Edition))?\\s*</title>\\;confidence:75",
+        "<html\\b[^>]*\\bng-app\\s*=\\s*[\"']portainer[\"']"
+      ]
+    },
+    "Keycloak": {
+      "cats": [3],
+      "html": ["<form\\b[^>]*\\bid\\s*=\\s*[\"']kc-form-login[\"']"],
+      "cookies": {
+        "KEYCLOAK_IDENTITY": "",
+        "KEYCLOAK_SESSION": ""
+      }
+    },
+    "Kibana": {
+      "cats": [3],
+      "headers": {
+        "kbn-name": "^kibana$",
+        "kbn-version": "^([0-9]+(?:\\.[0-9]+)+)(?:[-+][a-z0-9.-]+)?$\\;version:\\1"
+      },
+      "html": ["<title\\b[^>]*>\\s*Kibana\\s*</title>\\;confidence:75"]
+    },
+    "SonarQube": {
+      "cats": [3],
+      "meta": {
+        "application-name": ["^SonarQube$"]
+      },
+      "html": ["<title\\b[^>]*>\\s*SonarQube\\s*</title>\\;confidence:75"]
+    },
+    "Argo CD": {
+      "cats": [3],
+      "html": ["<title\\b[^>]*>\\s*Argo\\s+CD\\s*</title>\\;confidence:75"]
+    },
+    "Vercel": {
+      "cats": [5],
+      "headers": {
+        "server": "^Vercel$",
+        "x-vercel-id": "",
+        "x-vercel-cache": ""
+      }
+    },
+    "Netlify": {
+      "cats": [5],
+      "headers": {
+        "server": "^Netlify$",
+        "x-nf-request-id": ""
+      }
+    },
+    "Fastly": {
+      "cats": [4],
+      "headers": {
+        "server": "^Fastly$",
+        "fastly-debug-digest": "",
+        "x-fastly-request-id": ""
+      }
+    },
+    "Amazon CloudFront": {
+      "cats": [4],
+      "headers": {
+        "x-amz-cf-id": "",
+        "x-amz-cf-pop": "",
+        "via": "\\(cloudfront\\)(?:\\s*,|\\s*$)"
+      }
+    },
+    "Cloudflare": {
+      "cats": [4],
+      "headers": {
+        "server": "^Cloudflare$",
+        "cf-ray": "",
+        "cf-cache-status": ""
+      }
+    },
+    "Azure App Service": {
+      "cats": [5],
+      "headers": {
+        "x-waws-unencoded-url": "\\;confidence:75",
+        "x-site-deployment-id": "\\;confidence:75",
+        "set-cookie": "(?:^|,\\s*)ARRAffinity(?:SameSite)?=[^;]*;[^\\r\\n]*\\bdomain=\\.?[a-z0-9-]+\\.azurewebsites\\.net(?:;|$)"
+      },
+      "html": ["<title\\b[^>]*>\\s*Microsoft Azure App Service\\s*</title>\\;confidence:75"]
+    }
+  }
+}

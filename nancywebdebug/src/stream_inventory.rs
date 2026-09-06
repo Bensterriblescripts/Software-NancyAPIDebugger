@@ -36,7 +36,19 @@ pub(super) fn collect(
     let mut observations = Vec::new();
     for endpoint in endpoints {
         for response in &endpoint.http {
-            collect_response(response, &mut observations);
+            ({
+                let (response, observations): (&HttpObservation, &mut Vec<StreamObservation>) =
+                    (response, &mut observations);
+
+                collect_body(
+                    &response.url,
+                    &response.headers,
+                    &response.body,
+                    Some(&response.framing),
+                    Some(response.status),
+                    observations,
+                );
+            });
         }
     }
     for resource in &crawl.technology_resources {
@@ -50,7 +62,19 @@ pub(super) fn collect(
         );
     }
     for script in scripts {
-        collect_response(&script.response, &mut observations);
+        ({
+            let (response, observations): (&HttpObservation, &mut Vec<StreamObservation>) =
+                (&script.response, &mut observations);
+
+            collect_body(
+                &response.url,
+                &response.headers,
+                &response.body,
+                Some(&response.framing),
+                Some(response.status),
+                observations,
+            );
+        });
     }
     observations.extend(crawl.stream_observations.clone());
     for form in &crawl.forms {
@@ -68,7 +92,61 @@ pub(super) fn collect(
             });
         }
     }
-    reconcile_crawl_results(&mut observations, &crawl.resources);
+    ({
+        let (observations, resources): (&mut Vec<StreamObservation>, &[CrawledResource]) =
+            (&mut observations, &crawl.resources);
+
+        let confirmed = observations
+            .iter()
+            .filter(|observation| observation.status == StreamStatus::Confirmed)
+            .flat_map(|observation| observation.endpoints.iter().cloned())
+            .collect::<HashSet<_>>();
+        let mut additions = Vec::new();
+        for observation in observations
+            .iter()
+            .filter(|observation| observation.status == StreamStatus::Candidate)
+        {
+            if observation
+                .evidence
+                .iter()
+                .any(|evidence| evidence.contains("POST-only"))
+            {
+                continue;
+            }
+            for endpoint in &observation.endpoints {
+                let Some(resource) = resources.iter().find(|resource| resource.url == *endpoint)
+                else {
+                    continue;
+                };
+                let (status, evidence) = match resource.status {
+                    Some(401 | 403) => (
+                        StreamStatus::Protected,
+                        format!(
+                            "Safe GET returned HTTP {}",
+                            resource.status.unwrap_or_default()
+                        ),
+                    ),
+                    Some(status)
+                        if (200..300).contains(&status) && !confirmed.contains(endpoint) =>
+                    {
+                        (
+                            StreamStatus::Inconclusive,
+                            format!(
+                                "Safe GET returned HTTP {status} without recognizable streaming evidence"
+                            ),
+                        )
+                    }
+                    _ => continue,
+                };
+                let mut result = observation.clone();
+                result.source_url = endpoint.clone();
+                result.status = status;
+                result.evidence = vec![evidence];
+                additions.push(result);
+            }
+        }
+        observations.extend(additions);
+    });
     merge_observations(&mut observations);
     observations
 }
@@ -108,19 +186,20 @@ fn merge_observations(observations: &mut Vec<StreamObservation>) {
 
 pub(super) fn observations_for_response(response: &HttpObservation) -> Vec<StreamObservation> {
     let mut observations = Vec::new();
-    collect_response(response, &mut observations);
-    observations
-}
+    ({
+        let (response, observations): (&HttpObservation, &mut Vec<StreamObservation>) =
+            (response, &mut observations);
 
-fn collect_response(response: &HttpObservation, observations: &mut Vec<StreamObservation>) {
-    collect_body(
-        &response.url,
-        &response.headers,
-        &response.body,
-        Some(&response.framing),
-        Some(response.status),
-        observations,
-    );
+        collect_body(
+            &response.url,
+            &response.headers,
+            &response.body,
+            Some(&response.framing),
+            Some(response.status),
+            observations,
+        );
+    });
+    observations
 }
 
 fn collect_body(
@@ -139,7 +218,109 @@ fn collect_body(
     let text = String::from_utf8_lossy(&body[..body.len().min(256 * 1024)]);
     let successful = status.is_none_or(|status| (200..300).contains(&status));
     if successful {
-        classify_http_body(source_url, &content_type, &text, framing, observations);
+        ({
+            let (source_url, content_type, text, framing, observations): (
+                &str,
+                &str,
+                &str,
+                Option<&ResponseFraming>,
+                &mut Vec<StreamObservation>,
+            ) = (source_url, &content_type, &text, framing, observations);
+
+            let sse_frames = text
+                .lines()
+                .filter(|line| line.trim_start().starts_with("data:"))
+                .count();
+            if content_type.contains("text/event-stream") || sse_frames >= 2 {
+                confirmed(
+                    observations,
+                    source_url,
+                    StreamKind::ServerSentEvents,
+                    if content_type.contains("text/event-stream") {
+                        "Content-Type is text/event-stream"
+                    } else {
+                        "Multiple SSE data frames were observed"
+                    },
+                );
+            }
+            let json_lines = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .take(16)
+                .filter(|line| serde_json::from_str::<serde_json::Value>(line.trim()).is_ok())
+                .count();
+            if content_type.contains("ndjson")
+                || content_type.contains("x-ndjson")
+                || json_lines >= 2
+            {
+                confirmed(
+                    observations,
+                    source_url,
+                    StreamKind::Ndjson,
+                    if content_type.contains("ndjson") {
+                        "NDJSON content type observed"
+                    } else {
+                        "Multiple newline-delimited JSON values were observed"
+                    },
+                );
+            }
+            let json_sequence_records =
+                text.as_bytes().iter().filter(|byte| **byte == 0x1e).count();
+            if content_type.contains("application/json-seq") || json_sequence_records >= 2 {
+                confirmed(
+                    observations,
+                    source_url,
+                    StreamKind::JsonSequence,
+                    "JSON text-sequence content type or record separators observed",
+                );
+            }
+            if content_type.contains("mpegurl") || text.trim_start().starts_with("#EXTM3U") {
+                confirmed(
+                    observations,
+                    source_url,
+                    StreamKind::Hls,
+                    "HLS content type or #EXTM3U playlist framing observed",
+                );
+            }
+            let lower = text.trim_start().to_ascii_lowercase();
+            if content_type.contains("dash+xml")
+                || lower.starts_with("<mpd")
+                || lower.starts_with("<?xml") && lower.contains("<mpd")
+            {
+                confirmed(
+                    observations,
+                    source_url,
+                    StreamKind::Dash,
+                    "DASH content type or MPD document observed",
+                );
+            }
+            if let Some(framing) = framing.filter(|framing| framing.transfer_chunked) {
+                let incremental = !framing.completed && framing.decoded_chunks >= 2;
+                observations.push(StreamObservation {
+            source_url: source_url.to_owned(),
+            kind: StreamKind::ChunkedIncremental,
+            status: if incremental {
+                StreamStatus::Confirmed
+            } else {
+                StreamStatus::Inconclusive
+            },
+            confidence: if incremental {
+                Confidence::Medium
+            } else {
+                Confidence::Low
+            },
+            evidence: vec![if incremental {
+                format!(
+                    "Incomplete chunked delivery produced {} chunks across {} reads",
+                    framing.decoded_chunks, framing.body_read_events
+                )
+            } else {
+                "Transfer-Encoding: chunked alone is weak evidence; no sustained incremental delivery was established".to_owned()
+            }],
+            endpoints: vec![source_url.to_owned()],
+        });
+            }
+        });
     }
     let sdp = content_type.contains("application/sdp")
         || text.lines().take(10).any(|line| line.trim() == "v=0")
@@ -207,7 +388,414 @@ fn collect_body(
             endpoints: ice,
         });
     }
-    discover_candidates(source_url, &text, observations);
+    ({
+        let (source_url, text, observations): (&str, &str, &mut Vec<StreamObservation>) =
+            (source_url, &text, observations);
+
+        for capture in EVENT_SOURCE.captures_iter(text).take(64) {
+            ({
+                let (observations, source_url, kind, endpoint, evidence, post_only): (
+                    &mut Vec<StreamObservation>,
+                    &str,
+                    StreamKind,
+                    Option<&str>,
+                    &str,
+                    bool,
+                ) = (
+                    observations,
+                    source_url,
+                    StreamKind::EventSource,
+                    capture.get(1).map(|value| value.as_str()),
+                    "JavaScript EventSource constructor",
+                    false,
+                );
+                'inlined_candidate: {
+                    let Some(endpoint) =
+                        endpoint.and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                    else {
+                        break 'inlined_candidate;
+                    };
+                    let mut evidence = vec![evidence.to_owned()];
+                    if post_only {
+                        evidence.push(
+                            "POST-only candidate; automatic validation was not attempted"
+                                .to_owned(),
+                        );
+                    }
+                    observations.push(StreamObservation {
+                        source_url: source_url.to_owned(),
+                        kind,
+                        status: StreamStatus::Candidate,
+                        confidence: if post_only {
+                            Confidence::Low
+                        } else {
+                            Confidence::Medium
+                        },
+                        evidence,
+                        endpoints: vec![endpoint],
+                    });
+                }
+            });
+        }
+        for capture in WEB_SOCKET.captures_iter(text).take(64) {
+            ({
+                let (observations, source_url, kind, endpoint, evidence, post_only): (
+                    &mut Vec<StreamObservation>,
+                    &str,
+                    StreamKind,
+                    Option<&str>,
+                    &str,
+                    bool,
+                ) = (
+                    observations,
+                    source_url,
+                    StreamKind::WebSocket,
+                    capture.get(1).map(|value| value.as_str()),
+                    "JavaScript WebSocket constructor",
+                    false,
+                );
+                'inlined_candidate: {
+                    let Some(endpoint) =
+                        endpoint.and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                    else {
+                        break 'inlined_candidate;
+                    };
+                    let mut evidence = vec![evidence.to_owned()];
+                    if post_only {
+                        evidence.push(
+                            "POST-only candidate; automatic validation was not attempted"
+                                .to_owned(),
+                        );
+                    }
+                    observations.push(StreamObservation {
+                        source_url: source_url.to_owned(),
+                        kind,
+                        status: StreamStatus::Candidate,
+                        confidence: if post_only {
+                            Confidence::Low
+                        } else {
+                            Confidence::Medium
+                        },
+                        evidence,
+                        endpoints: vec![endpoint],
+                    });
+                }
+            });
+        }
+        for capture in MEDIA_SOURCE.captures_iter(text).take(128) {
+            ({
+                let (observations, source_url, kind, endpoint, evidence, post_only): (
+                    &mut Vec<StreamObservation>,
+                    &str,
+                    StreamKind,
+                    Option<&str>,
+                    &str,
+                    bool,
+                ) = (
+                    observations,
+                    source_url,
+                    StreamKind::MediaElement,
+                    capture.get(1).map(|value| value.as_str()),
+                    "HTML video, audio, or source element",
+                    false,
+                );
+                'inlined_candidate: {
+                    let Some(endpoint) =
+                        endpoint.and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                    else {
+                        break 'inlined_candidate;
+                    };
+                    let mut evidence = vec![evidence.to_owned()];
+                    if post_only {
+                        evidence.push(
+                            "POST-only candidate; automatic validation was not attempted"
+                                .to_owned(),
+                        );
+                    }
+                    observations.push(StreamObservation {
+                        source_url: source_url.to_owned(),
+                        kind,
+                        status: StreamStatus::Candidate,
+                        confidence: if post_only {
+                            Confidence::Low
+                        } else {
+                            Confidence::Medium
+                        },
+                        evidence,
+                        endpoints: vec![endpoint],
+                    });
+                }
+            });
+        }
+        let readable = text.contains("ReadableStream")
+            || text.contains("response.body")
+            || text.contains("getReader(");
+        if readable {
+            let mut found = false;
+            for capture in FETCH_SOURCE.captures_iter(text).take(64) {
+                found = true;
+                let options = capture.get(2).map_or("", |value| value.as_str());
+                ({
+                    let (observations, source_url, kind, endpoint, evidence, post_only): (
+                        &mut Vec<StreamObservation>,
+                        &str,
+                        StreamKind,
+                        Option<&str>,
+                        &str,
+                        bool,
+                    ) = (
+                        observations,
+                        source_url,
+                        StreamKind::ReadableStream,
+                        capture.get(1).map(|value| value.as_str()),
+                        "JavaScript fetch associated with ReadableStream consumption",
+                        options.to_ascii_lowercase().contains("method")
+                            && options.to_ascii_lowercase().contains("post"),
+                    );
+                    'inlined_candidate: {
+                        let Some(endpoint) =
+                            endpoint.and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                        else {
+                            break 'inlined_candidate;
+                        };
+                        let mut evidence = vec![evidence.to_owned()];
+                        if post_only {
+                            evidence.push(
+                                "POST-only candidate; automatic validation was not attempted"
+                                    .to_owned(),
+                            );
+                        }
+                        observations.push(StreamObservation {
+                            source_url: source_url.to_owned(),
+                            kind,
+                            status: StreamStatus::Candidate,
+                            confidence: if post_only {
+                                Confidence::Low
+                            } else {
+                                Confidence::Medium
+                            },
+                            evidence,
+                            endpoints: vec![endpoint],
+                        });
+                    }
+                });
+            }
+            if !found {
+                observations.push(StreamObservation {
+                    source_url: source_url.to_owned(),
+                    kind: StreamKind::ReadableStream,
+                    status: StreamStatus::Candidate,
+                    confidence: Confidence::Low,
+                    evidence: vec![
+                    "JavaScript ReadableStream usage found without a safely extractable endpoint"
+                        .to_owned(),
+                ],
+                    endpoints: Vec::new(),
+                });
+            }
+        }
+        for capture in XHR_SOURCE.captures_iter(text).take(64) {
+            let post = capture
+                .get(1)
+                .is_some_and(|method| method.as_str().eq_ignore_ascii_case("POST"));
+            ({
+                let (observations, source_url, kind, endpoint, evidence, post_only): (
+                    &mut Vec<StreamObservation>,
+                    &str,
+                    StreamKind,
+                    Option<&str>,
+                    &str,
+                    bool,
+                ) = (
+                    observations,
+                    source_url,
+                    StreamKind::ChunkedIncremental,
+                    capture.get(2).map(|value| value.as_str()),
+                    "JavaScript XMLHttpRequest API endpoint",
+                    post,
+                );
+                'inlined_candidate: {
+                    let Some(endpoint) =
+                        endpoint.and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                    else {
+                        break 'inlined_candidate;
+                    };
+                    let mut evidence = vec![evidence.to_owned()];
+                    if post_only {
+                        evidence.push(
+                            "POST-only candidate; automatic validation was not attempted"
+                                .to_owned(),
+                        );
+                    }
+                    observations.push(StreamObservation {
+                        source_url: source_url.to_owned(),
+                        kind,
+                        status: StreamStatus::Candidate,
+                        confidence: if post_only {
+                            Confidence::Low
+                        } else {
+                            Confidence::Medium
+                        },
+                        evidence,
+                        endpoints: vec![endpoint],
+                    });
+                }
+            });
+        }
+        for capture in POST_HELPER.captures_iter(text).take(64) {
+            ({
+                let (observations, source_url, kind, endpoint, evidence, post_only): (
+                    &mut Vec<StreamObservation>,
+                    &str,
+                    StreamKind,
+                    Option<&str>,
+                    &str,
+                    bool,
+                ) = (
+                    observations,
+                    source_url,
+                    StreamKind::ChunkedIncremental,
+                    capture.get(1).map(|value| value.as_str()),
+                    "JavaScript POST API endpoint",
+                    true,
+                );
+                'inlined_candidate: {
+                    let Some(endpoint) =
+                        endpoint.and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                    else {
+                        break 'inlined_candidate;
+                    };
+                    let mut evidence = vec![evidence.to_owned()];
+                    if post_only {
+                        evidence.push(
+                            "POST-only candidate; automatic validation was not attempted"
+                                .to_owned(),
+                        );
+                    }
+                    observations.push(StreamObservation {
+                        source_url: source_url.to_owned(),
+                        kind,
+                        status: StreamStatus::Candidate,
+                        confidence: if post_only {
+                            Confidence::Low
+                        } else {
+                            Confidence::Medium
+                        },
+                        evidence,
+                        endpoints: vec![endpoint],
+                    });
+                }
+            });
+        }
+        for capture in FETCH_SOURCE.captures_iter(text).take(64) {
+            let endpoint = capture.get(1).map(|value| value.as_str());
+            let Some(endpoint) = endpoint else { continue };
+            let lower = endpoint.to_ascii_lowercase();
+            let options = capture.get(2).map_or("", |value| value.as_str());
+            let post = options.to_ascii_lowercase().contains("method")
+                && options.to_ascii_lowercase().contains("post");
+            ({
+                let (observations, source_url, kind, endpoint, evidence, post_only): (
+                    &mut Vec<StreamObservation>,
+                    &str,
+                    StreamKind,
+                    Option<&str>,
+                    &str,
+                    bool,
+                ) = (
+                    observations,
+                    source_url,
+                    if lower.contains(".m3u8") {
+                        StreamKind::Hls
+                    } else if lower.contains(".mpd") {
+                        StreamKind::Dash
+                    } else {
+                        StreamKind::ChunkedIncremental
+                    },
+                    Some(endpoint),
+                    if lower.contains(".m3u8") || lower.contains(".mpd") {
+                        "Streaming playlist URL referenced by JavaScript"
+                    } else {
+                        "JavaScript fetch API endpoint"
+                    },
+                    post,
+                );
+                'inlined_candidate: {
+                    let Some(endpoint) =
+                        endpoint.and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                    else {
+                        break 'inlined_candidate;
+                    };
+                    let mut evidence = vec![evidence.to_owned()];
+                    if post_only {
+                        evidence.push(
+                            "POST-only candidate; automatic validation was not attempted"
+                                .to_owned(),
+                        );
+                    }
+                    observations.push(StreamObservation {
+                        source_url: source_url.to_owned(),
+                        kind,
+                        status: StreamStatus::Candidate,
+                        confidence: if post_only {
+                            Confidence::Low
+                        } else {
+                            Confidence::Medium
+                        },
+                        evidence,
+                        endpoints: vec![endpoint],
+                    });
+                }
+            });
+        }
+        if readable {
+            for capture in QUOTED_PATH.captures_iter(text).take(64) {
+                ({
+                    let (observations, source_url, kind, endpoint, evidence, post_only): (
+                        &mut Vec<StreamObservation>,
+                        &str,
+                        StreamKind,
+                        Option<&str>,
+                        &str,
+                        bool,
+                    ) = (
+                        observations,
+                        source_url,
+                        StreamKind::ReadableStream,
+                        capture.get(1).map(|value| value.as_str()),
+                        "URL literal near JavaScript streaming APIs",
+                        false,
+                    );
+                    'inlined_candidate: {
+                        let Some(endpoint) =
+                            endpoint.and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                        else {
+                            break 'inlined_candidate;
+                        };
+                        let mut evidence = vec![evidence.to_owned()];
+                        if post_only {
+                            evidence.push(
+                                "POST-only candidate; automatic validation was not attempted"
+                                    .to_owned(),
+                            );
+                        }
+                        observations.push(StreamObservation {
+                            source_url: source_url.to_owned(),
+                            kind,
+                            status: StreamStatus::Candidate,
+                            confidence: if post_only {
+                                Confidence::Low
+                            } else {
+                                Confidence::Medium
+                            },
+                            evidence,
+                            endpoints: vec![endpoint],
+                        });
+                    }
+                });
+            }
+        }
+    });
     if source_url
         .split(['?', '#'])
         .next()
@@ -222,106 +810,409 @@ fn collect_body(
             .filter_map(serde_json::Value::as_str)
             .take(256)
         {
-            discover_candidates(source_url, content, observations);
-        }
-    }
-}
+            ({
+                let (source_url, text, observations): (&str, &str, &mut Vec<StreamObservation>) =
+                    (source_url, content, observations);
 
-fn classify_http_body(
-    source_url: &str,
-    content_type: &str,
-    text: &str,
-    framing: Option<&ResponseFraming>,
-    observations: &mut Vec<StreamObservation>,
-) {
-    let sse_frames = text
-        .lines()
-        .filter(|line| line.trim_start().starts_with("data:"))
-        .count();
-    if content_type.contains("text/event-stream") || sse_frames >= 2 {
-        confirmed(
-            observations,
-            source_url,
-            StreamKind::ServerSentEvents,
-            if content_type.contains("text/event-stream") {
-                "Content-Type is text/event-stream"
-            } else {
-                "Multiple SSE data frames were observed"
-            },
-        );
-    }
-    let json_lines = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .take(16)
-        .filter(|line| serde_json::from_str::<serde_json::Value>(line.trim()).is_ok())
-        .count();
-    if content_type.contains("ndjson") || content_type.contains("x-ndjson") || json_lines >= 2 {
-        confirmed(
-            observations,
-            source_url,
-            StreamKind::Ndjson,
-            if content_type.contains("ndjson") {
-                "NDJSON content type observed"
-            } else {
-                "Multiple newline-delimited JSON values were observed"
-            },
-        );
-    }
-    let json_sequence_records = text.as_bytes().iter().filter(|byte| **byte == 0x1e).count();
-    if content_type.contains("application/json-seq") || json_sequence_records >= 2 {
-        confirmed(
-            observations,
-            source_url,
-            StreamKind::JsonSequence,
-            "JSON text-sequence content type or record separators observed",
-        );
-    }
-    if content_type.contains("mpegurl") || text.trim_start().starts_with("#EXTM3U") {
-        confirmed(
-            observations,
-            source_url,
-            StreamKind::Hls,
-            "HLS content type or #EXTM3U playlist framing observed",
-        );
-    }
-    let lower = text.trim_start().to_ascii_lowercase();
-    if content_type.contains("dash+xml")
-        || lower.starts_with("<mpd")
-        || lower.starts_with("<?xml") && lower.contains("<mpd")
-    {
-        confirmed(
-            observations,
-            source_url,
-            StreamKind::Dash,
-            "DASH content type or MPD document observed",
-        );
-    }
-    if let Some(framing) = framing.filter(|framing| framing.transfer_chunked) {
-        let incremental = !framing.completed && framing.decoded_chunks >= 2;
-        observations.push(StreamObservation {
-            source_url: source_url.to_owned(),
-            kind: StreamKind::ChunkedIncremental,
-            status: if incremental {
-                StreamStatus::Confirmed
-            } else {
-                StreamStatus::Inconclusive
-            },
-            confidence: if incremental {
-                Confidence::Medium
-            } else {
-                Confidence::Low
-            },
-            evidence: vec![if incremental {
-                format!(
-                    "Incomplete chunked delivery produced {} chunks across {} reads",
-                    framing.decoded_chunks, framing.body_read_events
-                )
-            } else {
-                "Transfer-Encoding: chunked alone is weak evidence; no sustained incremental delivery was established".to_owned()
-            }],
-            endpoints: vec![source_url.to_owned()],
-        });
+                for capture in EVENT_SOURCE.captures_iter(text).take(64) {
+                    ({
+                        let (observations, source_url, kind, endpoint, evidence, post_only): (
+                            &mut Vec<StreamObservation>,
+                            &str,
+                            StreamKind,
+                            Option<&str>,
+                            &str,
+                            bool,
+                        ) = (
+                            observations,
+                            source_url,
+                            StreamKind::EventSource,
+                            capture.get(1).map(|value| value.as_str()),
+                            "JavaScript EventSource constructor",
+                            false,
+                        );
+                        'inlined_candidate: {
+                            let Some(endpoint) = endpoint
+                                .and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                            else {
+                                break 'inlined_candidate;
+                            };
+                            let mut evidence = vec![evidence.to_owned()];
+                            if post_only {
+                                evidence.push(
+                                    "POST-only candidate; automatic validation was not attempted"
+                                        .to_owned(),
+                                );
+                            }
+                            observations.push(StreamObservation {
+                                source_url: source_url.to_owned(),
+                                kind,
+                                status: StreamStatus::Candidate,
+                                confidence: if post_only {
+                                    Confidence::Low
+                                } else {
+                                    Confidence::Medium
+                                },
+                                evidence,
+                                endpoints: vec![endpoint],
+                            });
+                        }
+                    });
+                }
+                for capture in WEB_SOCKET.captures_iter(text).take(64) {
+                    ({
+                        let (observations, source_url, kind, endpoint, evidence, post_only): (
+                            &mut Vec<StreamObservation>,
+                            &str,
+                            StreamKind,
+                            Option<&str>,
+                            &str,
+                            bool,
+                        ) = (
+                            observations,
+                            source_url,
+                            StreamKind::WebSocket,
+                            capture.get(1).map(|value| value.as_str()),
+                            "JavaScript WebSocket constructor",
+                            false,
+                        );
+                        'inlined_candidate: {
+                            let Some(endpoint) = endpoint
+                                .and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                            else {
+                                break 'inlined_candidate;
+                            };
+                            let mut evidence = vec![evidence.to_owned()];
+                            if post_only {
+                                evidence.push(
+                                    "POST-only candidate; automatic validation was not attempted"
+                                        .to_owned(),
+                                );
+                            }
+                            observations.push(StreamObservation {
+                                source_url: source_url.to_owned(),
+                                kind,
+                                status: StreamStatus::Candidate,
+                                confidence: if post_only {
+                                    Confidence::Low
+                                } else {
+                                    Confidence::Medium
+                                },
+                                evidence,
+                                endpoints: vec![endpoint],
+                            });
+                        }
+                    });
+                }
+                for capture in MEDIA_SOURCE.captures_iter(text).take(128) {
+                    ({
+                        let (observations, source_url, kind, endpoint, evidence, post_only): (
+                            &mut Vec<StreamObservation>,
+                            &str,
+                            StreamKind,
+                            Option<&str>,
+                            &str,
+                            bool,
+                        ) = (
+                            observations,
+                            source_url,
+                            StreamKind::MediaElement,
+                            capture.get(1).map(|value| value.as_str()),
+                            "HTML video, audio, or source element",
+                            false,
+                        );
+                        'inlined_candidate: {
+                            let Some(endpoint) = endpoint
+                                .and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                            else {
+                                break 'inlined_candidate;
+                            };
+                            let mut evidence = vec![evidence.to_owned()];
+                            if post_only {
+                                evidence.push(
+                                    "POST-only candidate; automatic validation was not attempted"
+                                        .to_owned(),
+                                );
+                            }
+                            observations.push(StreamObservation {
+                                source_url: source_url.to_owned(),
+                                kind,
+                                status: StreamStatus::Candidate,
+                                confidence: if post_only {
+                                    Confidence::Low
+                                } else {
+                                    Confidence::Medium
+                                },
+                                evidence,
+                                endpoints: vec![endpoint],
+                            });
+                        }
+                    });
+                }
+                let readable = text.contains("ReadableStream")
+                    || text.contains("response.body")
+                    || text.contains("getReader(");
+                if readable {
+                    let mut found = false;
+                    for capture in FETCH_SOURCE.captures_iter(text).take(64) {
+                        found = true;
+                        let options = capture.get(2).map_or("", |value| value.as_str());
+                        ({
+                            let (observations, source_url, kind, endpoint, evidence, post_only): (
+                                &mut Vec<StreamObservation>,
+                                &str,
+                                StreamKind,
+                                Option<&str>,
+                                &str,
+                                bool,
+                            ) = (
+                                observations,
+                                source_url,
+                                StreamKind::ReadableStream,
+                                capture.get(1).map(|value| value.as_str()),
+                                "JavaScript fetch associated with ReadableStream consumption",
+                                options.to_ascii_lowercase().contains("method")
+                                    && options.to_ascii_lowercase().contains("post"),
+                            );
+                            'inlined_candidate: {
+                                let Some(endpoint) = endpoint
+                                    .and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                                else {
+                                    break 'inlined_candidate;
+                                };
+                                let mut evidence = vec![evidence.to_owned()];
+                                if post_only {
+                                    evidence.push("POST-only candidate; automatic validation was not attempted".to_owned());
+                                }
+                                observations.push(StreamObservation {
+                                    source_url: source_url.to_owned(),
+                                    kind,
+                                    status: StreamStatus::Candidate,
+                                    confidence: if post_only {
+                                        Confidence::Low
+                                    } else {
+                                        Confidence::Medium
+                                    },
+                                    evidence,
+                                    endpoints: vec![endpoint],
+                                });
+                            }
+                        });
+                    }
+                    if !found {
+                        observations.push(StreamObservation {
+                            source_url: source_url.to_owned(),
+                            kind: StreamKind::ReadableStream,
+                            status: StreamStatus::Candidate,
+                            confidence: Confidence::Low,
+                            evidence: vec![
+                    "JavaScript ReadableStream usage found without a safely extractable endpoint"
+                        .to_owned(),
+                ],
+                            endpoints: Vec::new(),
+                        });
+                    }
+                }
+                for capture in XHR_SOURCE.captures_iter(text).take(64) {
+                    let post = capture
+                        .get(1)
+                        .is_some_and(|method| method.as_str().eq_ignore_ascii_case("POST"));
+                    ({
+                        let (observations, source_url, kind, endpoint, evidence, post_only): (
+                            &mut Vec<StreamObservation>,
+                            &str,
+                            StreamKind,
+                            Option<&str>,
+                            &str,
+                            bool,
+                        ) = (
+                            observations,
+                            source_url,
+                            StreamKind::ChunkedIncremental,
+                            capture.get(2).map(|value| value.as_str()),
+                            "JavaScript XMLHttpRequest API endpoint",
+                            post,
+                        );
+                        'inlined_candidate: {
+                            let Some(endpoint) = endpoint
+                                .and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                            else {
+                                break 'inlined_candidate;
+                            };
+                            let mut evidence = vec![evidence.to_owned()];
+                            if post_only {
+                                evidence.push(
+                                    "POST-only candidate; automatic validation was not attempted"
+                                        .to_owned(),
+                                );
+                            }
+                            observations.push(StreamObservation {
+                                source_url: source_url.to_owned(),
+                                kind,
+                                status: StreamStatus::Candidate,
+                                confidence: if post_only {
+                                    Confidence::Low
+                                } else {
+                                    Confidence::Medium
+                                },
+                                evidence,
+                                endpoints: vec![endpoint],
+                            });
+                        }
+                    });
+                }
+                for capture in POST_HELPER.captures_iter(text).take(64) {
+                    ({
+                        let (observations, source_url, kind, endpoint, evidence, post_only): (
+                            &mut Vec<StreamObservation>,
+                            &str,
+                            StreamKind,
+                            Option<&str>,
+                            &str,
+                            bool,
+                        ) = (
+                            observations,
+                            source_url,
+                            StreamKind::ChunkedIncremental,
+                            capture.get(1).map(|value| value.as_str()),
+                            "JavaScript POST API endpoint",
+                            true,
+                        );
+                        'inlined_candidate: {
+                            let Some(endpoint) = endpoint
+                                .and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                            else {
+                                break 'inlined_candidate;
+                            };
+                            let mut evidence = vec![evidence.to_owned()];
+                            if post_only {
+                                evidence.push(
+                                    "POST-only candidate; automatic validation was not attempted"
+                                        .to_owned(),
+                                );
+                            }
+                            observations.push(StreamObservation {
+                                source_url: source_url.to_owned(),
+                                kind,
+                                status: StreamStatus::Candidate,
+                                confidence: if post_only {
+                                    Confidence::Low
+                                } else {
+                                    Confidence::Medium
+                                },
+                                evidence,
+                                endpoints: vec![endpoint],
+                            });
+                        }
+                    });
+                }
+                for capture in FETCH_SOURCE.captures_iter(text).take(64) {
+                    let endpoint = capture.get(1).map(|value| value.as_str());
+                    let Some(endpoint) = endpoint else { continue };
+                    let lower = endpoint.to_ascii_lowercase();
+                    let options = capture.get(2).map_or("", |value| value.as_str());
+                    let post = options.to_ascii_lowercase().contains("method")
+                        && options.to_ascii_lowercase().contains("post");
+                    ({
+                        let (observations, source_url, kind, endpoint, evidence, post_only): (
+                            &mut Vec<StreamObservation>,
+                            &str,
+                            StreamKind,
+                            Option<&str>,
+                            &str,
+                            bool,
+                        ) = (
+                            observations,
+                            source_url,
+                            if lower.contains(".m3u8") {
+                                StreamKind::Hls
+                            } else if lower.contains(".mpd") {
+                                StreamKind::Dash
+                            } else {
+                                StreamKind::ChunkedIncremental
+                            },
+                            Some(endpoint),
+                            if lower.contains(".m3u8") || lower.contains(".mpd") {
+                                "Streaming playlist URL referenced by JavaScript"
+                            } else {
+                                "JavaScript fetch API endpoint"
+                            },
+                            post,
+                        );
+                        'inlined_candidate: {
+                            let Some(endpoint) = endpoint
+                                .and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                            else {
+                                break 'inlined_candidate;
+                            };
+                            let mut evidence = vec![evidence.to_owned()];
+                            if post_only {
+                                evidence.push(
+                                    "POST-only candidate; automatic validation was not attempted"
+                                        .to_owned(),
+                                );
+                            }
+                            observations.push(StreamObservation {
+                                source_url: source_url.to_owned(),
+                                kind,
+                                status: StreamStatus::Candidate,
+                                confidence: if post_only {
+                                    Confidence::Low
+                                } else {
+                                    Confidence::Medium
+                                },
+                                evidence,
+                                endpoints: vec![endpoint],
+                            });
+                        }
+                    });
+                }
+                if readable {
+                    for capture in QUOTED_PATH.captures_iter(text).take(64) {
+                        ({
+                            let (observations, source_url, kind, endpoint, evidence, post_only): (
+                                &mut Vec<StreamObservation>,
+                                &str,
+                                StreamKind,
+                                Option<&str>,
+                                &str,
+                                bool,
+                            ) = (
+                                observations,
+                                source_url,
+                                StreamKind::ReadableStream,
+                                capture.get(1).map(|value| value.as_str()),
+                                "URL literal near JavaScript streaming APIs",
+                                false,
+                            );
+                            'inlined_candidate: {
+                                let Some(endpoint) = endpoint
+                                    .and_then(|endpoint| resolve_endpoint(source_url, endpoint))
+                                else {
+                                    break 'inlined_candidate;
+                                };
+                                let mut evidence = vec![evidence.to_owned()];
+                                if post_only {
+                                    evidence.push("POST-only candidate; automatic validation was not attempted".to_owned());
+                                }
+                                observations.push(StreamObservation {
+                                    source_url: source_url.to_owned(),
+                                    kind,
+                                    status: StreamStatus::Candidate,
+                                    confidence: if post_only {
+                                        Confidence::Low
+                                    } else {
+                                        Confidence::Medium
+                                    },
+                                    evidence,
+                                    endpoints: vec![endpoint],
+                                });
+                            }
+                        });
+                    }
+                }
+            });
+        }
     }
 }
 
@@ -338,162 +1229,6 @@ fn confirmed(
         confidence: Confidence::High,
         evidence: vec![evidence.to_owned()],
         endpoints: vec![source_url.to_owned()],
-    });
-}
-
-fn discover_candidates(source_url: &str, text: &str, observations: &mut Vec<StreamObservation>) {
-    for capture in EVENT_SOURCE.captures_iter(text).take(64) {
-        candidate(
-            observations,
-            source_url,
-            StreamKind::EventSource,
-            capture.get(1).map(|value| value.as_str()),
-            "JavaScript EventSource constructor",
-            false,
-        );
-    }
-    for capture in WEB_SOCKET.captures_iter(text).take(64) {
-        candidate(
-            observations,
-            source_url,
-            StreamKind::WebSocket,
-            capture.get(1).map(|value| value.as_str()),
-            "JavaScript WebSocket constructor",
-            false,
-        );
-    }
-    for capture in MEDIA_SOURCE.captures_iter(text).take(128) {
-        candidate(
-            observations,
-            source_url,
-            StreamKind::MediaElement,
-            capture.get(1).map(|value| value.as_str()),
-            "HTML video, audio, or source element",
-            false,
-        );
-    }
-    let readable = text.contains("ReadableStream")
-        || text.contains("response.body")
-        || text.contains("getReader(");
-    if readable {
-        let mut found = false;
-        for capture in FETCH_SOURCE.captures_iter(text).take(64) {
-            found = true;
-            let options = capture.get(2).map_or("", |value| value.as_str());
-            candidate(
-                observations,
-                source_url,
-                StreamKind::ReadableStream,
-                capture.get(1).map(|value| value.as_str()),
-                "JavaScript fetch associated with ReadableStream consumption",
-                options.to_ascii_lowercase().contains("method")
-                    && options.to_ascii_lowercase().contains("post"),
-            );
-        }
-        if !found {
-            observations.push(StreamObservation {
-                source_url: source_url.to_owned(),
-                kind: StreamKind::ReadableStream,
-                status: StreamStatus::Candidate,
-                confidence: Confidence::Low,
-                evidence: vec![
-                    "JavaScript ReadableStream usage found without a safely extractable endpoint"
-                        .to_owned(),
-                ],
-                endpoints: Vec::new(),
-            });
-        }
-    }
-    for capture in XHR_SOURCE.captures_iter(text).take(64) {
-        let post = capture
-            .get(1)
-            .is_some_and(|method| method.as_str().eq_ignore_ascii_case("POST"));
-        candidate(
-            observations,
-            source_url,
-            StreamKind::ChunkedIncremental,
-            capture.get(2).map(|value| value.as_str()),
-            "JavaScript XMLHttpRequest API endpoint",
-            post,
-        );
-    }
-    for capture in POST_HELPER.captures_iter(text).take(64) {
-        candidate(
-            observations,
-            source_url,
-            StreamKind::ChunkedIncremental,
-            capture.get(1).map(|value| value.as_str()),
-            "JavaScript POST API endpoint",
-            true,
-        );
-    }
-    for capture in FETCH_SOURCE.captures_iter(text).take(64) {
-        let endpoint = capture.get(1).map(|value| value.as_str());
-        let Some(endpoint) = endpoint else { continue };
-        let lower = endpoint.to_ascii_lowercase();
-        let options = capture.get(2).map_or("", |value| value.as_str());
-        let post = options.to_ascii_lowercase().contains("method")
-            && options.to_ascii_lowercase().contains("post");
-        candidate(
-            observations,
-            source_url,
-            if lower.contains(".m3u8") {
-                StreamKind::Hls
-            } else if lower.contains(".mpd") {
-                StreamKind::Dash
-            } else {
-                StreamKind::ChunkedIncremental
-            },
-            Some(endpoint),
-            if lower.contains(".m3u8") || lower.contains(".mpd") {
-                "Streaming playlist URL referenced by JavaScript"
-            } else {
-                "JavaScript fetch API endpoint"
-            },
-            post,
-        );
-    }
-    if readable {
-        for capture in QUOTED_PATH.captures_iter(text).take(64) {
-            candidate(
-                observations,
-                source_url,
-                StreamKind::ReadableStream,
-                capture.get(1).map(|value| value.as_str()),
-                "URL literal near JavaScript streaming APIs",
-                false,
-            );
-        }
-    }
-}
-
-fn candidate(
-    observations: &mut Vec<StreamObservation>,
-    source_url: &str,
-    kind: StreamKind,
-    endpoint: Option<&str>,
-    evidence: &str,
-    post_only: bool,
-) {
-    let Some(endpoint) = endpoint.and_then(|endpoint| resolve_endpoint(source_url, endpoint))
-    else {
-        return;
-    };
-    let mut evidence = vec![evidence.to_owned()];
-    if post_only {
-        evidence.push("POST-only candidate; automatic validation was not attempted".to_owned());
-    }
-    observations.push(StreamObservation {
-        source_url: source_url.to_owned(),
-        kind,
-        status: StreamStatus::Candidate,
-        confidence: if post_only {
-            Confidence::Low
-        } else {
-            Confidence::Medium
-        },
-        evidence,
-        endpoints: vec![endpoint],
     });
 }
 
@@ -541,57 +1276,6 @@ pub(super) fn post_only_endpoints(source_url: &str, text: &str) -> HashSet<Strin
         }
     }
     endpoints
-}
-
-fn reconcile_crawl_results(
-    observations: &mut Vec<StreamObservation>,
-    resources: &[CrawledResource],
-) {
-    let confirmed = observations
-        .iter()
-        .filter(|observation| observation.status == StreamStatus::Confirmed)
-        .flat_map(|observation| observation.endpoints.iter().cloned())
-        .collect::<HashSet<_>>();
-    let mut additions = Vec::new();
-    for observation in observations
-        .iter()
-        .filter(|observation| observation.status == StreamStatus::Candidate)
-    {
-        if observation
-            .evidence
-            .iter()
-            .any(|evidence| evidence.contains("POST-only"))
-        {
-            continue;
-        }
-        for endpoint in &observation.endpoints {
-            let Some(resource) = resources.iter().find(|resource| resource.url == *endpoint) else {
-                continue;
-            };
-            let (status, evidence) = match resource.status {
-                Some(401 | 403) => (
-                    StreamStatus::Protected,
-                    format!(
-                        "Safe GET returned HTTP {}",
-                        resource.status.unwrap_or_default()
-                    ),
-                ),
-                Some(status) if (200..300).contains(&status) && !confirmed.contains(endpoint) => (
-                    StreamStatus::Inconclusive,
-                    format!(
-                        "Safe GET returned HTTP {status} without recognizable streaming evidence"
-                    ),
-                ),
-                _ => continue,
-            };
-            let mut result = observation.clone();
-            result.source_url = endpoint.clone();
-            result.status = status;
-            result.evidence = vec![evidence];
-            additions.push(result);
-        }
-    }
-    observations.extend(additions);
 }
 
 pub(super) async fn probe_candidates(
@@ -676,13 +1360,14 @@ pub(super) async fn probe_candidates(
         let mut response = None;
         let mut last_error = None;
         for ip in addresses {
-            match single_http_request_with_limit(
+            match single_http_request(
                 ProbeContext { ip, port, scan },
                 url.scheme(),
                 "GET",
                 &path,
                 &auth_headers,
                 64 * 1024,
+                None,
             )
             .await
             {
@@ -710,7 +1395,19 @@ pub(super) async fn probe_candidates(
             }
             Some(response) => {
                 let before = additions.len();
-                collect_response(&response, &mut additions);
+                ({
+                    let (response, observations): (&HttpObservation, &mut Vec<StreamObservation>) =
+                        (&response, &mut additions);
+
+                    collect_body(
+                        &response.url,
+                        &response.headers,
+                        &response.body,
+                        Some(&response.framing),
+                        Some(response.status),
+                        observations,
+                    );
+                });
                 let classified = additions[before..].iter().any(|observation| {
                     observation.source_url == url.as_str()
                         && observation.status == StreamStatus::Confirmed
@@ -851,26 +1548,217 @@ pub(super) async fn websocket_checks(
         .await;
         let displayed_url = url.to_string();
         let (status, summary, mut evidence) = match response {
-            Ok(response) if valid_websocket_upgrade(&response, key) => (
-                ServiceAccessStatus::Offered,
-                "WebSocket upgrade succeeded; no frames were sent or consumed",
-                vec!["HTTP 101 Switching Protocols".to_owned()],
-            ),
-            Ok(response) if matches!(http_status(&response), Some(401 | 403)) => (
-                ServiceAccessStatus::Protected,
-                "WebSocket upgrade required authorization",
-                vec![format!(
-                    "HTTP {}",
-                    http_status(&response).unwrap_or_default()
-                )],
-            ),
+            Ok(response)
+                if ({
+                    let (response, key): (&[u8], &str) = (&response, key);
+                    {
+                        'inlined_valid_websocket_upgrade: {
+                            let Some(header_end) =
+                                response.windows(4).position(|window| window == b"\r\n\r\n")
+                            else {
+                                break 'inlined_valid_websocket_upgrade false;
+                            };
+                            let headers = String::from_utf8_lossy(&response[..header_end]);
+                            if ({
+                                let (response,): (&[u8],) = (response,);
+                                {
+                                    'inlined_http_status: {
+                                        let first =
+                                            match response.split(|byte| *byte == b'\n').next() {
+                                                Some(value) => value,
+                                                None => break 'inlined_http_status None,
+                                            };
+                                        let first = match std::str::from_utf8(first).ok() {
+                                            Some(value) => value,
+                                            None => break 'inlined_http_status None,
+                                        }
+                                        .trim_end_matches('\r');
+                                        let mut fields = first.split_ascii_whitespace();
+                                        if !matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
+                                            break 'inlined_http_status None;
+                                        }
+                                        let status = match fields.next() {
+                                            Some(value) => value,
+                                            None => break 'inlined_http_status None,
+                                        };
+                                        if status.len() != 3
+                                            || !status.bytes().all(|byte| byte.is_ascii_digit())
+                                        {
+                                            break 'inlined_http_status None;
+                                        }
+                                        let status = match status.parse().ok() {
+                                            Some(value) => value,
+                                            None => break 'inlined_http_status None,
+                                        };
+                                        (100..=599).contains(&status).then_some(status)
+                                    }
+                                }
+                            }) != Some(101)
+                                || !headers
+                                    .lines()
+                                    .next()
+                                    .is_some_and(|line| line.starts_with("HTTP/1.1 "))
+                            {
+                                break 'inlined_valid_websocket_upgrade false;
+                            }
+                            let header = |expected: &str| {
+                                headers.lines().find_map(|line| {
+                                    let (name, value) =
+                                        line.trim_end_matches('\r').split_once(':')?;
+                                    name.eq_ignore_ascii_case(expected).then(|| value.trim())
+                                })
+                            };
+                            let accept = header("sec-websocket-accept");
+                            let upgrade = header("upgrade");
+                            let connection = header("connection");
+                            let mut digest = Sha1::new();
+                            digest.update(key.as_bytes());
+                            digest.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+                            let expected =
+                                base64::engine::general_purpose::STANDARD.encode(digest.finalize());
+                            accept.is_some_and(|accept| accept == expected)
+                                && upgrade
+                                    .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+                                && connection.is_some_and(|value| {
+                                    value
+                                        .split(',')
+                                        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+                                })
+                        }
+                    }
+                }) =>
+            {
+                (
+                    ServiceAccessStatus::Offered,
+                    "WebSocket upgrade succeeded; no frames were sent or consumed",
+                    vec!["HTTP 101 Switching Protocols".to_owned()],
+                )
+            }
+            Ok(response)
+                if matches!(
+                    {
+                        let (response,): (&[u8],) = (&response,);
+                        let inlined_result: Option<u16> = {
+                            'inlined_http_status: {
+                                let first = match response.split(|byte| *byte == b'\n').next() {
+                                    Some(value) => value,
+                                    None => break 'inlined_http_status None,
+                                };
+                                let first = match std::str::from_utf8(first).ok() {
+                                    Some(value) => value,
+                                    None => break 'inlined_http_status None,
+                                }
+                                .trim_end_matches('\r');
+                                let mut fields = first.split_ascii_whitespace();
+                                if !matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
+                                    break 'inlined_http_status None;
+                                }
+                                let status = match fields.next() {
+                                    Some(value) => value,
+                                    None => break 'inlined_http_status None,
+                                };
+                                if status.len() != 3
+                                    || !status.bytes().all(|byte| byte.is_ascii_digit())
+                                {
+                                    break 'inlined_http_status None;
+                                }
+                                let status = match status.parse().ok() {
+                                    Some(value) => value,
+                                    None => break 'inlined_http_status None,
+                                };
+                                (100..=599).contains(&status).then_some(status)
+                            }
+                        };
+                        inlined_result
+                    },
+                    Some(401 | 403)
+                ) =>
+            {
+                (
+                    ServiceAccessStatus::Protected,
+                    "WebSocket upgrade required authorization",
+                    vec![format!(
+                        "HTTP {}",
+                        ({
+                            let (response,): (&[u8],) = (&response,);
+                            let inlined_result: Option<u16> = {
+                                'inlined_http_status: {
+                                    let first = match response.split(|byte| *byte == b'\n').next() {
+                                        Some(value) => value,
+                                        None => break 'inlined_http_status None,
+                                    };
+                                    let first = match std::str::from_utf8(first).ok() {
+                                        Some(value) => value,
+                                        None => break 'inlined_http_status None,
+                                    }
+                                    .trim_end_matches('\r');
+                                    let mut fields = first.split_ascii_whitespace();
+                                    if !matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
+                                        break 'inlined_http_status None;
+                                    }
+                                    let status = match fields.next() {
+                                        Some(value) => value,
+                                        None => break 'inlined_http_status None,
+                                    };
+                                    if status.len() != 3
+                                        || !status.bytes().all(|byte| byte.is_ascii_digit())
+                                    {
+                                        break 'inlined_http_status None;
+                                    }
+                                    let status = match status.parse().ok() {
+                                        Some(value) => value,
+                                        None => break 'inlined_http_status None,
+                                    };
+                                    (100..=599).contains(&status).then_some(status)
+                                }
+                            };
+                            inlined_result
+                        })
+                        .unwrap_or_default()
+                    )],
+                )
+            }
             Ok(response) => (
                 ServiceAccessStatus::Inconclusive,
                 "The discovered URL did not accept a WebSocket upgrade",
                 vec![
-                    http_status(&response)
-                        .map(|status| format!("HTTP {status}"))
-                        .unwrap_or_else(|| "Invalid HTTP response".to_owned()),
+                    ({
+                        let (response,): (&[u8],) = (&response,);
+                        let inlined_result: Option<u16> = {
+                            'inlined_http_status: {
+                                let first = match response.split(|byte| *byte == b'\n').next() {
+                                    Some(value) => value,
+                                    None => break 'inlined_http_status None,
+                                };
+                                let first = match std::str::from_utf8(first).ok() {
+                                    Some(value) => value,
+                                    None => break 'inlined_http_status None,
+                                }
+                                .trim_end_matches('\r');
+                                let mut fields = first.split_ascii_whitespace();
+                                if !matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
+                                    break 'inlined_http_status None;
+                                }
+                                let status = match fields.next() {
+                                    Some(value) => value,
+                                    None => break 'inlined_http_status None,
+                                };
+                                if status.len() != 3
+                                    || !status.bytes().all(|byte| byte.is_ascii_digit())
+                                {
+                                    break 'inlined_http_status None;
+                                }
+                                let status = match status.parse().ok() {
+                                    Some(value) => value,
+                                    None => break 'inlined_http_status None,
+                                };
+                                (100..=599).contains(&status).then_some(status)
+                            }
+                        };
+                        inlined_result
+                    })
+                    .map(|status| format!("HTTP {status}"))
+                    .unwrap_or_else(|| "Invalid HTTP response".to_owned()),
                 ],
             ),
             Err(error) => (
@@ -927,54 +1815,4 @@ pub(super) fn include_websocket_results(
         });
     }
     merge_observations(observations);
-}
-
-fn http_status(response: &[u8]) -> Option<u16> {
-    let first = response.split(|byte| *byte == b'\n').next()?;
-    let first = std::str::from_utf8(first).ok()?.trim_end_matches('\r');
-    let mut fields = first.split_ascii_whitespace();
-    if !matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
-        return None;
-    }
-    let status = fields.next()?;
-    if status.len() != 3 || !status.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let status = status.parse().ok()?;
-    (100..=599).contains(&status).then_some(status)
-}
-
-fn valid_websocket_upgrade(response: &[u8], key: &str) -> bool {
-    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
-    };
-    let headers = String::from_utf8_lossy(&response[..header_end]);
-    if http_status(response) != Some(101)
-        || !headers
-            .lines()
-            .next()
-            .is_some_and(|line| line.starts_with("HTTP/1.1 "))
-    {
-        return false;
-    }
-    let header = |expected: &str| {
-        headers.lines().find_map(|line| {
-            let (name, value) = line.trim_end_matches('\r').split_once(':')?;
-            name.eq_ignore_ascii_case(expected).then(|| value.trim())
-        })
-    };
-    let accept = header("sec-websocket-accept");
-    let upgrade = header("upgrade");
-    let connection = header("connection");
-    let mut digest = Sha1::new();
-    digest.update(key.as_bytes());
-    digest.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    let expected = base64::engine::general_purpose::STANDARD.encode(digest.finalize());
-    accept.is_some_and(|accept| accept == expected)
-        && upgrade.is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
-        && connection.is_some_and(|value| {
-            value
-                .split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-        })
 }

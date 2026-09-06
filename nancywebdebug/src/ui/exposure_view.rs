@@ -1,22 +1,21 @@
 use crate::auth::{ProfileSummary, SharedAuthStore};
 use crate::diagnostics::{DiagnosticRequest, ProtocolPreference, StageTimeouts, UserAgentPreset};
 use crate::exposure::fingerprints::{self, InitializationStatus};
+use crate::scan_limits as limits;
 use crate::{
     Confidence, CrawlContactType, EndpointScan, ExposureScanPhaseState, ExposureScanReport,
-    ExposureScanRequest, PortSelection, PortState, ProductLayer, ServiceKind, TransportProtocol,
-    WebProbeLevel, curated_tcp_port_metadata,
+    ExposureScanRequest, PortSelection, PortState, ServiceKind, TransportProtocol, WebProbeLevel,
+    curated_tcp_port_metadata,
 };
 use eframe::egui;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::app::{App, ExposureLiveState};
 use super::details::{
     BodyView, DetailTab, show_body, show_http, show_network,
     show_summary as show_diagnostic_summary, show_tls,
 };
-use super::widgets::display_url;
 
 labeled_enum! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,32 +27,41 @@ labeled_enum! {
 }
 
 impl PortChoice {
-    fn transport_label(self, transport: TransportProtocol) -> &'static str {
-        match (self, transport) {
-            (Self::Curated, TransportProtocol::Udp) => "Curated UDP ports",
-            (Self::Custom, TransportProtocol::Udp) => "Custom UDP ports",
-            _ => self.label(),
-        }
-    }
-
     fn show(&mut self, ui: &mut egui::Ui, transport: TransportProtocol) {
         egui::ComboBox::from_id_salt(("exposure_ports", transport))
-            .selected_text(self.transport_label(transport))
+            .selected_text({
+                let (inlined_self, transport): (PortChoice, TransportProtocol) = (*self, transport);
+                let inlined_result: &'static str = {
+                    match (inlined_self, transport) {
+                        (PortChoice::Curated, TransportProtocol::Udp) => "Curated UDP ports",
+                        (PortChoice::Custom, TransportProtocol::Udp) => "Custom UDP ports",
+                        _ => inlined_self.label(),
+                    }
+                };
+                inlined_result
+            })
             .show_ui(ui, |ui| {
                 for choice in Self::ALL {
                     if transport == TransportProtocol::Tcp || choice != Self::All {
-                        ui.selectable_value(self, choice, choice.transport_label(transport));
+                        ui.selectable_value(self, choice, {
+                            let (inlined_self, transport): (PortChoice, TransportProtocol) =
+                                (choice, transport);
+                            let inlined_result: &'static str = {
+                                match (inlined_self, transport) {
+                                    (PortChoice::Curated, TransportProtocol::Udp) => {
+                                        "Curated UDP ports"
+                                    }
+                                    (PortChoice::Custom, TransportProtocol::Udp) => {
+                                        "Custom UDP ports"
+                                    }
+                                    _ => inlined_self.label(),
+                                }
+                            };
+                            inlined_result
+                        });
                     }
                 }
             });
-    }
-
-    fn selection(self, custom_ports: &str) -> Result<PortSelection, String> {
-        match self {
-            Self::Curated => Ok(PortSelection::Curated),
-            Self::All => Ok(PortSelection::All),
-            Self::Custom => PortSelection::parse(custom_ports),
-        }
     }
 }
 
@@ -66,32 +74,6 @@ pub(super) struct TimeoutInputs {
     headers: f64,
     first_byte: f64,
     body: f64,
-}
-
-impl TimeoutInputs {
-    fn from_timeouts(timeouts: &StageTimeouts) -> Self {
-        Self {
-            authentication: timeouts.authentication.as_secs_f64(),
-            dns: timeouts.dns.as_secs_f64(),
-            transport: timeouts.transport.as_secs_f64(),
-            tls: timeouts.tls.as_secs_f64(),
-            headers: timeouts.headers.as_secs_f64(),
-            first_byte: timeouts.first_byte.as_secs_f64(),
-            body: timeouts.body.as_secs_f64(),
-        }
-    }
-
-    fn to_timeouts(&self) -> StageTimeouts {
-        StageTimeouts {
-            authentication: duration(self.authentication),
-            dns: duration(self.dns),
-            transport: duration(self.transport),
-            tls: duration(self.tls),
-            headers: duration(self.headers),
-            first_byte: duration(self.first_byte),
-            body: duration(self.body),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -125,8 +107,7 @@ pub(super) struct ScanForm {
     active_requests_total: usize,
     service_access_checks: bool,
     udp_scanning: bool,
-    asset_discovery: bool,
-    dns_assessment: bool,
+    dns_and_discovery: bool,
     ct_hostname_limit: usize,
     dkim_selectors: String,
     crawl_max_urls: usize,
@@ -149,7 +130,20 @@ impl Default for ScanForm {
                 user_agent: diagnostic.user_agent,
                 selected_auth_profile: None,
                 selected_client_certificate_profile: None,
-                timeouts: TimeoutInputs::from_timeouts(&diagnostic.timeouts),
+                timeouts: ({
+                    let (timeouts,): (&StageTimeouts,) = (&diagnostic.timeouts,);
+                    {
+                        TimeoutInputs {
+                            authentication: timeouts.authentication.as_secs_f64(),
+                            dns: timeouts.dns.as_secs_f64(),
+                            transport: timeouts.transport.as_secs_f64(),
+                            tls: timeouts.tls.as_secs_f64(),
+                            headers: timeouts.headers.as_secs_f64(),
+                            first_byte: timeouts.first_byte.as_secs_f64(),
+                            body: timeouts.body.as_secs_f64(),
+                        }
+                    }
+                }),
             },
             port_choice: PortChoice::Curated,
             custom_ports: "80,443".to_owned(),
@@ -166,8 +160,7 @@ impl Default for ScanForm {
             active_requests_total: scan.active_requests_total,
             service_access_checks: true,
             udp_scanning: true,
-            asset_discovery: true,
-            dns_assessment: true,
+            dns_and_discovery: true,
             ct_hostname_limit: scan.ct_hostname_limit,
             dkim_selectors: String::new(),
             crawl_max_urls: scan.crawl_max_urls,
@@ -182,13 +175,6 @@ impl ScanForm {
         &self,
         auth_store: &SharedAuthStore,
     ) -> Result<ExposureScanRequest, String> {
-        if !self.connection_timeout.is_finite()
-            || self.connection_timeout <= 0.0
-            || !self.probe_timeout.is_finite()
-            || self.probe_timeout <= 0.0
-        {
-            return Err("Exposure scan timeouts must be positive numbers".to_owned());
-        }
         let auth = match self.diagnostic.selected_auth_profile {
             Some(id) => Some(
                 auth_store
@@ -211,39 +197,115 @@ impl ScanForm {
             ),
             None => None,
         };
-        Ok(ExposureScanRequest {
+        let defaults = ExposureScanRequest::default();
+        let mut request = ExposureScanRequest {
             diagnostic_request: DiagnosticRequest {
                 method: self.diagnostic.method.clone(),
                 url: self.diagnostic.url.trim().to_owned(),
                 headers: self.diagnostic.headers.clone(),
                 body: Arc::from(self.diagnostic.body.as_bytes()),
                 protocol: self.diagnostic.protocol,
-                timeouts: self.diagnostic.timeouts.to_timeouts(),
+                timeouts: StageTimeouts {
+                    authentication: limits::timeout(
+                        self.diagnostic.timeouts.authentication,
+                        limits::STAGE_TIMEOUT,
+                        "Authentication stage timeout (seconds)",
+                    )?,
+                    dns: limits::timeout(
+                        self.diagnostic.timeouts.dns,
+                        limits::STAGE_TIMEOUT,
+                        "DNS stage timeout (seconds)",
+                    )?,
+                    transport: limits::timeout(
+                        self.diagnostic.timeouts.transport,
+                        limits::STAGE_TIMEOUT,
+                        "TCP / QUIC stage timeout (seconds)",
+                    )?,
+                    tls: limits::timeout(
+                        self.diagnostic.timeouts.tls,
+                        limits::STAGE_TIMEOUT,
+                        "TLS stage timeout (seconds)",
+                    )?,
+                    headers: limits::timeout(
+                        self.diagnostic.timeouts.headers,
+                        limits::STAGE_TIMEOUT,
+                        "HTTP headers stage timeout (seconds)",
+                    )?,
+                    first_byte: limits::timeout(
+                        self.diagnostic.timeouts.first_byte,
+                        limits::STAGE_TIMEOUT,
+                        "First byte stage timeout (seconds)",
+                    )?,
+                    body: limits::timeout(
+                        self.diagnostic.timeouts.body,
+                        limits::STAGE_TIMEOUT,
+                        "Body stage timeout (seconds)",
+                    )?,
+                },
                 auth,
                 client_certificate,
                 follow_redirects: self.diagnostic.follow_redirects,
                 user_agent: self.diagnostic.user_agent,
             },
-            ports: self.port_choice.selection(&self.custom_ports)?,
-            connection_timeout: Duration::from_secs_f64(self.connection_timeout),
-            probe_timeout: Duration::from_secs_f64(self.probe_timeout),
+            ports: match self.port_choice {
+                PortChoice::Curated => PortSelection::Curated,
+                PortChoice::All => PortSelection::All,
+                PortChoice::Custom => PortSelection::parse(&self.custom_ports)
+                    .map_err(|error| format!("TCP ports: {error}"))?,
+            },
+            connection_timeout: limits::timeout(
+                self.connection_timeout,
+                limits::CONNECTION_TIMEOUT,
+                "Connection timeout (seconds)",
+            )?,
+            probe_timeout: limits::timeout(
+                self.probe_timeout,
+                limits::PROBE_TIMEOUT,
+                "Probe timeout (seconds)",
+            )?,
             concurrency: self.concurrency,
             connection_starts_per_second: self.rate,
             security_operations: self.security_operations,
             web_probe_level: self.web_probe_level,
-            active_requests_per_origin: self.active_requests_per_origin,
-            active_requests_total: self.active_requests_total,
-            udp_ports: self.udp_port_choice.selection(&self.custom_udp_ports)?,
             service_access_checks: self.service_access_checks,
             udp_scanning: self.udp_scanning,
-            asset_discovery: self.asset_discovery,
-            dns_assessment: self.dns_assessment,
-            ct_hostname_limit: self.ct_hostname_limit,
-            dkim_selectors: parse_dkim_selectors(&self.dkim_selectors)?,
-            crawl_max_urls: self.crawl_max_urls,
-            crawl_concurrency: self.crawl_concurrency,
-            crawl_requests_per_second: self.crawl_rate,
-        })
+            asset_discovery: self.dns_and_discovery,
+            dns_assessment: self.dns_and_discovery,
+            ..defaults
+        };
+        if self.udp_scanning {
+            request.udp_ports = match self.udp_port_choice {
+                PortChoice::Curated => PortSelection::Curated,
+                PortChoice::All => PortSelection::All,
+                PortChoice::Custom => PortSelection::parse(&self.custom_udp_ports)
+                    .map_err(|error| format!("UDP ports: {error}"))?,
+            };
+        }
+        if self.web_probe_level != WebProbeLevel::Passive {
+            request.active_requests_per_origin = self.active_requests_per_origin;
+            request.active_requests_total = self.active_requests_total;
+        }
+        if self.dns_and_discovery {
+            request.ct_hostname_limit = self.ct_hostname_limit;
+            for selector in self
+                .dkim_selectors
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let selector = selector.to_ascii_lowercase();
+                if !request.dkim_selectors.contains(&selector) {
+                    request.dkim_selectors.push(selector);
+                }
+            }
+        }
+        if self.security_operations {
+            request.crawl_max_urls = self.crawl_max_urls;
+            request.crawl_concurrency = self.crawl_concurrency;
+            request.crawl_requests_per_second = self.crawl_rate;
+        }
+        request.validate()?;
+        Ok(request)
     }
 }
 
@@ -267,12 +329,13 @@ impl Default for DiagnosticViewState {
 
 labeled_enum! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum ExposureDetailTab[9] {
+    pub(super) enum ExposureDetailTab[10] {
+        Summary => "Summary",
         Diagnostics => "Diagnostics",
-        Ports => "Ports",
-        NetworkPosture => "UDP / Services / DNS",
-        Discovery => "Discovery",
-        HttpTls => "HTTP / TLS",
+        Tcp => "TCP",
+        Udp => "UDP",
+        Services => "Services",
+        DnsAndDiscovery => "DNS",
         Crawl => "Details",
         ExternalSources => "External Sources",
         JavaScript => "Technology Versions",
@@ -312,7 +375,9 @@ pub(super) fn show_dialog(ctx: &egui::Context, app: &mut App) -> bool {
                 }
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut app.scan_form.udp_scanning, "UDP scanning");
-                    app.scan_form.udp_port_choice.show(ui, TransportProtocol::Udp);
+                    if app.scan_form.udp_scanning {
+                        app.scan_form.udp_port_choice.show(ui, TransportProtocol::Udp);
+                    }
                 });
                 if app.scan_form.udp_scanning
                     && app.scan_form.udp_port_choice == PortChoice::Custom
@@ -326,175 +391,9 @@ pub(super) fn show_dialog(ctx: &egui::Context, app: &mut App) -> bool {
                 egui::CollapsingHeader::new("Advanced settings")
                     .default_open(true)
                     .show(ui, |ui| {
-                        show_diagnostic_inputs(ui, app);
-                        ui.separator();
-                        egui::Grid::new("exposure_advanced").show(ui, |ui| {
-                            ui.label("Concurrent endpoints");
-                            ui.add(
-                                egui::DragValue::new(&mut app.scan_form.concurrency)
-                                    .range(1..=4096),
-                            );
-                            ui.end_row();
-                            ui.label("Connection starts / second");
-                            ui.add(egui::DragValue::new(&mut app.scan_form.rate).range(1..=10_000));
-                            ui.end_row();
-                            ui.label("Connection timeout");
-                            ui.add(
-                                egui::DragValue::new(&mut app.scan_form.connection_timeout)
-                                    .range(0.1..=120.0)
-                                    .suffix(" s"),
-                            );
-                            ui.end_row();
-                            ui.label("Probe timeout");
-                            ui.add(
-                                egui::DragValue::new(&mut app.scan_form.probe_timeout)
-                                    .range(0.1..=300.0)
-                                    .suffix(" s"),
-                            );
-                            ui.end_row();
-                            ui.label("Web probe level");
-                            egui::ComboBox::from_id_salt("web_probe_level")
-                                .selected_text(app.scan_form.web_probe_level.to_string())
-                                .show_ui(ui, |ui| {
-                                    for level in WebProbeLevel::ALL {
-                                        ui.selectable_value(
-                                            &mut app.scan_form.web_probe_level,
-                                            level,
-                                            level.to_string(),
-                                        );
-                                    }
-                                });
-                            ui.end_row();
-                            ui.label("Security operations");
-                            ui.checkbox(
-                                &mut app.scan_form.security_operations,
-                                "Broad exposure, source-map secret, advanced browser-policy, CORS consistency, DNS takeover, crawl, and technology checks",
-                            );
-                            ui.end_row();
-                            ui.label("Active requests / origin");
-                            ui.add_enabled(
-                                app.scan_form.web_probe_level.active(),
-                                egui::DragValue::new(
-                                    &mut app.scan_form.active_requests_per_origin,
-                                )
-                                .range(1..=10_000),
-                            );
-                            ui.end_row();
-                            ui.label("Total active requests");
-                            ui.add_enabled(
-                                app.scan_form.web_probe_level.active(),
-                                egui::DragValue::new(&mut app.scan_form.active_requests_total)
-                                    .range(1..=100_000),
-                            );
-                            ui.end_row();
-                            ui.label("Service access checks");
-                            ui.checkbox(
-                                &mut app.scan_form.service_access_checks,
-                                "Handshake-only anonymous access checks",
-                            );
-                            ui.end_row();
-                            ui.label("CT asset discovery");
-                            ui.checkbox(
-                                &mut app.scan_form.asset_discovery,
-                                "Query crt.sh; inventory only",
-                            );
-                            ui.end_row();
-                            ui.label("DNS posture");
-                            ui.checkbox(&mut app.scan_form.dns_assessment, "Assess DNS and email security");
-                            ui.end_row();
-                            ui.label("CT hostname limit");
-                            ui.add_enabled(
-                                app.scan_form.asset_discovery,
-                                egui::DragValue::new(&mut app.scan_form.ct_hostname_limit)
-                                    .range(1..=5_000),
-                            );
-                            ui.end_row();
-                            ui.label("DKIM selectors");
-                            ui.add_enabled(
-                                app.scan_form.dns_assessment,
-                                egui::TextEdit::singleline(&mut app.scan_form.dkim_selectors)
-                                    .hint_text("selector1,selector2"),
-                            );
-                            ui.end_row();
-                            ui.label("Crawl URLs / domain");
-                            ui.add(
-                                egui::DragValue::new(&mut app.scan_form.crawl_max_urls)
-                                    .range(1..=100_000),
-                            );
-                            ui.end_row();
-                            ui.label("Concurrent crawl requests");
-                            ui.add(
-                                egui::DragValue::new(&mut app.scan_form.crawl_concurrency)
-                                    .range(1..=1024),
-                            );
-                            ui.end_row();
-                            ui.label("Crawl requests / second");
-                            ui.add(
-                                egui::DragValue::new(&mut app.scan_form.crawl_rate)
-                                    .range(1..=10_000),
-                            );
-                            ui.end_row();
-                        });
-                    });
-                if app.scan_form.web_probe_level.state_changing() {
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        "State-changing probes may create application data. Cleanup is best-effort.",
-                    );
-                }
-                ui.horizontal(|ui| {
-                    let fingerprints_ready = matches!(
-                        fingerprints::initialization_status(),
-                        InitializationStatus::Ready { .. }
-                    );
-                    if ui
-                        .add_enabled(
-                            fingerprints_ready
-                                && !app.scan_form.diagnostic.url.trim().is_empty(),
-                            egui::Button::new("Start Scan"),
-                        )
-                        .clicked()
-                    {
-                        start = true;
-                    }
-                    if !fingerprints_ready {
-                        ui.spinner();
-                        ui.weak("Initializing fingerprint catalog");
-                    }
-                    if ui.button("Close").clicked() {
-                        app.show_exposure_scan = false;
-                    }
-                });
-            });
-    }
-    start
-}
+                        ({
+let (ui, app,): (& mut egui :: Ui, & mut App,) = (ui, app,);
 
-fn parse_dkim_selectors(value: &str) -> Result<Vec<String>, String> {
-    let mut selectors = Vec::new();
-    for value in value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-            || value.len() > 63
-            || value.starts_with('-')
-            || value.ends_with('-')
-        {
-            return Err(format!("Invalid DKIM selector '{value}'"));
-        }
-        let value = value.to_ascii_lowercase();
-        if !selectors.contains(&value) {
-            selectors.push(value);
-        }
-    }
-    Ok(selectors)
-}
-
-fn show_diagnostic_inputs(ui: &mut egui::Ui, app: &mut App) {
     ui.horizontal_wrapped(|ui| {
         ui.label("Method");
         egui::ComboBox::from_id_salt("scan_method")
@@ -631,35 +530,270 @@ fn show_diagnostic_inputs(ui: &mut egui::Ui, app: &mut App) {
     egui::CollapsingHeader::new("Stage timeouts")
         .default_open(true)
         .show(ui, |ui| {
-            show_timeout_inputs(ui, &mut app.scan_form.diagnostic.timeouts)
-        });
-}
+            {
+let (ui, values,): (& mut egui :: Ui, & mut TimeoutInputs,) = (ui, &mut app.scan_form.diagnostic.timeouts,);
 
-fn show_timeout_inputs(ui: &mut egui::Ui, values: &mut TimeoutInputs) {
     egui::Grid::new("scan_timeouts").show(ui, |ui| {
-        timeout_row(ui, "Authentication", &mut values.authentication);
-        timeout_row(ui, "DNS", &mut values.dns);
-        timeout_row(ui, "TCP / QUIC", &mut values.transport);
-        timeout_row(ui, "TLS", &mut values.tls);
-        timeout_row(ui, "HTTP headers", &mut values.headers);
-        timeout_row(ui, "First byte", &mut values.first_byte);
-        timeout_row(ui, "Body", &mut values.body);
-    });
-}
+        ({
+let (ui, label, value,): (& mut egui :: Ui, & str, & mut f64,) = (ui, "Authentication", &mut values.authentication,);
 
-fn timeout_row(ui: &mut egui::Ui, label: &str, value: &mut f64) {
     ui.label(label);
     ui.add(
         egui::DragValue::new(value)
-            .range(0.1..=3600.0)
+            .range(limits::STAGE_TIMEOUT)
+            .clamp_existing_to_range(false)
             .speed(0.5)
             .suffix(" s"),
     );
     ui.end_row();
-}
 
-fn duration(seconds: f64) -> Duration {
-    Duration::from_secs_f64(seconds.clamp(0.1, 3600.0))
+});
+        ({
+let (ui, label, value,): (& mut egui :: Ui, & str, & mut f64,) = (ui, "DNS", &mut values.dns,);
+
+    ui.label(label);
+    ui.add(
+        egui::DragValue::new(value)
+            .range(limits::STAGE_TIMEOUT)
+            .clamp_existing_to_range(false)
+            .speed(0.5)
+            .suffix(" s"),
+    );
+    ui.end_row();
+
+});
+        ({
+let (ui, label, value,): (& mut egui :: Ui, & str, & mut f64,) = (ui, "TCP / QUIC", &mut values.transport,);
+
+    ui.label(label);
+    ui.add(
+        egui::DragValue::new(value)
+            .range(limits::STAGE_TIMEOUT)
+            .clamp_existing_to_range(false)
+            .speed(0.5)
+            .suffix(" s"),
+    );
+    ui.end_row();
+
+});
+        ({
+let (ui, label, value,): (& mut egui :: Ui, & str, & mut f64,) = (ui, "TLS", &mut values.tls,);
+
+    ui.label(label);
+    ui.add(
+        egui::DragValue::new(value)
+            .range(limits::STAGE_TIMEOUT)
+            .clamp_existing_to_range(false)
+            .speed(0.5)
+            .suffix(" s"),
+    );
+    ui.end_row();
+
+});
+        ({
+let (ui, label, value,): (& mut egui :: Ui, & str, & mut f64,) = (ui, "HTTP headers", &mut values.headers,);
+
+    ui.label(label);
+    ui.add(
+        egui::DragValue::new(value)
+            .range(limits::STAGE_TIMEOUT)
+            .clamp_existing_to_range(false)
+            .speed(0.5)
+            .suffix(" s"),
+    );
+    ui.end_row();
+
+});
+        ({
+let (ui, label, value,): (& mut egui :: Ui, & str, & mut f64,) = (ui, "First byte", &mut values.first_byte,);
+
+    ui.label(label);
+    ui.add(
+        egui::DragValue::new(value)
+            .range(limits::STAGE_TIMEOUT)
+            .clamp_existing_to_range(false)
+            .speed(0.5)
+            .suffix(" s"),
+    );
+    ui.end_row();
+
+});
+        ({
+let (ui, label, value,): (& mut egui :: Ui, & str, & mut f64,) = (ui, "Body", &mut values.body,);
+
+    ui.label(label);
+    ui.add(
+        egui::DragValue::new(value)
+            .range(limits::STAGE_TIMEOUT)
+            .clamp_existing_to_range(false)
+            .speed(0.5)
+            .suffix(" s"),
+    );
+    ui.end_row();
+
+});
+    });
+
+}
+        });
+
+});
+                        ui.separator();
+                        egui::Grid::new("exposure_advanced").show(ui, |ui| {
+                            ui.label("Concurrent endpoints");
+                            ui.add(
+                                egui::DragValue::new(&mut app.scan_form.concurrency)
+                                    .range(limits::CONCURRENCY)
+                                    .clamp_existing_to_range(false),
+                            );
+                            ui.end_row();
+                            ui.label("Connection starts / second");
+                            ui.add(
+                                egui::DragValue::new(&mut app.scan_form.rate)
+                                    .range(limits::CONNECTION_RATE)
+                                    .clamp_existing_to_range(false),
+                            );
+                            ui.end_row();
+                            ui.label("Connection timeout");
+                            ui.add(
+                                egui::DragValue::new(&mut app.scan_form.connection_timeout)
+                                    .range(limits::CONNECTION_TIMEOUT)
+                                    .clamp_existing_to_range(false)
+                                    .suffix(" s"),
+                            );
+                            ui.end_row();
+                            ui.label("Probe timeout");
+                            ui.add(
+                                egui::DragValue::new(&mut app.scan_form.probe_timeout)
+                                    .range(limits::PROBE_TIMEOUT)
+                                    .clamp_existing_to_range(false)
+                                    .suffix(" s"),
+                            );
+                            ui.end_row();
+                            ui.label("Web probe level");
+                            egui::ComboBox::from_id_salt("web_probe_level")
+                                .selected_text(app.scan_form.web_probe_level.to_string())
+                                .show_ui(ui, |ui| {
+                                    for level in WebProbeLevel::ALL {
+                                        ui.selectable_value(
+                                            &mut app.scan_form.web_probe_level,
+                                            level,
+                                            level.to_string(),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                            ui.label("Security operations");
+                            ui.checkbox(
+                                &mut app.scan_form.security_operations,
+                                "Broad exposure, source-map secret, advanced browser-policy, CORS consistency, DNS takeover, crawl, and technology checks",
+                            );
+                            ui.end_row();
+                            if app.scan_form.web_probe_level != WebProbeLevel::Passive {
+                                ui.label("Active requests / origin");
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut app.scan_form.active_requests_per_origin,
+                                    )
+                                    .range(limits::ACTIVE_PER_ORIGIN)
+                                    .clamp_existing_to_range(false),
+                                );
+                                ui.end_row();
+                                ui.label("Total active requests");
+                                ui.add(
+                                    egui::DragValue::new(&mut app.scan_form.active_requests_total)
+                                        .range(limits::ACTIVE_TOTAL)
+                                        .clamp_existing_to_range(false),
+                                );
+                                ui.end_row();
+                            }
+                            ui.label("Service access checks");
+                            ui.checkbox(
+                                &mut app.scan_form.service_access_checks,
+                                "Handshake-only anonymous access checks",
+                            );
+                            ui.end_row();
+                            ui.label("DNS & Discovery");
+                            ui.checkbox(
+                                &mut app.scan_form.dns_and_discovery,
+                                "Assess DNS/email security; query crt.sh for inventory only",
+                            );
+                            ui.end_row();
+                            if app.scan_form.dns_and_discovery {
+                                ui.label("CT hostname limit");
+                                ui.add(
+                                    egui::DragValue::new(&mut app.scan_form.ct_hostname_limit)
+                                        .range(limits::CT_HOSTNAMES)
+                                        .clamp_existing_to_range(false),
+                                );
+                                ui.end_row();
+                                ui.label("DKIM selectors");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut app.scan_form.dkim_selectors)
+                                        .hint_text("selector1,selector2"),
+                                );
+                                ui.end_row();
+                            }
+                            if app.scan_form.security_operations {
+                                ui.label("Crawl URLs / domain");
+                                ui.add(
+                                    egui::DragValue::new(&mut app.scan_form.crawl_max_urls)
+                                        .range(limits::CRAWL_URLS)
+                                        .clamp_existing_to_range(false),
+                                );
+                                ui.end_row();
+                                ui.label("Concurrent crawl requests");
+                                ui.add(
+                                    egui::DragValue::new(&mut app.scan_form.crawl_concurrency)
+                                        .range(limits::CRAWL_CONCURRENCY)
+                                        .clamp_existing_to_range(false),
+                                );
+                                ui.end_row();
+                                ui.label("Crawl requests / second");
+                                ui.add(
+                                    egui::DragValue::new(&mut app.scan_form.crawl_rate)
+                                        .range(limits::CRAWL_RATE)
+                                        .clamp_existing_to_range(false),
+                                );
+                                ui.end_row();
+                            }
+                        });
+                    });
+                if matches!( app.scan_form.web_probe_level, crate::WebProbeLevel::StateChanging) {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "State-changing probes may create application data. Cleanup is best-effort.",
+                    );
+                }
+                if let Some(error) = &app.ui_error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+                ui.horizontal(|ui| {
+                    let fingerprints_ready = matches!(
+                        fingerprints::initialization_status(),
+                        InitializationStatus::Ready { .. }
+                    );
+                    if ui
+                        .add_enabled(
+                            fingerprints_ready
+                                && !app.scan_form.diagnostic.url.trim().is_empty(),
+                            egui::Button::new("Start Scan"),
+                        )
+                        .clicked()
+                    {
+                        start = true;
+                    }
+                    if !fingerprints_ready {
+                        ui.spinner();
+                        ui.weak("Initializing fingerprint catalog");
+                    }
+                    if ui.button("Close").clicked() {
+                        app.show_exposure_scan = false;
+                    }
+                });
+            });
+    }
+    start
 }
 
 pub(super) fn show_live(ui: &mut egui::Ui, live: &ExposureLiveState) {

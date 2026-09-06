@@ -65,9 +65,155 @@ pub(super) fn classify_resource(
     content_type: Option<&str>,
     body: &[u8],
 ) -> Vec<DetectedFileType> {
-    let extension = extension_file_type(url.path());
-    let mime = content_type.and_then(mime_file_type);
-    let signatures = signature_file_types(body);
+    let extension = {
+        let (path,): (&str,) = (url.path(),);
+        {
+            'inlined_extension_file_type: {
+                let path = path
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or(path)
+                    .to_ascii_lowercase();
+                let extension = match path.rsplit_once('.').map(|(_, value)| value) {
+                    Some(value) => value,
+                    None => break 'inlined_extension_file_type None,
+                };
+                Some(match extension {
+                    "js" | "mjs" | "cjs" => TechnologyFileType::JavaScript,
+                    "jsx" => TechnologyFileType::Jsx,
+                    "ts" => TechnologyFileType::TypeScript,
+                    "tsx" => TechnologyFileType::Tsx,
+                    "php" | "phtml" | "phar" => TechnologyFileType::Php,
+                    "py" | "pyw" => TechnologyFileType::Python,
+                    "rb" => TechnologyFileType::Ruby,
+                    "erb" => TechnologyFileType::Erb,
+                    "java" => TechnologyFileType::Java,
+                    "jsp" | "jspx" => TechnologyFileType::Jsp,
+                    "kt" | "kts" => TechnologyFileType::Kotlin,
+                    "jar" => TechnologyFileType::Jar,
+                    "cs" => TechnologyFileType::CSharp,
+                    "cshtml" | "razor" => TechnologyFileType::Razor,
+                    "aspx" | "ashx" | "asmx" => TechnologyFileType::AspNet,
+                    "dll" => TechnologyFileType::DotNetAssembly,
+                    "go" => TechnologyFileType::Go,
+                    "rs" => TechnologyFileType::Rust,
+                    _ => break 'inlined_extension_file_type None,
+                })
+            }
+        }
+    };
+    let mime = content_type.and_then(|content_type: &str| {
+        let value = content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim()
+            .to_ascii_lowercase();
+        Some(match value.as_str() {
+            "application/javascript"
+            | "text/javascript"
+            | "application/ecmascript"
+            | "text/ecmascript" => TechnologyFileType::JavaScript,
+            "application/typescript" | "text/typescript" => TechnologyFileType::TypeScript,
+            "application/x-httpd-php" | "text/x-php" => TechnologyFileType::Php,
+            "text/x-python" | "application/x-python-code" => TechnologyFileType::Python,
+            "text/x-ruby" | "application/x-ruby" => TechnologyFileType::Ruby,
+            "text/x-java-source" => TechnologyFileType::Java,
+            "application/java-archive" | "application/java-vm" => TechnologyFileType::Jar,
+            "text/x-kotlin" => TechnologyFileType::Kotlin,
+            "text/x-csharp" => TechnologyFileType::CSharp,
+            "text/x-go" => TechnologyFileType::Go,
+            "text/x-rust" => TechnologyFileType::Rust,
+            _ => return None,
+        })
+    });
+    let signatures = {
+        let (body,): (&[u8],) = (body,);
+        let inlined_result: Vec<TechnologyFileType> = {
+            'inlined_signature_file_types: {
+                let bytes = &body[..body.len().min(64 * 1024)];
+                if bytes.starts_with(b"PK\x03\x04") {
+                    break 'inlined_signature_file_types Vec::new();
+                }
+                let text = String::from_utf8_lossy(bytes);
+                let trimmed = text.trim_start();
+                if trimmed.to_ascii_lowercase().starts_with("<!doctype html")
+                    || trimmed.to_ascii_lowercase().starts_with("<html")
+                {
+                    break 'inlined_signature_file_types Vec::new();
+                }
+                let mut types = Vec::new();
+                if trimmed.starts_with("<?php") {
+                    types.push(TechnologyFileType::Php);
+                }
+                if trimmed.starts_with("<%@") && trimmed.contains("Page") {
+                    types.push(TechnologyFileType::AspNet);
+                }
+                if (trimmed.starts_with("@page") || trimmed.starts_with("@model"))
+                    && (text.contains("@code") || text.contains("@functions"))
+                {
+                    types.push(TechnologyFileType::Razor);
+                }
+                if text.starts_with("#!")
+                    && text
+                        .lines()
+                        .next()
+                        .is_some_and(|line| line.contains("python"))
+                    || (text.contains("def ") && text.contains("import ") && text.contains(':'))
+                {
+                    types.push(TechnologyFileType::Python);
+                }
+                if text.starts_with("#!")
+                    && text
+                        .lines()
+                        .next()
+                        .is_some_and(|line| line.contains("ruby"))
+                    || (text.contains("require '")
+                        && text.contains("def ")
+                        && text.contains("\nend"))
+                {
+                    types.push(TechnologyFileType::Ruby);
+                }
+                if (text.contains("package ") && text.contains("public class "))
+                    || (text.contains("import java.") && text.contains("class "))
+                {
+                    types.push(TechnologyFileType::Java);
+                }
+                if text.contains("fun main(")
+                    && (text.contains("val ") || text.contains("import kotlin."))
+                {
+                    types.push(TechnologyFileType::Kotlin);
+                }
+                if (text.contains("using System;") || text.contains("namespace System"))
+                    && (text.contains(" class ") || text.contains("record "))
+                {
+                    types.push(TechnologyFileType::CSharp);
+                }
+                if text.contains("package main") && text.contains("func main(") {
+                    types.push(TechnologyFileType::Go);
+                }
+                if text.contains("fn main(")
+                    && (text.contains("use std::") || text.contains("extern crate "))
+                {
+                    types.push(TechnologyFileType::Rust);
+                }
+                if (text.contains("\"use strict\"") || text.contains("'use strict'"))
+                    && (text.contains("function ") || text.contains("=>"))
+                {
+                    types.push(TechnologyFileType::JavaScript);
+                }
+                if (text.contains("interface ") || text.contains("type "))
+                    && (text.contains(": string") || text.contains(": number"))
+                {
+                    types.push(TechnologyFileType::TypeScript);
+                }
+                types.sort();
+                types.dedup();
+                types
+            }
+        };
+        inlined_result
+    };
     let mut evidence = BTreeMap::<TechnologyFileType, (u8, Vec<String>)>::new();
     if let Some(file_type) = extension {
         let item = evidence.entry(file_type).or_default();
@@ -91,7 +237,43 @@ pub(super) fn classify_resource(
         && let Some(sources) = map.get("sources").and_then(Value::as_array)
     {
         for source in sources.iter().filter_map(Value::as_str).take(2048) {
-            if let Some(file_type) = extension_file_type(source) {
+            if let Some(file_type) = {
+                let (path,): (&str,) = (source,);
+                {
+                    'inlined_extension_file_type: {
+                        let path = path
+                            .split(['?', '#'])
+                            .next()
+                            .unwrap_or(path)
+                            .to_ascii_lowercase();
+                        let extension = match path.rsplit_once('.').map(|(_, value)| value) {
+                            Some(value) => value,
+                            None => break 'inlined_extension_file_type None,
+                        };
+                        Some(match extension {
+                            "js" | "mjs" | "cjs" => TechnologyFileType::JavaScript,
+                            "jsx" => TechnologyFileType::Jsx,
+                            "ts" => TechnologyFileType::TypeScript,
+                            "tsx" => TechnologyFileType::Tsx,
+                            "php" | "phtml" | "phar" => TechnologyFileType::Php,
+                            "py" | "pyw" => TechnologyFileType::Python,
+                            "rb" => TechnologyFileType::Ruby,
+                            "erb" => TechnologyFileType::Erb,
+                            "java" => TechnologyFileType::Java,
+                            "jsp" | "jspx" => TechnologyFileType::Jsp,
+                            "kt" | "kts" => TechnologyFileType::Kotlin,
+                            "jar" => TechnologyFileType::Jar,
+                            "cs" => TechnologyFileType::CSharp,
+                            "cshtml" | "razor" => TechnologyFileType::Razor,
+                            "aspx" | "ashx" | "asmx" => TechnologyFileType::AspNet,
+                            "dll" => TechnologyFileType::DotNetAssembly,
+                            "go" => TechnologyFileType::Go,
+                            "rs" => TechnologyFileType::Rust,
+                            _ => break 'inlined_extension_file_type None,
+                        })
+                    }
+                }
+            } {
                 let item = evidence.entry(file_type).or_default();
                 item.0 |= 4;
                 item.1
@@ -100,7 +282,95 @@ pub(super) fn classify_resource(
         }
         if let Some(contents) = map.get("sourcesContent").and_then(Value::as_array) {
             for content in contents.iter().filter_map(Value::as_str).take(256) {
-                for file_type in signature_file_types(content.as_bytes()) {
+                for file_type in {
+                    let (body,): (&[u8],) = (content.as_bytes(),);
+                    let inlined_result: Vec<TechnologyFileType> = {
+                        'inlined_signature_file_types: {
+                            let bytes = &body[..body.len().min(64 * 1024)];
+                            if bytes.starts_with(b"PK\x03\x04") {
+                                break 'inlined_signature_file_types Vec::new();
+                            }
+                            let text = String::from_utf8_lossy(bytes);
+                            let trimmed = text.trim_start();
+                            if trimmed.to_ascii_lowercase().starts_with("<!doctype html")
+                                || trimmed.to_ascii_lowercase().starts_with("<html")
+                            {
+                                break 'inlined_signature_file_types Vec::new();
+                            }
+                            let mut types = Vec::new();
+                            if trimmed.starts_with("<?php") {
+                                types.push(TechnologyFileType::Php);
+                            }
+                            if trimmed.starts_with("<%@") && trimmed.contains("Page") {
+                                types.push(TechnologyFileType::AspNet);
+                            }
+                            if (trimmed.starts_with("@page") || trimmed.starts_with("@model"))
+                                && (text.contains("@code") || text.contains("@functions"))
+                            {
+                                types.push(TechnologyFileType::Razor);
+                            }
+                            if text.starts_with("#!")
+                                && text
+                                    .lines()
+                                    .next()
+                                    .is_some_and(|line| line.contains("python"))
+                                || (text.contains("def ")
+                                    && text.contains("import ")
+                                    && text.contains(':'))
+                            {
+                                types.push(TechnologyFileType::Python);
+                            }
+                            if text.starts_with("#!")
+                                && text
+                                    .lines()
+                                    .next()
+                                    .is_some_and(|line| line.contains("ruby"))
+                                || (text.contains("require '")
+                                    && text.contains("def ")
+                                    && text.contains("\nend"))
+                            {
+                                types.push(TechnologyFileType::Ruby);
+                            }
+                            if (text.contains("package ") && text.contains("public class "))
+                                || (text.contains("import java.") && text.contains("class "))
+                            {
+                                types.push(TechnologyFileType::Java);
+                            }
+                            if text.contains("fun main(")
+                                && (text.contains("val ") || text.contains("import kotlin."))
+                            {
+                                types.push(TechnologyFileType::Kotlin);
+                            }
+                            if (text.contains("using System;") || text.contains("namespace System"))
+                                && (text.contains(" class ") || text.contains("record "))
+                            {
+                                types.push(TechnologyFileType::CSharp);
+                            }
+                            if text.contains("package main") && text.contains("func main(") {
+                                types.push(TechnologyFileType::Go);
+                            }
+                            if text.contains("fn main(")
+                                && (text.contains("use std::") || text.contains("extern crate "))
+                            {
+                                types.push(TechnologyFileType::Rust);
+                            }
+                            if (text.contains("\"use strict\"") || text.contains("'use strict'"))
+                                && (text.contains("function ") || text.contains("=>"))
+                            {
+                                types.push(TechnologyFileType::JavaScript);
+                            }
+                            if (text.contains("interface ") || text.contains("type "))
+                                && (text.contains(": string") || text.contains(": number"))
+                            {
+                                types.push(TechnologyFileType::TypeScript);
+                            }
+                            types.sort();
+                            types.dedup();
+                            types
+                        }
+                    };
+                    inlined_result
+                } {
                     let item = evidence.entry(file_type).or_default();
                     item.0 |= 4;
                     item.1
@@ -144,178 +414,46 @@ pub(super) fn should_capture(
             item.file_type,
             TechnologyFileType::Jar | TechnologyFileType::DotNetAssembly
         )
-    }) || is_manifest_path(&path)
-        || path.ends_with(".map")
+    }) || ({
+        let (path,): (&str,) = (&path,);
+        {
+            matches!(
+                path.rsplit('/').next().unwrap_or(path),
+                "package.json"
+                    | "package-lock.json"
+                    | "npm-shrinkwrap.json"
+                    | "yarn.lock"
+                    | "pnpm-lock.yaml"
+                    | "composer.json"
+                    | "composer.lock"
+                    | "requirements.txt"
+                    | "pipfile"
+                    | "pipfile.lock"
+                    | "poetry.lock"
+                    | "uv.lock"
+                    | "pyproject.toml"
+                    | "gemfile"
+                    | "gemfile.lock"
+                    | "pom.xml"
+                    | "build.gradle"
+                    | "build.gradle.kts"
+                    | "gradle.lockfile"
+                    | "packages.config"
+                    | "packages.lock.json"
+                    | "directory.packages.props"
+                    | "go.mod"
+                    | "go.sum"
+                    | "cargo.toml"
+                    | "cargo.lock"
+            )
+        }
+    }) || path.ends_with(".map")
         || start.trim_start().starts_with("<!doctype html")
         || start.trim_start().starts_with("<html")
         || content_type.is_some_and(|value| {
             let value = value.to_ascii_lowercase();
             value.contains("html") || value.contains("json") || value.contains("xml")
         })
-}
-
-fn extension_file_type(path: &str) -> Option<TechnologyFileType> {
-    let path = path
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(path)
-        .to_ascii_lowercase();
-    let extension = path.rsplit_once('.').map(|(_, value)| value)?;
-    Some(match extension {
-        "js" | "mjs" | "cjs" => TechnologyFileType::JavaScript,
-        "jsx" => TechnologyFileType::Jsx,
-        "ts" => TechnologyFileType::TypeScript,
-        "tsx" => TechnologyFileType::Tsx,
-        "php" | "phtml" | "phar" => TechnologyFileType::Php,
-        "py" | "pyw" => TechnologyFileType::Python,
-        "rb" => TechnologyFileType::Ruby,
-        "erb" => TechnologyFileType::Erb,
-        "java" => TechnologyFileType::Java,
-        "jsp" | "jspx" => TechnologyFileType::Jsp,
-        "kt" | "kts" => TechnologyFileType::Kotlin,
-        "jar" => TechnologyFileType::Jar,
-        "cs" => TechnologyFileType::CSharp,
-        "cshtml" | "razor" => TechnologyFileType::Razor,
-        "aspx" | "ashx" | "asmx" => TechnologyFileType::AspNet,
-        "dll" => TechnologyFileType::DotNetAssembly,
-        "go" => TechnologyFileType::Go,
-        "rs" => TechnologyFileType::Rust,
-        _ => return None,
-    })
-}
-
-fn mime_file_type(content_type: &str) -> Option<TechnologyFileType> {
-    let value = content_type
-        .split(';')
-        .next()
-        .unwrap_or(content_type)
-        .trim()
-        .to_ascii_lowercase();
-    Some(match value.as_str() {
-        "application/javascript"
-        | "text/javascript"
-        | "application/ecmascript"
-        | "text/ecmascript" => TechnologyFileType::JavaScript,
-        "application/typescript" | "text/typescript" => TechnologyFileType::TypeScript,
-        "application/x-httpd-php" | "text/x-php" => TechnologyFileType::Php,
-        "text/x-python" | "application/x-python-code" => TechnologyFileType::Python,
-        "text/x-ruby" | "application/x-ruby" => TechnologyFileType::Ruby,
-        "text/x-java-source" => TechnologyFileType::Java,
-        "application/java-archive" | "application/java-vm" => TechnologyFileType::Jar,
-        "text/x-kotlin" => TechnologyFileType::Kotlin,
-        "text/x-csharp" => TechnologyFileType::CSharp,
-        "text/x-go" => TechnologyFileType::Go,
-        "text/x-rust" => TechnologyFileType::Rust,
-        _ => return None,
-    })
-}
-
-fn signature_file_types(body: &[u8]) -> Vec<TechnologyFileType> {
-    let bytes = &body[..body.len().min(64 * 1024)];
-    if bytes.starts_with(b"PK\x03\x04") {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(bytes);
-    let trimmed = text.trim_start();
-    if trimmed.to_ascii_lowercase().starts_with("<!doctype html")
-        || trimmed.to_ascii_lowercase().starts_with("<html")
-    {
-        return Vec::new();
-    }
-    let mut types = Vec::new();
-    if trimmed.starts_with("<?php") {
-        types.push(TechnologyFileType::Php);
-    }
-    if trimmed.starts_with("<%@") && trimmed.contains("Page") {
-        types.push(TechnologyFileType::AspNet);
-    }
-    if (trimmed.starts_with("@page") || trimmed.starts_with("@model"))
-        && (text.contains("@code") || text.contains("@functions"))
-    {
-        types.push(TechnologyFileType::Razor);
-    }
-    if text.starts_with("#!")
-        && text
-            .lines()
-            .next()
-            .is_some_and(|line| line.contains("python"))
-        || (text.contains("def ") && text.contains("import ") && text.contains(':'))
-    {
-        types.push(TechnologyFileType::Python);
-    }
-    if text.starts_with("#!")
-        && text
-            .lines()
-            .next()
-            .is_some_and(|line| line.contains("ruby"))
-        || (text.contains("require '") && text.contains("def ") && text.contains("\nend"))
-    {
-        types.push(TechnologyFileType::Ruby);
-    }
-    if (text.contains("package ") && text.contains("public class "))
-        || (text.contains("import java.") && text.contains("class "))
-    {
-        types.push(TechnologyFileType::Java);
-    }
-    if text.contains("fun main(") && (text.contains("val ") || text.contains("import kotlin.")) {
-        types.push(TechnologyFileType::Kotlin);
-    }
-    if (text.contains("using System;") || text.contains("namespace System"))
-        && (text.contains(" class ") || text.contains("record "))
-    {
-        types.push(TechnologyFileType::CSharp);
-    }
-    if text.contains("package main") && text.contains("func main(") {
-        types.push(TechnologyFileType::Go);
-    }
-    if text.contains("fn main(") && (text.contains("use std::") || text.contains("extern crate ")) {
-        types.push(TechnologyFileType::Rust);
-    }
-    if (text.contains("\"use strict\"") || text.contains("'use strict'"))
-        && (text.contains("function ") || text.contains("=>"))
-    {
-        types.push(TechnologyFileType::JavaScript);
-    }
-    if (text.contains("interface ") || text.contains("type "))
-        && (text.contains(": string") || text.contains(": number"))
-    {
-        types.push(TechnologyFileType::TypeScript);
-    }
-    types.sort();
-    types.dedup();
-    types
-}
-
-fn is_manifest_path(path: &str) -> bool {
-    matches!(
-        path.rsplit('/').next().unwrap_or(path),
-        "package.json"
-            | "package-lock.json"
-            | "npm-shrinkwrap.json"
-            | "yarn.lock"
-            | "pnpm-lock.yaml"
-            | "composer.json"
-            | "composer.lock"
-            | "requirements.txt"
-            | "pipfile"
-            | "pipfile.lock"
-            | "poetry.lock"
-            | "uv.lock"
-            | "pyproject.toml"
-            | "gemfile"
-            | "gemfile.lock"
-            | "pom.xml"
-            | "build.gradle"
-            | "build.gradle.kts"
-            | "gradle.lockfile"
-            | "packages.config"
-            | "packages.lock.json"
-            | "directory.packages.props"
-            | "go.mod"
-            | "go.sum"
-            | "cargo.toml"
-            | "cargo.lock"
-    )
 }
 
 pub(super) async fn analyze(
@@ -338,35 +476,1880 @@ pub(super) async fn analyze(
     );
     for endpoint in endpoints.iter_mut() {
         endpoint.technology_components.clear();
-        import_javascript_components(endpoint);
+        ({
+            let (endpoint,): (&mut EndpointScan,) = (endpoint,);
+
+            let mut components = Vec::new();
+            for source in &endpoint.javascript_sources {
+                for library in &source.libraries {
+                    let ecosystem = if library.npm_package.is_some() {
+                        TechnologyEcosystem::Npm
+                    } else {
+                        TechnologyEcosystem::JavaScript
+                    };
+                    components.push(TechnologyComponent {
+                        name: library.name.clone(),
+                        ecosystem,
+                        kind: known_kind(
+                            ecosystem,
+                            library.npm_package.as_deref().unwrap_or(&library.name),
+                        ),
+                        package_identifier: library.npm_package.clone(),
+                        installed_version: library.installed_version.clone(),
+                        latest_version: library.latest_version.clone(),
+                        status: if library.installed_version.is_some() {
+                            library.status
+                        } else {
+                            TechnologyVersionStatus::InventoryOnly
+                        },
+                        support_status: TechnologySupportStatus::NotApplicable,
+                        confidence: if library.installed_version.is_some() {
+                            Confidence::High
+                        } else {
+                            Confidence::Medium
+                        },
+                        release_source_url: None,
+                        evidence_urls: vec![source.source_url.clone()],
+                        evidence: library.evidence.clone(),
+                        check_error: library
+                            .installed_version
+                            .is_some()
+                            .then(|| library.check_error.clone())
+                            .flatten(),
+                    });
+                }
+            }
+            for component in components {
+                ({
+                    let (components, mut incoming): (
+                        &mut Vec<TechnologyComponent>,
+                        TechnologyComponent,
+                    ) = (&mut endpoint.technology_components, component);
+
+                    let identity = |component: &TechnologyComponent| {
+                        component
+                            .package_identifier
+                            .as_deref()
+                            .unwrap_or(&component.name)
+                            .to_ascii_lowercase()
+                    };
+                    let incoming_identity = identity(&incoming);
+                    let matching = components.iter_mut().find(|existing| {
+                        existing.ecosystem == incoming.ecosystem
+                            && identity(existing) == incoming_identity
+                            && (existing.installed_version == incoming.installed_version
+                                || existing.installed_version.is_none()
+                                || incoming.installed_version.is_none())
+                    });
+                    if let Some(existing) = matching {
+                        if existing.installed_version.is_none()
+                            && incoming.installed_version.is_some()
+                        {
+                            existing.installed_version = incoming.installed_version.take();
+                            existing.status = incoming.status;
+                        }
+                        if existing.latest_version.is_none() {
+                            existing.latest_version = incoming.latest_version;
+                        }
+                        if existing.package_identifier.is_none() {
+                            existing.package_identifier = incoming.package_identifier;
+                        }
+                        if existing.support_status == TechnologySupportStatus::NotApplicable
+                            || existing.support_status == TechnologySupportStatus::Unknown
+                        {
+                            existing.support_status = incoming.support_status;
+                        }
+                        if existing.release_source_url.is_none() {
+                            existing.release_source_url = incoming.release_source_url;
+                        }
+                        existing.confidence = existing.confidence.max(incoming.confidence);
+                        existing.evidence_urls.extend(incoming.evidence_urls);
+                        existing.evidence.extend(incoming.evidence);
+                        existing.evidence_urls.sort();
+                        existing.evidence_urls.dedup();
+                        existing.evidence.sort();
+                        existing.evidence.dedup();
+                    } else {
+                        incoming.evidence_urls.sort();
+                        incoming.evidence_urls.dedup();
+                        incoming.evidence.sort();
+                        incoming.evidence.dedup();
+                        components.push(incoming);
+                    }
+                });
+            }
+        });
         inventory_completed += 1;
-        send_technology_progress(
-            progress,
-            0.25 * inventory_completed as f32 / inventory_total.max(1) as f32,
-            format!(
-                "Imported JavaScript inventory for {}:{}",
-                endpoint.ip, endpoint.port
-            ),
-        );
+        ({
+            let (progress, fraction, text): (&Option<Sender<ExposureScanProgress>>, f32, String) = (
+                progress,
+                0.25 * inventory_completed as f32 / inventory_total.max(1) as f32,
+                format!(
+                    "Imported JavaScript inventory for {}:{}",
+                    endpoint.ip, endpoint.port
+                ),
+            );
+
+            send_phase_progress(
+                progress,
+                ExposureScanPhase::TechnologyAnalysis,
+                ExposureScanPhaseState::Running,
+                fraction,
+                text,
+            );
+        });
     }
     for resource in resources {
         inventory_completed += 1;
-        send_technology_progress(
-            progress,
-            0.25 * inventory_completed as f32 / inventory_total.max(1) as f32,
-            format!("Parsing inventory resource {}", resource.url),
-        );
+        ({
+            let (progress, fraction, text): (&Option<Sender<ExposureScanProgress>>, f32, String) = (
+                progress,
+                0.25 * inventory_completed as f32 / inventory_total.max(1) as f32,
+                format!("Parsing inventory resource {}", resource.url),
+            );
+
+            send_phase_progress(
+                progress,
+                ExposureScanPhase::TechnologyAnalysis,
+                ExposureScanPhaseState::Running,
+                fraction,
+                text,
+            );
+        });
         let Some(endpoint) = endpoints
             .iter_mut()
             .find(|endpoint| endpoint.ip == resource.ip && endpoint.port == resource.port)
         else {
             continue;
         };
-        for component in parse_resource(resource) {
-            merge_component(&mut endpoint.technology_components, component);
+        for component in {
+            let (resource,): (&CapturedTechnologyResource,) = (resource,);
+            let inlined_result: Vec<TechnologyComponent> = {
+                'inlined_parse_resource: {
+                    if resource.truncated {
+                        break 'inlined_parse_resource Vec::new();
+                    }
+                    let path = Url::parse(&resource.fetch_url)
+                        .ok()
+                        .map(|url| url.path().to_ascii_lowercase())
+                        .unwrap_or_else(|| resource.fetch_url.to_ascii_lowercase());
+                    let name = path.rsplit('/').next().unwrap_or(&path);
+                    match name {
+                        "package.json" | "composer.json" => {
+                            let (resource, manifest): (&CapturedTechnologyResource, &str) =
+                                (resource, name);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                'inlined_parse_dependency_manifest: {
+                                    let Ok(value) = serde_json::from_slice::<Value>(&resource.body)
+                                    else {
+                                        break 'inlined_parse_dependency_manifest Vec::new();
+                                    };
+                                    let Some(root) = value.as_object() else {
+                                        break 'inlined_parse_dependency_manifest Vec::new();
+                                    };
+                                    let (ecosystem, sections): (_, &[&str]) = match manifest {
+                                        "composer.json" => (
+                                            TechnologyEcosystem::Composer,
+                                            &["require", "require-dev"],
+                                        ),
+                                        _ => (
+                                            TechnologyEcosystem::Npm,
+                                            &[
+                                                "dependencies",
+                                                "devDependencies",
+                                                "peerDependencies",
+                                            ],
+                                        ),
+                                    };
+                                    sections
+                                        .iter()
+                                        .copied()
+                                        .filter_map(|key| {
+                                            root.get(key)
+                                                .and_then(Value::as_object)
+                                                .map(|map| (key, map))
+                                        })
+                                        .flat_map(|(key, dependencies)| {
+                                            dependencies.iter().filter_map(move |(name, value)| {
+                                                if ecosystem == TechnologyEcosystem::Composer
+                                                    && (name == "php" || name.starts_with("ext-"))
+                                                {
+                                                    return None;
+                                                }
+                                                let requested = value.as_str()?;
+                                                Some(component(
+                                                    name,
+                                                    ecosystem,
+                                                    Some(name),
+                                                    Some(requested),
+                                                    false,
+                                                    &resource.url,
+                                                    format!(
+                                                        "{manifest} {key} requests {requested}"
+                                                    ),
+                                                ))
+                                            })
+                                        })
+                                        .collect()
+                                }
+                            };
+                            inlined_result
+                        }
+                        "package-lock.json" | "npm-shrinkwrap.json" => {
+                            let (resource,): (&CapturedTechnologyResource,) = (resource,);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                'inlined_parse_package_lock: {
+                                    let Ok(value) = serde_json::from_slice::<Value>(&resource.body)
+                                    else {
+                                        break 'inlined_parse_package_lock Vec::new();
+                                    };
+                                    let Some(root) = value.as_object() else {
+                                        break 'inlined_parse_package_lock Vec::new();
+                                    };
+                                    let mut found = Vec::new();
+                                    if let Some(packages) =
+                                        root.get("packages").and_then(Value::as_object)
+                                    {
+                                        for (path, item) in packages {
+                                            let Some(name) = path
+                                                .rsplit("node_modules/")
+                                                .next()
+                                                .filter(|name| !name.is_empty())
+                                            else {
+                                                continue;
+                                            };
+                                            let Some(version) =
+                                                item.get("version").and_then(Value::as_str)
+                                            else {
+                                                continue;
+                                            };
+                                            found.push(component(
+                                                name,
+                                                TechnologyEcosystem::Npm,
+                                                Some(name),
+                                                Some(version),
+                                                exact_version(version),
+                                                &resource.url,
+                                                format!("npm lockfile pins {version}"),
+                                            ));
+                                        }
+                                    } else if let Some(dependencies) =
+                                        root.get("dependencies").and_then(Value::as_object)
+                                    {
+                                        collect_npm_lock_dependencies(
+                                            dependencies,
+                                            resource,
+                                            &mut found,
+                                        );
+                                    }
+                                    found
+                                }
+                            };
+                            inlined_result
+                        }
+                        "yarn.lock" => {
+                            let (resource,): (&CapturedTechnologyResource,) = (resource,);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                let text = String::from_utf8_lossy(&resource.body);
+                                let version = Regex::new(r#"^\s*version\s+\"([^\"]+)\""#)
+                                    .expect("valid regex");
+                                let mut names = Vec::<String>::new();
+                                let mut found = Vec::new();
+                                for line in text.lines() {
+                                    if !line.starts_with(char::is_whitespace) && line.ends_with(':')
+                                    {
+                                        names = line
+                                            .trim_end_matches(':')
+                                            .split(',')
+                                            .filter_map(|item| {
+                                                let (spec,): (&str,) =
+                                                    (item.trim().trim_matches(['\'', '"']),);
+                                                {
+                                                    'inlined_yarn_name: {
+                                                        if spec.starts_with('@') {
+                                                            let slash = match spec.find('/') {
+                                                                Some(value) => value,
+                                                                None => {
+                                                                    break 'inlined_yarn_name None;
+                                                                }
+                                                            };
+                                                            let after = &spec[slash + 1..];
+                                                            let end = after
+                                                                .find('@')
+                                                                .map_or(spec.len(), |index| {
+                                                                    slash + 1 + index
+                                                                });
+                                                            break 'inlined_yarn_name Some(
+                                                                spec[..end].to_owned(),
+                                                            );
+                                                        }
+                                                        Some(
+                                                            match spec.split('@').next() {
+                                                                Some(value) => value,
+                                                                None => {
+                                                                    break 'inlined_yarn_name None;
+                                                                }
+                                                            }
+                                                            .to_owned(),
+                                                        )
+                                                        .filter(|name| !name.is_empty())
+                                                    }
+                                                }
+                                            })
+                                            .collect();
+                                    } else if let Some(version) = version
+                                        .captures(line)
+                                        .and_then(|captures| captures.get(1))
+                                        .map(|value| value.as_str())
+                                    {
+                                        for name in names.drain(..) {
+                                            found.push(component(
+                                                &name,
+                                                TechnologyEcosystem::Npm,
+                                                Some(&name),
+                                                Some(version),
+                                                exact_version(version),
+                                                &resource.url,
+                                                format!("yarn.lock pins {version}"),
+                                            ));
+                                        }
+                                    }
+                                }
+                                found
+                            };
+                            inlined_result
+                        }
+                        "composer.lock" => {
+                            let (resource,): (&CapturedTechnologyResource,) = (resource,);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                'inlined_parse_composer_lock: {
+                                    let Ok(value) = serde_json::from_slice::<Value>(&resource.body)
+                                    else {
+                                        break 'inlined_parse_composer_lock Vec::new();
+                                    };
+                                    ["packages", "packages-dev"]
+                                        .into_iter()
+                                        .filter_map(|key| value.get(key).and_then(Value::as_array))
+                                        .flatten()
+                                        .filter_map(|item| {
+                                            let name = item.get("name")?.as_str()?;
+                                            let version = item.get("version")?.as_str()?;
+                                            Some(component(
+                                                name,
+                                                TechnologyEcosystem::Composer,
+                                                Some(name),
+                                                Some(version),
+                                                exact_version(version),
+                                                &resource.url,
+                                                format!("composer.lock pins {version}"),
+                                            ))
+                                        })
+                                        .collect()
+                                }
+                            };
+                            inlined_result
+                        }
+                        "requirements.txt" | "pipfile" => {
+                            let (resource,): (&CapturedTechnologyResource,) = (resource,);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                let text = String::from_utf8_lossy(&resource.body);
+                                let requirement = Regex::new(r#"(?im)^[\s\"']*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]+\])?\s*(==|~=|>=|<=|!=|>|<|\^|=)?\s*([^\s,;\"']*)"#)
+        .expect("valid regex");
+                                requirement
+                                    .captures_iter(&text)
+                                    .filter_map(|captures| {
+                                        let name = captures.get(1)?.as_str();
+                                        if {
+                                            let (value, candidates): (&str, &[&str]) =
+                                                (name, &["python", "source", "requires-python"]);
+                                            candidates.iter().any(|candidate| {
+                                                value.eq_ignore_ascii_case(candidate)
+                                            })
+                                        } {
+                                            return None;
+                                        }
+                                        let spec =
+                                            captures.get(3).map_or("", |value| value.as_str());
+                                        Some(component(
+                                            name,
+                                            TechnologyEcosystem::PyPi,
+                                            Some(name),
+                                            (!spec.is_empty()).then_some(spec),
+                                            false,
+                                            &resource.url,
+                                            if spec.is_empty() {
+                                                "Python dependency manifest entry".to_owned()
+                                            } else {
+                                                format!(
+                                                    "Python dependency manifest requests {spec}"
+                                                )
+                                            },
+                                        ))
+                                    })
+                                    .take(4096)
+                                    .collect()
+                            };
+                            inlined_result
+                        }
+                        "pyproject.toml" => {
+                            let (resource,): (&CapturedTechnologyResource,) = (resource,);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                let text = String::from_utf8_lossy(&resource.body);
+                                let requirement = Regex::new(
+        r#"[\"']([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]+\])?\s*(==|~=|>=|<=|!=|>|<|\^|~)?\s*([^\s,;\"']*)[\"']"#,
+    )
+    .expect("valid regex");
+                                let assignment = Regex::new(
+                                    r#"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*=\s*[\"']([^\"']+)[\"']"#,
+                                )
+                                .expect("valid regex");
+                                let mut dependency_section = false;
+                                let mut dependency_array = false;
+                                let mut found = Vec::new();
+                                for line in text.lines() {
+                                    let trimmed = line.trim();
+                                    if trimmed.starts_with('[') {
+                                        let section =
+                                            trimmed.trim_matches(['[', ']']).to_ascii_lowercase();
+                                        dependency_section = section.contains("dependenc");
+                                        dependency_array = false;
+                                        continue;
+                                    }
+                                    if trimmed.starts_with("dependencies") && trimmed.contains('[')
+                                    {
+                                        dependency_array = true;
+                                        continue;
+                                    }
+                                    if dependency_array && trimmed == "]" {
+                                        dependency_array = false;
+                                        continue;
+                                    }
+                                    if !dependency_section && !dependency_array {
+                                        continue;
+                                    }
+                                    if let Some(captures) = requirement.captures(line) {
+                                        let Some(name) =
+                                            captures.get(1).map(|value| value.as_str())
+                                        else {
+                                            continue;
+                                        };
+                                        if name.eq_ignore_ascii_case("python") {
+                                            continue;
+                                        }
+                                        let requested = captures
+                                            .get(3)
+                                            .map(|value| value.as_str())
+                                            .filter(|value| !value.is_empty());
+                                        found.push(component(
+                                            name,
+                                            TechnologyEcosystem::PyPi,
+                                            Some(name),
+                                            requested,
+                                            false,
+                                            &resource.url,
+                                            requested.map_or_else(
+                                                || "pyproject.toml dependency".to_owned(),
+                                                |value| format!("pyproject.toml requests {value}"),
+                                            ),
+                                        ));
+                                    } else if let Some(captures) = assignment.captures(line) {
+                                        let Some(name) =
+                                            captures.get(1).map(|value| value.as_str())
+                                        else {
+                                            continue;
+                                        };
+                                        if name.eq_ignore_ascii_case("python") {
+                                            continue;
+                                        }
+                                        let requested = captures.get(2).map(|value| value.as_str());
+                                        found.push(component(
+                                            name,
+                                            TechnologyEcosystem::PyPi,
+                                            Some(name),
+                                            requested,
+                                            false,
+                                            &resource.url,
+                                            requested.map_or_else(
+                                                || "pyproject.toml dependency".to_owned(),
+                                                |value| format!("pyproject.toml requests {value}"),
+                                            ),
+                                        ));
+                                    }
+                                }
+                                found
+                            };
+                            inlined_result
+                        }
+                        "pipfile.lock" => {
+                            let (resource,): (&CapturedTechnologyResource,) = (resource,);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                'inlined_parse_pipfile_lock: {
+                                    let Ok(value) = serde_json::from_slice::<Value>(&resource.body)
+                                    else {
+                                        break 'inlined_parse_pipfile_lock Vec::new();
+                                    };
+                                    ["default", "develop"]
+                                        .into_iter()
+                                        .filter_map(|key| value.get(key).and_then(Value::as_object))
+                                        .flat_map(|dependencies| dependencies.iter())
+                                        .filter_map(|(name, item)| {
+                                            let version =
+                                                item.get("version").and_then(Value::as_str)?;
+                                            Some(component(
+                                                name,
+                                                TechnologyEcosystem::PyPi,
+                                                Some(name),
+                                                Some(version),
+                                                exact_version(version),
+                                                &resource.url,
+                                                format!("Pipfile.lock pins {version}"),
+                                            ))
+                                        })
+                                        .collect()
+                                }
+                            };
+                            inlined_result
+                        }
+                        "poetry.lock" | "uv.lock" => {
+                            let (resource, ecosystem): (
+                                &CapturedTechnologyResource,
+                                TechnologyEcosystem,
+                            ) = (resource, TechnologyEcosystem::PyPi);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                let text = String::from_utf8_lossy(&resource.body);
+                                let assignment =
+                                    Regex::new(r#"^\s*(name|version)\s*=\s*[\"']([^\"']+)[\"']"#)
+                                        .expect("valid regex");
+                                let mut current_name: Option<String> = None;
+                                let mut current_version: Option<String> = None;
+                                let mut found = Vec::new();
+                                for line in text.lines().chain(std::iter::once("[[package]]")) {
+                                    if line.trim() == "[[package]]" {
+                                        if let (Some(name), Some(version)) =
+                                            (current_name.take(), current_version.take())
+                                        {
+                                            found.push(component(
+                                                &name,
+                                                ecosystem,
+                                                Some(&name),
+                                                Some(&version),
+                                                exact_version(&version),
+                                                &resource.url,
+                                                format!("lockfile pins {version}"),
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                    if let Some(captures) = assignment.captures(line) {
+                                        match captures.get(1).map(|value| value.as_str()) {
+                                            Some("name") => {
+                                                current_name = captures
+                                                    .get(2)
+                                                    .map(|value| value.as_str().to_owned())
+                                            }
+                                            Some("version") => {
+                                                current_version = captures
+                                                    .get(2)
+                                                    .map(|value| value.as_str().to_owned())
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                found
+                            };
+                            inlined_result
+                        }
+                        "gemfile" => {
+                            let (resource,): (&CapturedTechnologyResource,) = (resource,);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                let text = String::from_utf8_lossy(&resource.body);
+                                let pattern = Regex::new(r#"(?m)^\s*gem\s+[\"']([^\"']+)[\"'](?:\s*,\s*[\"']([^\"']+)[\"'])?"#)
+        .expect("valid regex");
+                                pattern
+                                    .captures_iter(&text)
+                                    .filter_map(|captures| {
+                                        let name = captures.get(1)?.as_str();
+                                        let requested = captures.get(2).map(|value| value.as_str());
+                                        Some(component(
+                                            name,
+                                            TechnologyEcosystem::RubyGems,
+                                            Some(name),
+                                            requested,
+                                            false,
+                                            &resource.url,
+                                            requested.map_or_else(
+                                                || "Gemfile dependency".to_owned(),
+                                                |value| format!("Gemfile requests {value}"),
+                                            ),
+                                        ))
+                                    })
+                                    .collect()
+                            };
+                            inlined_result
+                        }
+                        "pom.xml" => {
+                            let (resource,): (&CapturedTechnologyResource,) = (resource,);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                'inlined_parse_pom: {
+                                    if !({
+                                        let (bytes,): (&[u8],) = (&resource.body,);
+                                        {
+                                            'inlined_valid_xml: {
+                                                let mut reader = Reader::from_reader(bytes);
+                                                loop {
+                                                    match reader.read_event() {
+                                                        Ok(Event::Eof) => {
+                                                            break 'inlined_valid_xml true;
+                                                        }
+                                                        Err(_) => break 'inlined_valid_xml false,
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }) {
+                                        break 'inlined_parse_pom Vec::new();
+                                    }
+                                    let text = String::from_utf8_lossy(&resource.body);
+                                    let dependency =
+                                        Regex::new(r"(?s)<dependency\b[^>]*>(.*?)</dependency>")
+                                            .expect("valid regex");
+                                    dependency
+        .captures_iter(&text)
+        .filter_map(|captures| {
+            let block = captures.get(1)?.as_str();
+            let group = ({
+let (block, tag,): (& str, & str,) = (block, "groupId",);
+{
+'inlined_xml_value: {
+
+    match match Regex::new(&format!(r"(?s)<{tag}\b[^>]*>\s*([^<]+?)\s*</{tag}>"))
+        .ok() { Some(value) => value, None => break 'inlined_xml_value None }
+        .captures(block) { Some(value) => value, None => break 'inlined_xml_value None }
+        .get(1)
+        .map(|value| value.as_str().to_owned())
+
+}
+}
+
+})?;
+            let artifact = ({
+let (block, tag,): (& str, & str,) = (block, "artifactId",);
+{
+'inlined_xml_value: {
+
+    match match Regex::new(&format!(r"(?s)<{tag}\b[^>]*>\s*([^<]+?)\s*</{tag}>"))
+        .ok() { Some(value) => value, None => break 'inlined_xml_value None }
+        .captures(block) { Some(value) => value, None => break 'inlined_xml_value None }
+        .get(1)
+        .map(|value| value.as_str().to_owned())
+
+}
+}
+
+})?;
+            let identifier = format!("{group}:{artifact}");
+            let version = {
+let (block, tag,): (& str, & str,) = (block, "version",);
+{
+'inlined_xml_value: {
+
+    match match Regex::new(&format!(r"(?s)<{tag}\b[^>]*>\s*([^<]+?)\s*</{tag}>"))
+        .ok() { Some(value) => value, None => break 'inlined_xml_value None }
+        .captures(block) { Some(value) => value, None => break 'inlined_xml_value None }
+        .get(1)
+        .map(|value| value.as_str().to_owned())
+
+}
+}
+
+};
+            let evidence = version.as_ref().map_or_else(
+                || "Maven dependency manifest entry".to_owned(),
+                |value| format!("pom.xml requests {value}"),
+            );
+            Some(component(
+                &artifact,
+                TechnologyEcosystem::MavenCentral,
+                Some(&identifier),
+                version.as_deref(),
+                false,
+                &resource.url,
+                evidence,
+            ))
+        })
+        .collect()
+                                }
+                            };
+                            inlined_result
+                        }
+                        "pnpm-lock.yaml" | "gemfile.lock" | "build.gradle" | "build.gradle.kts"
+                        | "gradle.lockfile" | "go.mod" => {
+                            let (resource, manifest): (&CapturedTechnologyResource, &str) =
+                                (resource, name);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                'inlined_parse_regex_inventory: {
+                                    let (ecosystem, pattern, evidence, installed) = match manifest {
+                                        "pnpm-lock.yaml" => (
+                                            TechnologyEcosystem::Npm,
+                                            r#"(?m)^\s{0,4}['\"]?/?((?:@[^/@\s]+/)?[^@:\s'\"]+)@([0-9][^:\s'\"]*)['\"]?:"#,
+                                            "pnpm lockfile pins",
+                                            true,
+                                        ),
+                                        "gemfile.lock" => (
+                                            TechnologyEcosystem::RubyGems,
+                                            r"(?m)^ {4}([A-Za-z0-9_.-]+) \(([^ )]+)\)",
+                                            "Gemfile.lock pins",
+                                            true,
+                                        ),
+                                        "build.gradle" | "build.gradle.kts" => (
+                                            TechnologyEcosystem::MavenCentral,
+                                            r#"[\"']([A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+):([^\"']+)[\"']"#,
+                                            "Gradle dependency requests",
+                                            false,
+                                        ),
+                                        "gradle.lockfile" => (
+                                            TechnologyEcosystem::MavenCentral,
+                                            r"(?m)^([A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+):([^=\s]+)=",
+                                            "Gradle lockfile pins",
+                                            true,
+                                        ),
+                                        "go.mod" => (
+                                            TechnologyEcosystem::GoModules,
+                                            r"(?m)^\s*([A-Za-z0-9._~/-]+)\s+(v[0-9][^\s]*)",
+                                            "go.mod requires",
+                                            false,
+                                        ),
+                                        _ => break 'inlined_parse_regex_inventory Vec::new(),
+                                    };
+                                    let text = String::from_utf8_lossy(&resource.body);
+                                    Regex::new(pattern)
+                                        .expect("valid regex")
+                                        .captures_iter(&text)
+                                        .filter_map(|captures| {
+                                            let identifier = captures.get(1)?.as_str();
+                                            let version = captures.get(2)?.as_str();
+                                            let name =
+                                                if ecosystem == TechnologyEcosystem::MavenCentral {
+                                                    identifier.rsplit(':').next()?
+                                                } else {
+                                                    identifier
+                                                };
+                                            Some(component(
+                                                name,
+                                                ecosystem,
+                                                Some(identifier),
+                                                Some(version),
+                                                installed && exact_version(version),
+                                                &resource.url,
+                                                format!("{evidence} {version}"),
+                                            ))
+                                        })
+                                        .collect()
+                                }
+                            };
+                            inlined_result
+                        }
+                        "packages.config" => {
+                            let (resource, installed_manifest): (
+                                &CapturedTechnologyResource,
+                                bool,
+                            ) = (resource, true);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                'inlined_parse_nuget_xml: {
+                                    if !({
+                                        let (bytes,): (&[u8],) = (&resource.body,);
+                                        {
+                                            'inlined_valid_xml: {
+                                                let mut reader = Reader::from_reader(bytes);
+                                                loop {
+                                                    match reader.read_event() {
+                                                        Ok(Event::Eof) => {
+                                                            break 'inlined_valid_xml true;
+                                                        }
+                                                        Err(_) => break 'inlined_valid_xml false,
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }) {
+                                        break 'inlined_parse_nuget_xml Vec::new();
+                                    }
+                                    let text = String::from_utf8_lossy(&resource.body);
+                                    let package = Regex::new(
+        r#"(?i)<package\b[^>]*\bid=[\"']([^\"']+)[\"'][^>]*\bversion=[\"']([^\"']+)[\"'][^>]*/?>"#,
+    )
+    .expect("valid regex");
+                                    let version_first = Regex::new(
+        r#"(?i)<package\b[^>]*\bversion=[\"']([^\"']+)[\"'][^>]*\bid=[\"']([^\"']+)[\"'][^>]*/?>"#,
+    )
+    .expect("valid regex");
+                                    let package_version = Regex::new(r#"(?i)<PackageVersion\b[^>]*\bInclude=[\"']([^\"']+)[\"'][^>]*\bVersion=[\"']([^\"']+)[\"'][^>]*/?>"#)
+        .expect("valid regex");
+                                    [
+                                        (&package, 1, 2),
+                                        (&version_first, 2, 1),
+                                        (&package_version, 1, 2),
+                                    ]
+                                    .into_iter()
+                                    .flat_map(|(pattern, name, version)| {
+                                        pattern.captures_iter(&text).filter_map(move |captures| {
+                                            let name = captures.get(name)?.as_str();
+                                            let version = captures.get(version)?.as_str();
+                                            Some(component(
+                                                name,
+                                                TechnologyEcosystem::NuGet,
+                                                Some(name),
+                                                Some(version),
+                                                installed_manifest && exact_version(version),
+                                                &resource.url,
+                                                format!("NuGet package manifest records {version}"),
+                                            ))
+                                        })
+                                    })
+                                    .collect()
+                                }
+                            };
+                            inlined_result
+                        }
+                        "directory.packages.props" => {
+                            let (resource, installed_manifest): (
+                                &CapturedTechnologyResource,
+                                bool,
+                            ) = (resource, false);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                'inlined_parse_nuget_xml: {
+                                    if !({
+                                        let (bytes,): (&[u8],) = (&resource.body,);
+                                        {
+                                            'inlined_valid_xml: {
+                                                let mut reader = Reader::from_reader(bytes);
+                                                loop {
+                                                    match reader.read_event() {
+                                                        Ok(Event::Eof) => {
+                                                            break 'inlined_valid_xml true;
+                                                        }
+                                                        Err(_) => break 'inlined_valid_xml false,
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }) {
+                                        break 'inlined_parse_nuget_xml Vec::new();
+                                    }
+                                    let text = String::from_utf8_lossy(&resource.body);
+                                    let package = Regex::new(
+        r#"(?i)<package\b[^>]*\bid=[\"']([^\"']+)[\"'][^>]*\bversion=[\"']([^\"']+)[\"'][^>]*/?>"#,
+    )
+    .expect("valid regex");
+                                    let version_first = Regex::new(
+        r#"(?i)<package\b[^>]*\bversion=[\"']([^\"']+)[\"'][^>]*\bid=[\"']([^\"']+)[\"'][^>]*/?>"#,
+    )
+    .expect("valid regex");
+                                    let package_version = Regex::new(r#"(?i)<PackageVersion\b[^>]*\bInclude=[\"']([^\"']+)[\"'][^>]*\bVersion=[\"']([^\"']+)[\"'][^>]*/?>"#)
+        .expect("valid regex");
+                                    [
+                                        (&package, 1, 2),
+                                        (&version_first, 2, 1),
+                                        (&package_version, 1, 2),
+                                    ]
+                                    .into_iter()
+                                    .flat_map(|(pattern, name, version)| {
+                                        pattern.captures_iter(&text).filter_map(move |captures| {
+                                            let name = captures.get(name)?.as_str();
+                                            let version = captures.get(version)?.as_str();
+                                            Some(component(
+                                                name,
+                                                TechnologyEcosystem::NuGet,
+                                                Some(name),
+                                                Some(version),
+                                                installed_manifest && exact_version(version),
+                                                &resource.url,
+                                                format!("NuGet package manifest records {version}"),
+                                            ))
+                                        })
+                                    })
+                                    .collect()
+                                }
+                            };
+                            inlined_result
+                        }
+                        "packages.lock.json" => {
+                            let (resource,): (&CapturedTechnologyResource,) = (resource,);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                'inlined_parse_nuget_lock: {
+                                    let Ok(value) = serde_json::from_slice::<Value>(&resource.body)
+                                    else {
+                                        break 'inlined_parse_nuget_lock Vec::new();
+                                    };
+                                    let Some(dependencies) =
+                                        value.get("dependencies").and_then(Value::as_object)
+                                    else {
+                                        break 'inlined_parse_nuget_lock Vec::new();
+                                    };
+                                    dependencies
+                                        .values()
+                                        .filter_map(Value::as_object)
+                                        .flat_map(|framework| framework.iter())
+                                        .filter_map(|(name, item)| {
+                                            let version =
+                                                item.get("resolved").and_then(Value::as_str)?;
+                                            Some(component(
+                                                name,
+                                                TechnologyEcosystem::NuGet,
+                                                Some(name),
+                                                Some(version),
+                                                exact_version(version),
+                                                &resource.url,
+                                                format!("packages.lock.json pins {version}"),
+                                            ))
+                                        })
+                                        .collect()
+                                }
+                            };
+                            inlined_result
+                        }
+                        "go.sum" => {
+                            let (resource,): (&CapturedTechnologyResource,) = (resource,);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                let text = String::from_utf8_lossy(&resource.body);
+                                let mut seen = HashSet::new();
+                                text.lines()
+                                    .filter_map(|line| {
+                                        let mut fields = line.split_ascii_whitespace();
+                                        let name = fields.next()?;
+                                        let version = fields.next()?.trim_end_matches("/go.mod");
+                                        if !seen.insert((name.to_owned(), version.to_owned())) {
+                                            return None;
+                                        }
+                                        Some(component(
+                                            name,
+                                            TechnologyEcosystem::GoModules,
+                                            Some(name),
+                                            Some(version),
+                                            exact_version(version),
+                                            &resource.url,
+                                            format!("go.sum records {version}"),
+                                        ))
+                                    })
+                                    .take(4096)
+                                    .collect()
+                            };
+                            inlined_result
+                        }
+                        "cargo.toml" => {
+                            let (resource,): (&CapturedTechnologyResource,) = (resource,);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                let text = String::from_utf8_lossy(&resource.body);
+                                let mut in_dependencies = false;
+                                let simple =
+                                    Regex::new(r#"^\s*([A-Za-z0-9_-]+)\s*=\s*[\"']([^\"']+)[\"']"#)
+                                        .expect("valid regex");
+                                let table =
+        Regex::new(r#"^\s*([A-Za-z0-9_-]+)\s*=\s*\{[^}]*version\s*=\s*[\"']([^\"']+)[\"']"#)
+            .expect("valid regex");
+                                let mut found = Vec::new();
+                                for line in text.lines() {
+                                    if line.trim_start().starts_with('[') {
+                                        let section = line
+                                            .trim()
+                                            .trim_matches(['[', ']'])
+                                            .to_ascii_lowercase();
+                                        in_dependencies = section.ends_with("dependencies");
+                                        continue;
+                                    }
+                                    if !in_dependencies {
+                                        continue;
+                                    }
+                                    let captures =
+                                        table.captures(line).or_else(|| simple.captures(line));
+                                    let Some(captures) = captures else {
+                                        continue;
+                                    };
+                                    let Some(name) = captures.get(1).map(|value| value.as_str())
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(requested) =
+                                        captures.get(2).map(|value| value.as_str())
+                                    else {
+                                        continue;
+                                    };
+                                    found.push(component(
+                                        name,
+                                        TechnologyEcosystem::CratesIo,
+                                        Some(name),
+                                        Some(requested),
+                                        false,
+                                        &resource.url,
+                                        format!("Cargo.toml requests {requested}"),
+                                    ));
+                                }
+                                found
+                            };
+                            inlined_result
+                        }
+                        "cargo.lock" => {
+                            let (resource, ecosystem): (
+                                &CapturedTechnologyResource,
+                                TechnologyEcosystem,
+                            ) = (resource, TechnologyEcosystem::CratesIo);
+                            let inlined_result: Vec<TechnologyComponent> = {
+                                let text = String::from_utf8_lossy(&resource.body);
+                                let assignment =
+                                    Regex::new(r#"^\s*(name|version)\s*=\s*[\"']([^\"']+)[\"']"#)
+                                        .expect("valid regex");
+                                let mut current_name: Option<String> = None;
+                                let mut current_version: Option<String> = None;
+                                let mut found = Vec::new();
+                                for line in text.lines().chain(std::iter::once("[[package]]")) {
+                                    if line.trim() == "[[package]]" {
+                                        if let (Some(name), Some(version)) =
+                                            (current_name.take(), current_version.take())
+                                        {
+                                            found.push(component(
+                                                &name,
+                                                ecosystem,
+                                                Some(&name),
+                                                Some(&version),
+                                                exact_version(&version),
+                                                &resource.url,
+                                                format!("lockfile pins {version}"),
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                    if let Some(captures) = assignment.captures(line) {
+                                        match captures.get(1).map(|value| value.as_str()) {
+                                            Some("name") => {
+                                                current_name = captures
+                                                    .get(2)
+                                                    .map(|value| value.as_str().to_owned())
+                                            }
+                                            Some("version") => {
+                                                current_version = captures
+                                                    .get(2)
+                                                    .map(|value| value.as_str().to_owned())
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                found
+                            };
+                            inlined_result
+                        }
+                        _ => Vec::new(),
+                    }
+                }
+            };
+            inlined_result
+        } {
+            ({
+                let (components, mut incoming): (
+                    &mut Vec<TechnologyComponent>,
+                    TechnologyComponent,
+                ) = (&mut endpoint.technology_components, component);
+
+                let identity = |component: &TechnologyComponent| {
+                    component
+                        .package_identifier
+                        .as_deref()
+                        .unwrap_or(&component.name)
+                        .to_ascii_lowercase()
+                };
+                let incoming_identity = identity(&incoming);
+                let matching = components.iter_mut().find(|existing| {
+                    existing.ecosystem == incoming.ecosystem
+                        && identity(existing) == incoming_identity
+                        && (existing.installed_version == incoming.installed_version
+                            || existing.installed_version.is_none()
+                            || incoming.installed_version.is_none())
+                });
+                if let Some(existing) = matching {
+                    if existing.installed_version.is_none() && incoming.installed_version.is_some()
+                    {
+                        existing.installed_version = incoming.installed_version.take();
+                        existing.status = incoming.status;
+                    }
+                    if existing.latest_version.is_none() {
+                        existing.latest_version = incoming.latest_version;
+                    }
+                    if existing.package_identifier.is_none() {
+                        existing.package_identifier = incoming.package_identifier;
+                    }
+                    if existing.support_status == TechnologySupportStatus::NotApplicable
+                        || existing.support_status == TechnologySupportStatus::Unknown
+                    {
+                        existing.support_status = incoming.support_status;
+                    }
+                    if existing.release_source_url.is_none() {
+                        existing.release_source_url = incoming.release_source_url;
+                    }
+                    existing.confidence = existing.confidence.max(incoming.confidence);
+                    existing.evidence_urls.extend(incoming.evidence_urls);
+                    existing.evidence.extend(incoming.evidence);
+                    existing.evidence_urls.sort();
+                    existing.evidence_urls.dedup();
+                    existing.evidence.sort();
+                    existing.evidence.dedup();
+                } else {
+                    incoming.evidence_urls.sort();
+                    incoming.evidence_urls.dedup();
+                    incoming.evidence.sort();
+                    incoming.evidence.dedup();
+                    components.push(incoming);
+                }
+            });
         }
-        detect_url_components(endpoint, &resource.url);
-        detect_content_components(endpoint, resource);
+        ({
+            let (endpoint, url): (&mut EndpointScan, &str) = (endpoint, &resource.url);
+            'inlined_detect_url_components: {
+                let Ok(parsed) = Url::parse(url) else {
+                    break 'inlined_detect_url_components;
+                };
+                let path = parsed.path().to_ascii_lowercase();
+                if let Some(captures) = Regex::new(r"/wp-content/plugins/([a-z0-9_-]+)(?:/|$)")
+                    .expect("valid regex")
+                    .captures(&path)
+                    && let Some(slug) = captures.get(1).map(|value| value.as_str())
+                {
+                    let version = parsed
+                        .query_pairs()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("ver"))
+                        .map(|(_, value)| value.into_owned())
+                        .filter(|value| exact_version(value));
+                    ({
+                        let (components, mut incoming): (
+                            &mut Vec<TechnologyComponent>,
+                            TechnologyComponent,
+                        ) = (
+                            &mut endpoint.technology_components,
+                            component(
+                                slug,
+                                TechnologyEcosystem::WordPress,
+                                Some(slug),
+                                version.as_deref(),
+                                version.is_some(),
+                                url,
+                                if let Some(version) = &version {
+                                    format!("WordPress plugin asset path exposes version {version}")
+                                } else {
+                                    "WordPress plugin asset path".to_owned()
+                                },
+                            ),
+                        );
+
+                        let identity = |component: &TechnologyComponent| {
+                            component
+                                .package_identifier
+                                .as_deref()
+                                .unwrap_or(&component.name)
+                                .to_ascii_lowercase()
+                        };
+                        let incoming_identity = identity(&incoming);
+                        let matching = components.iter_mut().find(|existing| {
+                            existing.ecosystem == incoming.ecosystem
+                                && identity(existing) == incoming_identity
+                                && (existing.installed_version == incoming.installed_version
+                                    || existing.installed_version.is_none()
+                                    || incoming.installed_version.is_none())
+                        });
+                        if let Some(existing) = matching {
+                            if existing.installed_version.is_none()
+                                && incoming.installed_version.is_some()
+                            {
+                                existing.installed_version = incoming.installed_version.take();
+                                existing.status = incoming.status;
+                            }
+                            if existing.latest_version.is_none() {
+                                existing.latest_version = incoming.latest_version;
+                            }
+                            if existing.package_identifier.is_none() {
+                                existing.package_identifier = incoming.package_identifier;
+                            }
+                            if existing.support_status == TechnologySupportStatus::NotApplicable
+                                || existing.support_status == TechnologySupportStatus::Unknown
+                            {
+                                existing.support_status = incoming.support_status;
+                            }
+                            if existing.release_source_url.is_none() {
+                                existing.release_source_url = incoming.release_source_url;
+                            }
+                            existing.confidence = existing.confidence.max(incoming.confidence);
+                            existing.evidence_urls.extend(incoming.evidence_urls);
+                            existing.evidence.extend(incoming.evidence);
+                            existing.evidence_urls.sort();
+                            existing.evidence_urls.dedup();
+                            existing.evidence.sort();
+                            existing.evidence.dedup();
+                        } else {
+                            incoming.evidence_urls.sort();
+                            incoming.evidence_urls.dedup();
+                            incoming.evidence.sort();
+                            incoming.evidence.dedup();
+                            components.push(incoming);
+                        }
+                    });
+                }
+                for (marker, name, package) in [
+                    ("/_next/", "Next.js", "next"),
+                    ("/_nuxt/", "Nuxt", "nuxt"),
+                    ("/react", "React", "react"),
+                    ("/vue.", "Vue", "vue"),
+                ] {
+                    if path.contains(marker) {
+                        ({
+                            let (components, mut incoming): (
+                                &mut Vec<TechnologyComponent>,
+                                TechnologyComponent,
+                            ) = (
+                                &mut endpoint.technology_components,
+                                component(
+                                    name,
+                                    TechnologyEcosystem::Npm,
+                                    Some(package),
+                                    None,
+                                    false,
+                                    url,
+                                    format!("Curated framework asset marker {marker}"),
+                                ),
+                            );
+
+                            let identity = |component: &TechnologyComponent| {
+                                component
+                                    .package_identifier
+                                    .as_deref()
+                                    .unwrap_or(&component.name)
+                                    .to_ascii_lowercase()
+                            };
+                            let incoming_identity = identity(&incoming);
+                            let matching = components.iter_mut().find(|existing| {
+                                existing.ecosystem == incoming.ecosystem
+                                    && identity(existing) == incoming_identity
+                                    && (existing.installed_version == incoming.installed_version
+                                        || existing.installed_version.is_none()
+                                        || incoming.installed_version.is_none())
+                            });
+                            if let Some(existing) = matching {
+                                if existing.installed_version.is_none()
+                                    && incoming.installed_version.is_some()
+                                {
+                                    existing.installed_version = incoming.installed_version.take();
+                                    existing.status = incoming.status;
+                                }
+                                if existing.latest_version.is_none() {
+                                    existing.latest_version = incoming.latest_version;
+                                }
+                                if existing.package_identifier.is_none() {
+                                    existing.package_identifier = incoming.package_identifier;
+                                }
+                                if existing.support_status == TechnologySupportStatus::NotApplicable
+                                    || existing.support_status == TechnologySupportStatus::Unknown
+                                {
+                                    existing.support_status = incoming.support_status;
+                                }
+                                if existing.release_source_url.is_none() {
+                                    existing.release_source_url = incoming.release_source_url;
+                                }
+                                existing.confidence = existing.confidence.max(incoming.confidence);
+                                existing.evidence_urls.extend(incoming.evidence_urls);
+                                existing.evidence.extend(incoming.evidence);
+                                existing.evidence_urls.sort();
+                                existing.evidence_urls.dedup();
+                                existing.evidence.sort();
+                                existing.evidence.dedup();
+                            } else {
+                                incoming.evidence_urls.sort();
+                                incoming.evidence_urls.dedup();
+                                incoming.evidence.sort();
+                                incoming.evidence.dedup();
+                                components.push(incoming);
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        ({
+            let (endpoint, resource): (&mut EndpointScan, &CapturedTechnologyResource) =
+                (endpoint, resource);
+
+            let text = String::from_utf8_lossy(&resource.body);
+            let lower = text.to_ascii_lowercase();
+            let mut detected = Vec::new();
+            for detection in crate::web_server::detect_web_servers(
+                resource
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+                &resource.body,
+                Some(resource.status),
+                Some(&resource.url),
+            ) {
+                let layer = match detection.role {
+                    crate::web_server::WebProductRole::Server => ProductLayer::Server,
+                    crate::web_server::WebProductRole::Proxy => ProductLayer::Proxy,
+                    crate::web_server::WebProductRole::Framework => ProductLayer::Framework,
+                    crate::web_server::WebProductRole::Runtime => ProductLayer::Runtime,
+                };
+                let confidence = match detection.confidence {
+                    crate::web_server::FingerprintConfidence::High => Confidence::High,
+                    crate::web_server::FingerprintConfidence::Medium => Confidence::Medium,
+                };
+                for evidence in detection.evidence {
+                    super::add_product(
+                        endpoint,
+                        detection.product,
+                        layer,
+                        detection.version.clone(),
+                        confidence,
+                        evidence,
+                    );
+                }
+            }
+            if crate::web_server::is_fastapi_branded_document(&resource.fetch_url, &resource.body) {
+                super::add_product(
+                    endpoint,
+                    "FastAPI",
+                    ProductLayer::Framework,
+                    None,
+                    Confidence::High,
+                    format!(
+                        "FastAPI-branded OpenAPI or Swagger content at {}",
+                        resource.url
+                    ),
+                );
+            }
+            if lower.contains("__react_devtools_global_hook__")
+                || lower.contains("data-reactroot")
+                || lower.contains("react.production.min")
+            {
+                detected.push({
+                    let (name, ecosystem, package, version, resource, evidence): (
+                        &str,
+                        TechnologyEcosystem,
+                        &str,
+                        Option<&str>,
+                        &CapturedTechnologyResource,
+                        &str,
+                    ) = (
+                        "React",
+                        TechnologyEcosystem::Npm,
+                        "react",
+                        None,
+                        resource,
+                        "Curated React content fingerprint",
+                    );
+                    let inlined_result: TechnologyComponent = {
+                        component(
+                            name,
+                            ecosystem,
+                            Some(package),
+                            version,
+                            version.is_some_and(exact_version),
+                            &resource.url,
+                            evidence.to_owned(),
+                        )
+                    };
+                    inlined_result
+                });
+            }
+            if lower.contains("__vue__")
+                || lower.contains("data-v-")
+                || lower.contains("vue.runtime")
+            {
+                detected.push({
+                    let (name, ecosystem, package, version, resource, evidence): (
+                        &str,
+                        TechnologyEcosystem,
+                        &str,
+                        Option<&str>,
+                        &CapturedTechnologyResource,
+                        &str,
+                    ) = (
+                        "Vue",
+                        TechnologyEcosystem::Npm,
+                        "vue",
+                        None,
+                        resource,
+                        "Curated Vue content fingerprint",
+                    );
+                    let inlined_result: TechnologyComponent = {
+                        component(
+                            name,
+                            ecosystem,
+                            Some(package),
+                            version,
+                            version.is_some_and(exact_version),
+                            &resource.url,
+                            evidence.to_owned(),
+                        )
+                    };
+                    inlined_result
+                });
+            }
+            if let Some(version) = {
+                let (text, pattern): (&str, &str) =
+                    (&text, r#"(?i)\bng-version=[\"']([0-9][0-9A-Za-z._-]*)"#);
+                {
+                    'inlined_capture: {
+                        match match Regex::new(pattern).ok() {
+                            Some(value) => value,
+                            None => break 'inlined_capture None,
+                        }
+                        .captures(text)
+                        {
+                            Some(value) => value,
+                            None => break 'inlined_capture None,
+                        }
+                        .get(1)
+                        .map(|value| value.as_str().to_owned())
+                    }
+                }
+            } {
+                detected.push({
+                    let (name, ecosystem, package, version, resource, evidence): (
+                        &str,
+                        TechnologyEcosystem,
+                        &str,
+                        Option<&str>,
+                        &CapturedTechnologyResource,
+                        &str,
+                    ) = (
+                        "Angular",
+                        TechnologyEcosystem::Npm,
+                        "@angular/core",
+                        Some(&version),
+                        resource,
+                        "Angular ng-version attribute",
+                    );
+                    let inlined_result: TechnologyComponent = {
+                        component(
+                            name,
+                            ecosystem,
+                            Some(package),
+                            version,
+                            version.is_some_and(exact_version),
+                            &resource.url,
+                            evidence.to_owned(),
+                        )
+                    };
+                    inlined_result
+                });
+            } else if lower.contains("ng-version=") || lower.contains("ng-app=") {
+                detected.push({
+                    let (name, ecosystem, package, version, resource, evidence): (
+                        &str,
+                        TechnologyEcosystem,
+                        &str,
+                        Option<&str>,
+                        &CapturedTechnologyResource,
+                        &str,
+                    ) = (
+                        "Angular",
+                        TechnologyEcosystem::Npm,
+                        "@angular/core",
+                        None,
+                        resource,
+                        "Curated Angular content fingerprint",
+                    );
+                    let inlined_result: TechnologyComponent = {
+                        component(
+                            name,
+                            ecosystem,
+                            Some(package),
+                            version,
+                            version.is_some_and(exact_version),
+                            &resource.url,
+                            evidence.to_owned(),
+                        )
+                    };
+                    inlined_result
+                });
+            }
+            if lower.contains("__next_data__") {
+                detected.push({
+                    let (name, ecosystem, package, version, resource, evidence): (
+                        &str,
+                        TechnologyEcosystem,
+                        &str,
+                        Option<&str>,
+                        &CapturedTechnologyResource,
+                        &str,
+                    ) = (
+                        "Next.js",
+                        TechnologyEcosystem::Npm,
+                        "next",
+                        None,
+                        resource,
+                        "Next.js __NEXT_DATA__ marker",
+                    );
+                    let inlined_result: TechnologyComponent = {
+                        component(
+                            name,
+                            ecosystem,
+                            Some(package),
+                            version,
+                            version.is_some_and(exact_version),
+                            &resource.url,
+                            evidence.to_owned(),
+                        )
+                    };
+                    inlined_result
+                });
+            }
+            if lower.contains("__nuxt__") {
+                detected.push({
+                    let (name, ecosystem, package, version, resource, evidence): (
+                        &str,
+                        TechnologyEcosystem,
+                        &str,
+                        Option<&str>,
+                        &CapturedTechnologyResource,
+                        &str,
+                    ) = (
+                        "Nuxt",
+                        TechnologyEcosystem::Npm,
+                        "nuxt",
+                        None,
+                        resource,
+                        "Nuxt __NUXT__ marker",
+                    );
+                    let inlined_result: TechnologyComponent = {
+                        component(
+                            name,
+                            ecosystem,
+                            Some(package),
+                            version,
+                            version.is_some_and(exact_version),
+                            &resource.url,
+                            evidence.to_owned(),
+                        )
+                    };
+                    inlined_result
+                });
+            }
+            if lower.contains("name=\"csrfmiddlewaretoken\"")
+                || lower.contains("name='csrfmiddlewaretoken'")
+            {
+                super::add_product(
+                    endpoint,
+                    "Django",
+                    ProductLayer::Framework,
+                    None,
+                    Confidence::Medium,
+                    format!(
+                        "Django csrfmiddlewaretoken form control at {}",
+                        resource.url
+                    ),
+                );
+                detected.push({
+                    let (name, ecosystem, package, version, resource, evidence): (
+                        &str,
+                        TechnologyEcosystem,
+                        &str,
+                        Option<&str>,
+                        &CapturedTechnologyResource,
+                        &str,
+                    ) = (
+                        "Django",
+                        TechnologyEcosystem::PyPi,
+                        "Django",
+                        None,
+                        resource,
+                        "Django CSRF field marker",
+                    );
+                    let inlined_result: TechnologyComponent = {
+                        component(
+                            name,
+                            ecosystem,
+                            Some(package),
+                            version,
+                            version.is_some_and(exact_version),
+                            &resource.url,
+                            evidence.to_owned(),
+                        )
+                    };
+                    inlined_result
+                });
+            }
+            if lower.contains("csrf verification failed. request aborted") {
+                super::add_product(
+                    endpoint,
+                    "Django",
+                    ProductLayer::Framework,
+                    None,
+                    Confidence::High,
+                    format!("Distinctive Django CSRF failure page at {}", resource.url),
+                );
+            }
+            if lower.contains("rails-ujs")
+                || (lower.contains("csrf-param") && lower.contains("csrf-token"))
+            {
+                detected.push({
+                    let (name, ecosystem, package, version, resource, evidence): (
+                        &str,
+                        TechnologyEcosystem,
+                        &str,
+                        Option<&str>,
+                        &CapturedTechnologyResource,
+                        &str,
+                    ) = (
+                        "Ruby on Rails",
+                        TechnologyEcosystem::RubyGems,
+                        "rails",
+                        None,
+                        resource,
+                        "Ruby on Rails content fingerprint",
+                    );
+                    let inlined_result: TechnologyComponent = {
+                        component(
+                            name,
+                            ecosystem,
+                            Some(package),
+                            version,
+                            version.is_some_and(exact_version),
+                            &resource.url,
+                            evidence.to_owned(),
+                        )
+                    };
+                    inlined_result
+                });
+            }
+            if lower.contains("whitelabel error page") {
+                detected.push({
+                    let (name, ecosystem, package, version, resource, evidence): (
+                        &str,
+                        TechnologyEcosystem,
+                        &str,
+                        Option<&str>,
+                        &CapturedTechnologyResource,
+                        &str,
+                    ) = (
+                        "Spring Boot",
+                        TechnologyEcosystem::MavenCentral,
+                        "org.springframework.boot:spring-boot",
+                        None,
+                        resource,
+                        "Spring Boot Whitelabel Error Page",
+                    );
+                    let inlined_result: TechnologyComponent = {
+                        component(
+                            name,
+                            ecosystem,
+                            Some(package),
+                            version,
+                            version.is_some_and(exact_version),
+                            &resource.url,
+                            evidence.to_owned(),
+                        )
+                    };
+                    inlined_result
+                });
+            }
+            if lower.contains("__viewstate") {
+                detected.push(TechnologyComponent {
+                    name: "ASP.NET".to_owned(),
+                    ecosystem: TechnologyEcosystem::Runtime,
+                    kind: TechnologyComponentKind::Framework,
+                    package_identifier: None,
+                    installed_version: None,
+                    latest_version: None,
+                    status: TechnologyVersionStatus::InventoryOnly,
+                    support_status: TechnologySupportStatus::NotApplicable,
+                    confidence: Confidence::High,
+                    release_source_url: None,
+                    evidence_urls: vec![resource.url.clone()],
+                    evidence: vec!["ASP.NET __VIEWSTATE field".to_owned()],
+                    check_error: None,
+                });
+            }
+            if lower.contains("_framework/blazor") {
+                detected.push(TechnologyComponent {
+                    name: "Blazor".to_owned(),
+                    ecosystem: TechnologyEcosystem::Runtime,
+                    kind: TechnologyComponentKind::Framework,
+                    package_identifier: None,
+                    installed_version: None,
+                    latest_version: None,
+                    status: TechnologyVersionStatus::InventoryOnly,
+                    support_status: TechnologySupportStatus::NotApplicable,
+                    confidence: Confidence::High,
+                    release_source_url: None,
+                    evidence_urls: vec![resource.url.clone()],
+                    evidence: vec!["Blazor framework asset marker".to_owned()],
+                    check_error: None,
+                });
+            }
+            if let Some(version) = ({
+let (text, pattern,): (& str, & str,) = (&text, r#"(?i)<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"']wordpress\s+([0-9][0-9A-Za-z._-]*)"#,);
+{
+'inlined_capture: {
+
+    match match Regex::new(pattern)
+        .ok() { Some(value) => value, None => break 'inlined_capture None }
+        .captures(text) { Some(value) => value, None => break 'inlined_capture None }
+        .get(1)
+        .map(|value| value.as_str().to_owned())
+
+}
+}
+
+})
+    .or_else(|| {
+        {
+let (text, pattern,): (& str, & str,) = (&text, r#"(?i)<meta[^>]+content=[\"']wordpress\s+([0-9][0-9A-Za-z._-]*)[\"'][^>]+name=[\"']generator[\"']"#,);
+{
+'inlined_capture: {
+
+    match match Regex::new(pattern)
+        .ok() { Some(value) => value, None => break 'inlined_capture None }
+        .captures(text) { Some(value) => value, None => break 'inlined_capture None }
+        .get(1)
+        .map(|value| value.as_str().to_owned())
+
+}
+}
+
+}
+    }) {
+        let mut item = component(
+            "WordPress",
+            TechnologyEcosystem::WordPress,
+            Some("wordpress"),
+            Some(&version),
+            exact_version(&version),
+            &resource.url,
+            format!("WordPress generator exposes {version}"),
+        );
+        item.kind = TechnologyComponentKind::Cms;
+        detected.push(item);
+    }
+            if let Some(version) = ({
+let (text, pattern,): (& str, & str,) = (&text, r#"(?i)<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"']moodle\s+([0-9][0-9A-Za-z._+-]*)"#,);
+{
+'inlined_capture: {
+
+    match match Regex::new(pattern)
+        .ok() { Some(value) => value, None => break 'inlined_capture None }
+        .captures(text) { Some(value) => value, None => break 'inlined_capture None }
+        .get(1)
+        .map(|value| value.as_str().to_owned())
+
+}
+}
+
+})
+    .or_else(|| {
+        {
+let (text, pattern,): (& str, & str,) = (&text, r#"(?i)<meta[^>]+content=[\"']moodle\s+([0-9][0-9A-Za-z._+-]*)[\"'][^>]+name=[\"']generator[\"']"#,);
+{
+'inlined_capture: {
+
+    match match Regex::new(pattern)
+        .ok() { Some(value) => value, None => break 'inlined_capture None }
+        .captures(text) { Some(value) => value, None => break 'inlined_capture None }
+        .get(1)
+        .map(|value| value.as_str().to_owned())
+
+}
+}
+
+}
+    }) {
+        let exact = {
+let (value,): (& str,) = (&version,);
+{
+
+    matches!(
+        value
+            .trim()
+            .split('.')
+            .try_fold(0, |count, part| (!part.is_empty()
+                && part.chars().all(|character| character.is_ascii_digit()))
+            .then_some(count + 1)),
+        Some(2..=4)
+    )
+
+}
+
+};
+        let mut item = component(
+            "Moodle",
+            TechnologyEcosystem::Moodle,
+            Some("moodle"),
+            Some(&version),
+            exact,
+            &resource.url,
+            format!("Moodle generator exposes {version}"),
+        );
+        item.kind = TechnologyComponentKind::Cms;
+        detected.push(item);
+    }
+            for component in detected {
+                ({
+                    let (components, mut incoming): (
+                        &mut Vec<TechnologyComponent>,
+                        TechnologyComponent,
+                    ) = (&mut endpoint.technology_components, component);
+
+                    let identity = |component: &TechnologyComponent| {
+                        component
+                            .package_identifier
+                            .as_deref()
+                            .unwrap_or(&component.name)
+                            .to_ascii_lowercase()
+                    };
+                    let incoming_identity = identity(&incoming);
+                    let matching = components.iter_mut().find(|existing| {
+                        existing.ecosystem == incoming.ecosystem
+                            && identity(existing) == incoming_identity
+                            && (existing.installed_version == incoming.installed_version
+                                || existing.installed_version.is_none()
+                                || incoming.installed_version.is_none())
+                    });
+                    if let Some(existing) = matching {
+                        if existing.installed_version.is_none()
+                            && incoming.installed_version.is_some()
+                        {
+                            existing.installed_version = incoming.installed_version.take();
+                            existing.status = incoming.status;
+                        }
+                        if existing.latest_version.is_none() {
+                            existing.latest_version = incoming.latest_version;
+                        }
+                        if existing.package_identifier.is_none() {
+                            existing.package_identifier = incoming.package_identifier;
+                        }
+                        if existing.support_status == TechnologySupportStatus::NotApplicable
+                            || existing.support_status == TechnologySupportStatus::Unknown
+                        {
+                            existing.support_status = incoming.support_status;
+                        }
+                        if existing.release_source_url.is_none() {
+                            existing.release_source_url = incoming.release_source_url;
+                        }
+                        existing.confidence = existing.confidence.max(incoming.confidence);
+                        existing.evidence_urls.extend(incoming.evidence_urls);
+                        existing.evidence.extend(incoming.evidence);
+                        existing.evidence_urls.sort();
+                        existing.evidence_urls.dedup();
+                        existing.evidence.sort();
+                        existing.evidence.dedup();
+                    } else {
+                        incoming.evidence_urls.sort();
+                        incoming.evidence_urls.dedup();
+                        incoming.evidence.sort();
+                        incoming.evidence.dedup();
+                        components.push(incoming);
+                    }
+                });
+            }
+        });
     }
     for endpoint in endpoints.iter_mut() {
         let urls = endpoint
@@ -378,21 +2361,634 @@ pub(super) async fn analyze(
             .map(str::to_owned)
             .collect::<Vec<_>>();
         for url in urls {
-            detect_url_components(endpoint, &url);
+            ({
+                let (endpoint, url): (&mut EndpointScan, &str) = (endpoint, &url);
+                'inlined_detect_url_components: {
+                    let Ok(parsed) = Url::parse(url) else {
+                        break 'inlined_detect_url_components;
+                    };
+                    let path = parsed.path().to_ascii_lowercase();
+                    if let Some(captures) = Regex::new(r"/wp-content/plugins/([a-z0-9_-]+)(?:/|$)")
+                        .expect("valid regex")
+                        .captures(&path)
+                        && let Some(slug) = captures.get(1).map(|value| value.as_str())
+                    {
+                        let version = parsed
+                            .query_pairs()
+                            .find(|(name, _)| name.eq_ignore_ascii_case("ver"))
+                            .map(|(_, value)| value.into_owned())
+                            .filter(|value| exact_version(value));
+                        ({
+                            let (components, mut incoming): (
+                                &mut Vec<TechnologyComponent>,
+                                TechnologyComponent,
+                            ) = (
+                                &mut endpoint.technology_components,
+                                component(
+                                    slug,
+                                    TechnologyEcosystem::WordPress,
+                                    Some(slug),
+                                    version.as_deref(),
+                                    version.is_some(),
+                                    url,
+                                    if let Some(version) = &version {
+                                        format!(
+                                            "WordPress plugin asset path exposes version {version}"
+                                        )
+                                    } else {
+                                        "WordPress plugin asset path".to_owned()
+                                    },
+                                ),
+                            );
+
+                            let identity = |component: &TechnologyComponent| {
+                                component
+                                    .package_identifier
+                                    .as_deref()
+                                    .unwrap_or(&component.name)
+                                    .to_ascii_lowercase()
+                            };
+                            let incoming_identity = identity(&incoming);
+                            let matching = components.iter_mut().find(|existing| {
+                                existing.ecosystem == incoming.ecosystem
+                                    && identity(existing) == incoming_identity
+                                    && (existing.installed_version == incoming.installed_version
+                                        || existing.installed_version.is_none()
+                                        || incoming.installed_version.is_none())
+                            });
+                            if let Some(existing) = matching {
+                                if existing.installed_version.is_none()
+                                    && incoming.installed_version.is_some()
+                                {
+                                    existing.installed_version = incoming.installed_version.take();
+                                    existing.status = incoming.status;
+                                }
+                                if existing.latest_version.is_none() {
+                                    existing.latest_version = incoming.latest_version;
+                                }
+                                if existing.package_identifier.is_none() {
+                                    existing.package_identifier = incoming.package_identifier;
+                                }
+                                if existing.support_status == TechnologySupportStatus::NotApplicable
+                                    || existing.support_status == TechnologySupportStatus::Unknown
+                                {
+                                    existing.support_status = incoming.support_status;
+                                }
+                                if existing.release_source_url.is_none() {
+                                    existing.release_source_url = incoming.release_source_url;
+                                }
+                                existing.confidence = existing.confidence.max(incoming.confidence);
+                                existing.evidence_urls.extend(incoming.evidence_urls);
+                                existing.evidence.extend(incoming.evidence);
+                                existing.evidence_urls.sort();
+                                existing.evidence_urls.dedup();
+                                existing.evidence.sort();
+                                existing.evidence.dedup();
+                            } else {
+                                incoming.evidence_urls.sort();
+                                incoming.evidence_urls.dedup();
+                                incoming.evidence.sort();
+                                incoming.evidence.dedup();
+                                components.push(incoming);
+                            }
+                        });
+                    }
+                    for (marker, name, package) in [
+                        ("/_next/", "Next.js", "next"),
+                        ("/_nuxt/", "Nuxt", "nuxt"),
+                        ("/react", "React", "react"),
+                        ("/vue.", "Vue", "vue"),
+                    ] {
+                        if path.contains(marker) {
+                            ({
+                                let (components, mut incoming): (
+                                    &mut Vec<TechnologyComponent>,
+                                    TechnologyComponent,
+                                ) = (
+                                    &mut endpoint.technology_components,
+                                    component(
+                                        name,
+                                        TechnologyEcosystem::Npm,
+                                        Some(package),
+                                        None,
+                                        false,
+                                        url,
+                                        format!("Curated framework asset marker {marker}"),
+                                    ),
+                                );
+
+                                let identity = |component: &TechnologyComponent| {
+                                    component
+                                        .package_identifier
+                                        .as_deref()
+                                        .unwrap_or(&component.name)
+                                        .to_ascii_lowercase()
+                                };
+                                let incoming_identity = identity(&incoming);
+                                let matching = components.iter_mut().find(|existing| {
+                                    existing.ecosystem == incoming.ecosystem
+                                        && identity(existing) == incoming_identity
+                                        && (existing.installed_version
+                                            == incoming.installed_version
+                                            || existing.installed_version.is_none()
+                                            || incoming.installed_version.is_none())
+                                });
+                                if let Some(existing) = matching {
+                                    if existing.installed_version.is_none()
+                                        && incoming.installed_version.is_some()
+                                    {
+                                        existing.installed_version =
+                                            incoming.installed_version.take();
+                                        existing.status = incoming.status;
+                                    }
+                                    if existing.latest_version.is_none() {
+                                        existing.latest_version = incoming.latest_version;
+                                    }
+                                    if existing.package_identifier.is_none() {
+                                        existing.package_identifier = incoming.package_identifier;
+                                    }
+                                    if existing.support_status
+                                        == TechnologySupportStatus::NotApplicable
+                                        || existing.support_status
+                                            == TechnologySupportStatus::Unknown
+                                    {
+                                        existing.support_status = incoming.support_status;
+                                    }
+                                    if existing.release_source_url.is_none() {
+                                        existing.release_source_url = incoming.release_source_url;
+                                    }
+                                    existing.confidence =
+                                        existing.confidence.max(incoming.confidence);
+                                    existing.evidence_urls.extend(incoming.evidence_urls);
+                                    existing.evidence.extend(incoming.evidence);
+                                    existing.evidence_urls.sort();
+                                    existing.evidence_urls.dedup();
+                                    existing.evidence.sort();
+                                    existing.evidence.dedup();
+                                } else {
+                                    incoming.evidence_urls.sort();
+                                    incoming.evidence_urls.dedup();
+                                    incoming.evidence.sort();
+                                    incoming.evidence.dedup();
+                                    components.push(incoming);
+                                }
+                            });
+                        }
+                    }
+                }
+            });
         }
-        import_product_components(endpoint);
-        infer_runtime_components(endpoint);
+        ({
+            let (endpoint,): (&mut EndpointScan,) = (endpoint,);
+
+            let mut detected = Vec::new();
+            for product in &endpoint.products {
+                let Some(mapping) = ({
+                    let (name, layer): (&str, ProductLayer) = (&product.name, product.layer);
+                    let inlined_result: Option<&'static ProductComponentMapping> = {
+                        let normalized = name.to_ascii_lowercase();
+                        PRODUCT_COMPONENT_MAPPINGS.iter().find(|mapping| {
+                            mapping
+                                .product_layer
+                                .is_none_or(|expected| expected == layer)
+                                && mapping.aliases.contains(&normalized.as_str())
+                        })
+                    };
+                    inlined_result
+                }) else {
+                    continue;
+                };
+                let package_identifier = {
+                    let (mapping, version): (&ProductComponentMapping, Option<&str>) =
+                        (mapping, product.version.as_deref());
+                    {
+                        let major = version
+                            .map(|value: &str| {
+                                value
+                                    .trim()
+                                    .trim_start_matches('=')
+                                    .trim_start()
+                                    .trim_start_matches(['v', 'V'])
+                                    .trim_end_matches("+incompatible")
+                            })
+                            .and_then(|version| version.split('.').next())
+                            .and_then(|major| major.parse::<u64>().ok());
+                        match (mapping.name, major) {
+                            ("Fiber", Some(1)) => Some("github.com/gofiber/fiber"),
+                            ("Fiber", Some(2)) => Some("github.com/gofiber/fiber/v2"),
+                            ("Fiber", Some(3)) => Some("github.com/gofiber/fiber/v3"),
+                            ("Echo", Some(3)) => Some("github.com/labstack/echo/v3"),
+                            ("Echo", Some(4)) => Some("github.com/labstack/echo/v4"),
+                            ("Echo", Some(5)) => Some("github.com/labstack-go/echo/v5"),
+                            ("GoFrame", Some(1)) => Some("github.com/gogf/gf"),
+                            ("Chi", Some(4)) => Some("github.com/go-chi/chi/v4"),
+                            ("Chi", Some(5)) => Some("github.com/go-chi/chi/v5"),
+                            _ => mapping.package_identifier,
+                        }
+                    }
+                };
+                let url = endpoint
+                    .http
+                    .iter()
+                    .find(|response| (200..400).contains(&response.status))
+                    .map(|response| response.url.clone())
+                    .unwrap_or_else(|| format!("{}:{}", endpoint.ip, endpoint.port));
+                let exact = product.version.as_deref().is_some_and(|version| {
+                    if mapping.ecosystem == TechnologyEcosystem::WebServer {
+                        crate::web_server::is_exact_web_server_version(version)
+                    } else if mapping.ecosystem == TechnologyEcosystem::Moodle {
+                        {
+                            let (value,): (&str,) = (version,);
+                            {
+                                matches!(
+                                    value.trim().split('.').try_fold(0, |count, part| (!part
+                                        .is_empty()
+                                        && part
+                                            .chars()
+                                            .all(|character| character.is_ascii_digit()))
+                                    .then_some(count + 1)),
+                                    Some(2..=4)
+                                )
+                            }
+                        }
+                    } else {
+                        exact_version(version)
+                    }
+                });
+                let exact = if mapping.ecosystem == TechnologyEcosystem::Moodle {
+                    exact
+                && product.confidence == Confidence::High
+                && product.version.as_deref().is_some_and(|version| {
+                    product.evidence.iter().any(|evidence| {
+                        ({
+let (evidence,): (& str,) = (evidence,);
+{
+'inlined_exact_moodle_generator_version: {
+
+    let metadata = match evidence.strip_prefix("Generator metadata:") { Some(value) => value, None => break 'inlined_exact_moodle_generator_version None }.trim();
+    {
+let (text, pattern,): (& str, & str,) = (metadata, r#"(?i)^Moodle\s+([0-9]+(?:\.[0-9]+){1,3})(?:\s*(?:\(|$))"#,);
+{
+'inlined_capture: {
+
+    match match Regex::new(pattern)
+        .ok() { Some(value) => value, None => break 'inlined_capture None }
+        .captures(text) { Some(value) => value, None => break 'inlined_capture None }
+        .get(1)
+        .map(|value| value.as_str().to_owned())
+
+}
+}
+
+}
+
+}
+}
+
+}).as_deref() == Some(version)
+                    })
+                })
+                } else {
+                    exact
+                };
+                let mut item = component(
+                    mapping.name,
+                    mapping.ecosystem,
+                    package_identifier,
+                    product.version.as_deref(),
+                    exact,
+                    &url,
+                    format!("Product fingerprint: {}", product.evidence.join("; ")),
+                );
+                if package_identifier.is_none()
+                    && let Some(version) = product.version.as_deref().filter(|_| exact)
+                {
+                    item.installed_version = Some({
+                        let (value,): (&str,) = (version,);
+                        {
+                            ({
+                                let (value,): (&str,) = (value,);
+                                let inlined_result: &str = {
+                                    value
+                                        .trim()
+                                        .trim_start_matches('=')
+                                        .trim_start()
+                                        .trim_start_matches(['v', 'V'])
+                                        .trim_end_matches("+incompatible")
+                                };
+                                inlined_result
+                            })
+                            .to_owned()
+                        }
+                    });
+                    item.status = TechnologyVersionStatus::InventoryOnly;
+                    item.support_status = if mapping.ecosystem == TechnologyEcosystem::WebServer {
+                        TechnologySupportStatus::Unknown
+                    } else {
+                        TechnologySupportStatus::NotApplicable
+                    };
+                }
+                item.kind = mapping.kind;
+                item.confidence = product.confidence;
+                detected.push(item);
+            }
+            ({
+                let (endpoint, detected): (&EndpointScan, &mut Vec<TechnologyComponent>) =
+                    (endpoint, &mut detected);
+
+                let rules = [
+                    (
+                        "php",
+                        r"(?i)\bPHP/?([0-9]+(?:\.[0-9]+){1,3}(?:[-._A-Za-z0-9]+)?)",
+                        "PHP",
+                    ),
+                    (
+                        "python",
+                        r"(?i)\bPython/?([0-9]+(?:\.[0-9]+){1,3}(?:[-._A-Za-z0-9]+)?)",
+                        "Python",
+                    ),
+                    (
+                        "ruby",
+                        r"(?i)\bRuby/?([0-9]+(?:\.[0-9]+){1,3}(?:[-._A-Za-z0-9]+)?)",
+                        "Ruby",
+                    ),
+                    (
+                        "node",
+                        r"(?i)\bNode(?:\.js)?/?v?([0-9]+(?:\.[0-9]+){1,3}(?:[-._A-Za-z0-9]+)?)",
+                        "Node.js",
+                    ),
+                ];
+                for response in &endpoint.http {
+                    for (header_name, header_value) in &response.headers {
+                        if !({
+                            let (value, candidates): (&str, &[&str]) =
+                                (header_name, &["server", "x-powered-by", "x-runtime"]);
+                            candidates
+                                .iter()
+                                .any(|candidate| value.eq_ignore_ascii_case(candidate))
+                        }) {
+                            continue;
+                        }
+                        for (identifier, pattern, name) in rules {
+                            let Some(version) = ({
+                                let (text, pattern): (&str, &str) = (header_value, pattern);
+                                {
+                                    'inlined_capture: {
+                                        match match Regex::new(pattern).ok() {
+                                            Some(value) => value,
+                                            None => break 'inlined_capture None,
+                                        }
+                                        .captures(text)
+                                        {
+                                            Some(value) => value,
+                                            None => break 'inlined_capture None,
+                                        }
+                                        .get(1)
+                                        .map(|value| value.as_str().to_owned())
+                                    }
+                                }
+                            }) else {
+                                continue;
+                            };
+                            let mut item = component(
+                                name,
+                                TechnologyEcosystem::Runtime,
+                                Some(identifier),
+                                Some(&version),
+                                exact_version(&version),
+                                &response.url,
+                                format!("{header_name} header exposes {name} {version}"),
+                            );
+                            item.kind = TechnologyComponentKind::Runtime;
+                            detected.push(item);
+                        }
+                    }
+                }
+            });
+            for component in detected {
+                ({
+                    let (components, mut incoming): (
+                        &mut Vec<TechnologyComponent>,
+                        TechnologyComponent,
+                    ) = (&mut endpoint.technology_components, component);
+
+                    let identity = |component: &TechnologyComponent| {
+                        component
+                            .package_identifier
+                            .as_deref()
+                            .unwrap_or(&component.name)
+                            .to_ascii_lowercase()
+                    };
+                    let incoming_identity = identity(&incoming);
+                    let matching = components.iter_mut().find(|existing| {
+                        existing.ecosystem == incoming.ecosystem
+                            && identity(existing) == incoming_identity
+                            && (existing.installed_version == incoming.installed_version
+                                || existing.installed_version.is_none()
+                                || incoming.installed_version.is_none())
+                    });
+                    if let Some(existing) = matching {
+                        if existing.installed_version.is_none()
+                            && incoming.installed_version.is_some()
+                        {
+                            existing.installed_version = incoming.installed_version.take();
+                            existing.status = incoming.status;
+                        }
+                        if existing.latest_version.is_none() {
+                            existing.latest_version = incoming.latest_version;
+                        }
+                        if existing.package_identifier.is_none() {
+                            existing.package_identifier = incoming.package_identifier;
+                        }
+                        if existing.support_status == TechnologySupportStatus::NotApplicable
+                            || existing.support_status == TechnologySupportStatus::Unknown
+                        {
+                            existing.support_status = incoming.support_status;
+                        }
+                        if existing.release_source_url.is_none() {
+                            existing.release_source_url = incoming.release_source_url;
+                        }
+                        existing.confidence = existing.confidence.max(incoming.confidence);
+                        existing.evidence_urls.extend(incoming.evidence_urls);
+                        existing.evidence.extend(incoming.evidence);
+                        existing.evidence_urls.sort();
+                        existing.evidence_urls.dedup();
+                        existing.evidence.sort();
+                        existing.evidence.dedup();
+                    } else {
+                        incoming.evidence_urls.sort();
+                        incoming.evidence_urls.dedup();
+                        incoming.evidence.sort();
+                        incoming.evidence.dedup();
+                        components.push(incoming);
+                    }
+                });
+            }
+        });
+        ({
+            let (endpoint,): (&mut EndpointScan,) = (endpoint,);
+
+            let inferred = endpoint
+                .technology_components
+                .iter()
+                .filter(|component| component.kind != TechnologyComponentKind::Runtime)
+                .filter_map(|component| {
+                    let (runtime_name, runtime_identifier) = implied_runtime(component)?;
+                    Some(TechnologyComponent {
+                        name: runtime_name.to_owned(),
+                        ecosystem: TechnologyEcosystem::Runtime,
+                        kind: TechnologyComponentKind::Runtime,
+                        package_identifier: runtime_identifier.map(str::to_owned),
+                        installed_version: None,
+                        latest_version: None,
+                        status: TechnologyVersionStatus::InventoryOnly,
+                        support_status: TechnologySupportStatus::NotApplicable,
+                        confidence: Confidence::High,
+                        release_source_url: None,
+                        evidence_urls: component.evidence_urls.clone(),
+                        evidence: vec![format!(
+                            "{runtime_name} runtime implied by detected {} {}",
+                            component.ecosystem, component.name
+                        )],
+                        check_error: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            for component in inferred {
+                ({
+                    let (components, mut incoming): (
+                        &mut Vec<TechnologyComponent>,
+                        TechnologyComponent,
+                    ) = (&mut endpoint.technology_components, component);
+
+                    let identity = |component: &TechnologyComponent| {
+                        component
+                            .package_identifier
+                            .as_deref()
+                            .unwrap_or(&component.name)
+                            .to_ascii_lowercase()
+                    };
+                    let incoming_identity = identity(&incoming);
+                    let matching = components.iter_mut().find(|existing| {
+                        existing.ecosystem == incoming.ecosystem
+                            && identity(existing) == incoming_identity
+                            && (existing.installed_version == incoming.installed_version
+                                || existing.installed_version.is_none()
+                                || incoming.installed_version.is_none())
+                    });
+                    if let Some(existing) = matching {
+                        if existing.installed_version.is_none()
+                            && incoming.installed_version.is_some()
+                        {
+                            existing.installed_version = incoming.installed_version.take();
+                            existing.status = incoming.status;
+                        }
+                        if existing.latest_version.is_none() {
+                            existing.latest_version = incoming.latest_version;
+                        }
+                        if existing.package_identifier.is_none() {
+                            existing.package_identifier = incoming.package_identifier;
+                        }
+                        if existing.support_status == TechnologySupportStatus::NotApplicable
+                            || existing.support_status == TechnologySupportStatus::Unknown
+                        {
+                            existing.support_status = incoming.support_status;
+                        }
+                        if existing.release_source_url.is_none() {
+                            existing.release_source_url = incoming.release_source_url;
+                        }
+                        existing.confidence = existing.confidence.max(incoming.confidence);
+                        existing.evidence_urls.extend(incoming.evidence_urls);
+                        existing.evidence.extend(incoming.evidence);
+                        existing.evidence_urls.sort();
+                        existing.evidence_urls.dedup();
+                        existing.evidence.sort();
+                        existing.evidence.dedup();
+                    } else {
+                        incoming.evidence_urls.sort();
+                        incoming.evidence_urls.dedup();
+                        incoming.evidence.sort();
+                        incoming.evidence.dedup();
+                        components.push(incoming);
+                    }
+                });
+            }
+        });
         inventory_completed += 1;
-        send_technology_progress(
-            progress,
-            0.25 * inventory_completed as f32 / inventory_total.max(1) as f32,
-            format!("Built inventory for {}:{}", endpoint.ip, endpoint.port),
-        );
+        ({
+            let (progress, fraction, text): (&Option<Sender<ExposureScanProgress>>, f32, String) = (
+                progress,
+                0.25 * inventory_completed as f32 / inventory_total.max(1) as f32,
+                format!("Built inventory for {}:{}", endpoint.ip, endpoint.port),
+            );
+
+            send_phase_progress(
+                progress,
+                ExposureScanPhase::TechnologyAnalysis,
+                ExposureScanPhaseState::Running,
+                fraction,
+                text,
+            );
+        });
     }
-    send_technology_progress(progress, 0.25, "Inventory parsing complete".to_owned());
+    ({
+        let (progress, fraction, text): (&Option<Sender<ExposureScanProgress>>, f32, String) =
+            (progress, 0.25, "Inventory parsing complete".to_owned());
+
+        send_phase_progress(
+            progress,
+            ExposureScanPhase::TechnologyAnalysis,
+            ExposureScanPhaseState::Running,
+            fraction,
+            text,
+        );
+    });
 
     let mut cache = HashMap::<(TechnologyEcosystem, String), LatestResult>::new();
-    seed_javascript_cache(endpoints, &mut cache);
+    ({
+        let (endpoints, cache): (
+            &[EndpointScan],
+            &mut HashMap<(TechnologyEcosystem, String), LatestResult>,
+        ) = (endpoints, &mut cache);
+
+        for component in endpoints
+            .iter()
+            .flat_map(|endpoint| &endpoint.technology_components)
+        {
+            if component.ecosystem != TechnologyEcosystem::Npm {
+                continue;
+            }
+            let Some(identifier) = component.package_identifier.clone() else {
+                continue;
+            };
+            if component.latest_version.is_some() || component.check_error.is_some() {
+                cache
+                    .entry((
+                        component.ecosystem,
+                        ({
+                            let (ecosystem, identifier): (TechnologyEcosystem, &str) =
+                                (component.ecosystem, &identifier);
+                            {
+                                if matches!(
+                                    ecosystem,
+                                    TechnologyEcosystem::MavenCentral
+                                        | TechnologyEcosystem::GoModules
+                                ) {
+                                    identifier.to_owned()
+                                } else {
+                                    identifier.to_ascii_lowercase()
+                                }
+                            }
+                        }),
+                    ))
+                    .or_insert_with(|| LatestResult {
+                        latest: component.latest_version.clone(),
+                        error: component.check_error.clone(),
+                        support_status: None,
+                    });
+            }
+        }
+    });
     let mut jobs = HashMap::<(TechnologyEcosystem, String), LookupJob>::new();
     for endpoint in endpoints.iter_mut() {
         for component in &mut endpoint.technology_components {
@@ -412,13 +3008,89 @@ pub(super) async fn analyze(
                 continue;
             };
             let lookup_identifier = if component.ecosystem == TechnologyEcosystem::WebServer {
-                web_server_cache_identifier(&identifier, &installed)
+                {
+                    let (identifier, installed): (&str, &str) = (&identifier, &installed);
+                    {
+                        let line = ({
+                            let (identifier, version): (&str, &str) = (identifier, installed);
+                            let inlined_result: Option<String> = {
+                                'inlined_web_server_release_line: {
+                                    let numbers = match version_numbers(version) {
+                                        Some(value) => value,
+                                        None => break 'inlined_web_server_release_line None,
+                                    };
+                                    let count = match identifier {
+                                        "caddy" => 1,
+                                        "openresty" => 3,
+                                        "nginx" | "apache-httpd" | "iis" | "litespeed"
+                                        | "openlitespeed" | "lighttpd" | "tomcat" | "jetty"
+                                        | "kestrel" => 2,
+                                        _ => break 'inlined_web_server_release_line None,
+                                    };
+                                    (numbers.len() >= count).then(|| {
+                                        numbers
+                                            .into_iter()
+                                            .take(count)
+                                            .map(|number| number.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(".")
+                                    })
+                                }
+                            };
+                            inlined_result
+                        })
+                        .unwrap_or_else(|| "all".to_owned());
+                        format!("{}@{}", identifier.to_ascii_lowercase(), line)
+                    }
+                }
             } else {
-                registry_cache_identifier(component.ecosystem, &identifier)
+                {
+                    let (ecosystem, identifier): (TechnologyEcosystem, &str) =
+                        (component.ecosystem, &identifier);
+                    {
+                        if matches!(
+                            ecosystem,
+                            TechnologyEcosystem::MavenCentral | TechnologyEcosystem::GoModules
+                        ) {
+                            identifier.to_owned()
+                        } else {
+                            identifier.to_ascii_lowercase()
+                        }
+                    }
+                }
             };
             let key = (component.ecosystem, lookup_identifier.clone());
             if !cache.contains_key(&key) {
-                let priority = lookup_priority(component, &lookup_identifier);
+                let priority = {
+                    let (component, identifier): (&TechnologyComponent, &str) =
+                        (component, &lookup_identifier);
+                    let inlined_result: (u8, u8, String) = {
+                        let preferred = matches!(
+                            component.kind,
+                            TechnologyComponentKind::Server
+                                | TechnologyComponentKind::Runtime
+                                | TechnologyComponentKind::Framework
+                                | TechnologyComponentKind::Cms
+                        );
+                        let high = component.confidence == Confidence::High;
+                        let group = match (high, preferred) {
+                            (true, true) => 0,
+                            (true, false) => 1,
+                            (false, true) => 2,
+                            (false, false) => 3,
+                        };
+                        let kind = match component.kind {
+                            TechnologyComponentKind::Server => 0,
+                            TechnologyComponentKind::Runtime => 1,
+                            TechnologyComponentKind::Framework => 2,
+                            TechnologyComponentKind::Cms => 3,
+                            TechnologyComponentKind::Plugin => 4,
+                            TechnologyComponentKind::Package => 5,
+                        };
+                        (group, kind, identifier.to_owned())
+                    };
+                    inlined_result
+                };
                 jobs.entry(key)
                     .and_modify(|job| job.priority = job.priority.clone().min(priority.clone()))
                     .or_insert(LookupJob {
@@ -430,9 +3102,3329 @@ pub(super) async fn analyze(
         }
     }
 
-    fetch_lookup_jobs(
-        jobs, &mut cache, request, cancel, limiter, enrichment, progress,
-    )
+    ({
+let (jobs, cache, request, cancel, limiter, enrichment, progress,): (HashMap < (TechnologyEcosystem , String) , LookupJob >, & mut HashMap < (TechnologyEcosystem , String) , LatestResult >, & ExposureScanRequest, & CancellationToken, & ConnectionRateLimiter, & mut javascript :: EnrichmentState, & Option < Sender < ExposureScanProgress > >,) = (jobs, &mut cache, request, cancel, limiter, enrichment, progress,);
+async move {
+
+    enrichment.start();
+    let mut jobs = jobs.into_iter().collect::<Vec<_>>();
+    jobs.sort_by(|left, right| {
+        left.1
+            .priority
+            .cmp(&right.1.priority)
+            .then(left.0.cmp(&right.0))
+    });
+    let mut fetched = HashMap::new();
+    let mut requests = HashMap::<String, ((u8, u8, String), String)>::new();
+    for (_, job) in &jobs {
+        let Some(url) = ({
+let (ecosystem, identifier,): (TechnologyEcosystem, & str,) = (job.ecosystem, &job.identifier,);
+let inlined_result: Option < String > = {
+'inlined_registry_url: {
+
+    let identifier = identifier
+        .split_once('@')
+        .map(|(identifier, _)| identifier)
+        .unwrap_or(identifier);
+    let encoded = utf8_percent_encode(identifier, NON_ALPHANUMERIC).to_string();
+    Some(match ecosystem {
+        TechnologyEcosystem::JavaScript => break 'inlined_registry_url None,
+        TechnologyEcosystem::Npm => format!("https://registry.npmjs.org/{encoded}"),
+        TechnologyEcosystem::Composer => format!(
+            "https://repo.packagist.org/p2/{}.json",
+            ({
+let (value,): (& str,) = (identifier,);
+let inlined_result: String = {
+
+    value
+        .split('/')
+        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+
+};
+inlined_result
+})
+        ),
+        TechnologyEcosystem::WordPress if identifier == "wordpress" => {
+            "https://api.wordpress.org/core/version-check/1.7/".to_owned()
+        }
+        TechnologyEcosystem::WordPress => format!(
+            "https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&request%5Bslug%5D={encoded}"
+        ),
+        TechnologyEcosystem::Moodle if identifier == "moodle" => {
+            MOODLE_LATEST_RELEASE_URL.to_owned()
+        }
+        TechnologyEcosystem::Moodle => break 'inlined_registry_url None,
+        TechnologyEcosystem::PyPi => format!("https://pypi.org/pypi/{encoded}/json"),
+        TechnologyEcosystem::RubyGems => {
+            format!("https://rubygems.org/api/v1/versions/{encoded}.json")
+        }
+        TechnologyEcosystem::MavenCentral => {
+            let (group, artifact) = match identifier.split_once(':') { Some(value) => value, None => break 'inlined_registry_url None };
+            let query_text = format!("g:\"{group}\" AND a:\"{artifact}\"");
+            let query = utf8_percent_encode(&query_text, NON_ALPHANUMERIC);
+            format!(
+                "https://search.maven.org/solrsearch/select?q={query}&core=gav&rows=200&wt=json"
+            )
+        }
+        TechnologyEcosystem::NuGet => format!(
+            "https://api-v2v3search-0.nuget.org/query?q=packageid%3A{encoded}&prerelease=false&semVerLevel=2.0.0&take=20"
+        ),
+        TechnologyEcosystem::GoModules => {
+            format!(
+                "https://proxy.golang.org/{}/@v/list",
+                ({
+let (value,): (& str,) = (identifier,);
+let inlined_result: String = {
+
+    let mut escaped = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_uppercase() {
+            escaped.push('!');
+            escaped.push(char::from(byte.to_ascii_lowercase()));
+        } else if byte.is_ascii_alphanumeric() || b"-._~+/".contains(&byte) {
+            escaped.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(escaped, "%{byte:02X}");
+        }
+    }
+    escaped
+
+};
+inlined_result
+})
+            )
+        }
+        TechnologyEcosystem::CratesIo => {
+            format!("https://crates.io/api/v1/crates/{encoded}")
+        }
+        TechnologyEcosystem::Runtime => match identifier {
+            "php" => "https://www.php.net/releases/index.php?json&max=100".to_owned(),
+            "python" => {
+                "https://www.python.org/api/v2/downloads/release/?is_published=true".to_owned()
+            }
+            "ruby" => "https://cache.ruby-lang.org/pub/ruby/index.txt".to_owned(),
+            "java" => "https://api.adoptium.net/v3/info/available_releases".to_owned(),
+            "dotnet" => {
+                "https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json"
+                    .to_owned()
+            }
+            "go" => "https://go.dev/dl/?mode=json&include=all".to_owned(),
+            "rust" => "https://static.rust-lang.org/dist/channel-rust-stable.toml".to_owned(),
+            "node" => "https://nodejs.org/dist/index.json".to_owned(),
+            _ => break 'inlined_registry_url None,
+        },
+        TechnologyEcosystem::WebServer => match web_server_release_source(identifier) { Some(value) => value, None => break 'inlined_registry_url None }.to_owned(),
+    })
+
+}
+};
+inlined_result
+}) else {
+            continue;
+        };
+        if let Some(result) = enrichment.cached(&url) {
+            fetched.insert(url, result);
+            continue;
+        }
+        let accept = ({
+let (ecosystem, identifier,): (TechnologyEcosystem, & str,) = (job.ecosystem, &job.identifier,);
+let inlined_result: & 'static str = {
+
+    let base_identifier = identifier
+        .split_once('@')
+        .map(|(identifier, _)| identifier)
+        .unwrap_or(identifier);
+    if ecosystem == TechnologyEcosystem::Npm {
+        "application/vnd.npm.install-v1+json"
+    } else if ecosystem == TechnologyEcosystem::Moodle {
+        "text/html"
+    } else if ecosystem == TechnologyEcosystem::WebServer && base_identifier == "lighttpd" {
+        "text/plain"
+    } else if ecosystem == TechnologyEcosystem::WebServer
+        && matches!(
+            base_identifier,
+            "nginx"
+                | "apache-httpd"
+                | "iis"
+                | "openresty"
+                | "litespeed"
+                | "openlitespeed"
+                | "tomcat"
+                | "jetty"
+        )
+    {
+        "text/html"
+    } else if matches!(
+        ecosystem,
+        TechnologyEcosystem::GoModules | TechnologyEcosystem::Runtime
+    ) && matches!(identifier, "ruby" | "rust")
+    {
+        "text/plain"
+    } else {
+        "application/json"
+    }
+
+};
+inlined_result
+}).to_owned();
+        requests
+            .entry(url)
+            .and_modify(|existing| {
+                if job.priority < existing.0 {
+                    *existing = (job.priority.clone(), accept.clone());
+                }
+            })
+            .or_insert_with(|| (job.priority.clone(), accept));
+    }
+    let mut requests = requests.into_iter().collect::<Vec<_>>();
+    requests.sort_by(|left, right| left.1.0.cmp(&right.1.0).then(left.0.cmp(&right.0)));
+    let metadata_total = requests.len() + jobs.len();
+    let mut metadata_completed = 0usize;
+    ({
+let (progress, fraction, text,): (& Option < Sender < ExposureScanProgress > >, f32, String,) = (progress, 0.25, format!("Checking {metadata_total} metadata records"),);
+
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::TechnologyAnalysis,
+        ExposureScanPhaseState::Running,
+        fraction,
+        text,
+    );
+
+});
+
+    let context = enrichment.fetch_context();
+    let mut pending = FuturesUnordered::new();
+    let mut next = 0usize;
+    let mut reserved = 0usize;
+    while next < requests.len() || !pending.is_empty() {
+        while pending.len() < MAX_CONCURRENT_VERSION_FETCHES && next < requests.len() {
+            if enrichment.stop_error(cancel).is_some() {
+                break;
+            }
+            let available = (enrichment).remaining_bytes.saturating_sub(reserved);
+            if available == 0 {
+                break;
+            }
+            let body_limit = MAX_METADATA_BYTES.min(available);
+            let (url, (_, accept)) = requests[next].clone();
+            next += 1;
+            if !cancel.is_cancelled() {
+                ({
+let (progress, fraction, text,): (& Option < Sender < ExposureScanProgress > >, f32, String,) = (progress, 0.25 + 0.55 * metadata_completed as f32 / metadata_total.max(1) as f32, format!("Fetching technology metadata: {url}"),);
+
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::TechnologyAnalysis,
+        ExposureScanPhaseState::Running,
+        fraction,
+        text,
+    );
+
+});
+            }
+            reserved += body_limit;
+            let context = context.clone();
+            pending.push(async move {
+                let headers = [("Accept", accept.as_str())];
+                let result = javascript::fetch_metadata_url(
+                    &url, body_limit, &headers, request, cancel, limiter, context,
+                )
+                .await;
+                (url, body_limit, result)
+            });
+        }
+        let Some((url, body_limit, result)) = pending.next().await else {
+            break;
+        };
+        reserved = reserved.saturating_sub(body_limit);
+        enrichment.store(url.clone(), result.clone());
+        fetched.insert(url, result);
+        metadata_completed += 1;
+        if !cancel.is_cancelled() {
+            ({
+let (progress, fraction, text,): (& Option < Sender < ExposureScanProgress > >, f32, String,) = (progress, 0.25 + 0.55 * metadata_completed as f32 / metadata_total.max(1) as f32, format!("Fetched {metadata_completed} / {metadata_total} metadata records"),);
+
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::TechnologyAnalysis,
+        ExposureScanPhaseState::Running,
+        fraction,
+        text,
+    );
+
+});
+        }
+    }
+    if next < requests.len() {
+        let error = enrichment
+            .stop_error(cancel)
+            .unwrap_or(javascript::METADATA_LIMIT_ERROR)
+            .to_owned();
+        for (url, _) in &requests[next..] {
+            fetched.insert(url.clone(), {
+let (url, error,): (& str, & str,) = (url, &error,);
+{
+
+    javascript::Fetched {
+        final_url: Url::parse(url).ok(),
+        response: None,
+        error: Some(error.to_owned()),
+        captured_bytes: 0,
+    }
+
+}
+
+});
+        }
+        metadata_completed += requests.len() - next;
+    }
+
+    for (key, job) in jobs {
+        let result = match {
+let (ecosystem, identifier,): (TechnologyEcosystem, & str,) = (job.ecosystem, &job.identifier,);
+let inlined_result: Option < String > = {
+'inlined_registry_url: {
+
+    let identifier = identifier
+        .split_once('@')
+        .map(|(identifier, _)| identifier)
+        .unwrap_or(identifier);
+    let encoded = utf8_percent_encode(identifier, NON_ALPHANUMERIC).to_string();
+    Some(match ecosystem {
+        TechnologyEcosystem::JavaScript => break 'inlined_registry_url None,
+        TechnologyEcosystem::Npm => format!("https://registry.npmjs.org/{encoded}"),
+        TechnologyEcosystem::Composer => format!(
+            "https://repo.packagist.org/p2/{}.json",
+            ({
+let (value,): (& str,) = (identifier,);
+let inlined_result: String = {
+
+    value
+        .split('/')
+        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+
+};
+inlined_result
+})
+        ),
+        TechnologyEcosystem::WordPress if identifier == "wordpress" => {
+            "https://api.wordpress.org/core/version-check/1.7/".to_owned()
+        }
+        TechnologyEcosystem::WordPress => format!(
+            "https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&request%5Bslug%5D={encoded}"
+        ),
+        TechnologyEcosystem::Moodle if identifier == "moodle" => {
+            MOODLE_LATEST_RELEASE_URL.to_owned()
+        }
+        TechnologyEcosystem::Moodle => break 'inlined_registry_url None,
+        TechnologyEcosystem::PyPi => format!("https://pypi.org/pypi/{encoded}/json"),
+        TechnologyEcosystem::RubyGems => {
+            format!("https://rubygems.org/api/v1/versions/{encoded}.json")
+        }
+        TechnologyEcosystem::MavenCentral => {
+            let (group, artifact) = match identifier.split_once(':') { Some(value) => value, None => break 'inlined_registry_url None };
+            let query_text = format!("g:\"{group}\" AND a:\"{artifact}\"");
+            let query = utf8_percent_encode(&query_text, NON_ALPHANUMERIC);
+            format!(
+                "https://search.maven.org/solrsearch/select?q={query}&core=gav&rows=200&wt=json"
+            )
+        }
+        TechnologyEcosystem::NuGet => format!(
+            "https://api-v2v3search-0.nuget.org/query?q=packageid%3A{encoded}&prerelease=false&semVerLevel=2.0.0&take=20"
+        ),
+        TechnologyEcosystem::GoModules => {
+            format!(
+                "https://proxy.golang.org/{}/@v/list",
+                ({
+let (value,): (& str,) = (identifier,);
+let inlined_result: String = {
+
+    let mut escaped = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_uppercase() {
+            escaped.push('!');
+            escaped.push(char::from(byte.to_ascii_lowercase()));
+        } else if byte.is_ascii_alphanumeric() || b"-._~+/".contains(&byte) {
+            escaped.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(escaped, "%{byte:02X}");
+        }
+    }
+    escaped
+
+};
+inlined_result
+})
+            )
+        }
+        TechnologyEcosystem::CratesIo => {
+            format!("https://crates.io/api/v1/crates/{encoded}")
+        }
+        TechnologyEcosystem::Runtime => match identifier {
+            "php" => "https://www.php.net/releases/index.php?json&max=100".to_owned(),
+            "python" => {
+                "https://www.python.org/api/v2/downloads/release/?is_published=true".to_owned()
+            }
+            "ruby" => "https://cache.ruby-lang.org/pub/ruby/index.txt".to_owned(),
+            "java" => "https://api.adoptium.net/v3/info/available_releases".to_owned(),
+            "dotnet" => {
+                "https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json"
+                    .to_owned()
+            }
+            "go" => "https://go.dev/dl/?mode=json&include=all".to_owned(),
+            "rust" => "https://static.rust-lang.org/dist/channel-rust-stable.toml".to_owned(),
+            "node" => "https://nodejs.org/dist/index.json".to_owned(),
+            _ => break 'inlined_registry_url None,
+        },
+        TechnologyEcosystem::WebServer => match web_server_release_source(identifier) { Some(value) => value, None => break 'inlined_registry_url None }.to_owned(),
+    })
+
+}
+};
+inlined_result
+} {
+            Some(url) => fetched
+                .get(&url)
+                .cloned()
+                .map(|fetched| {
+let (ecosystem, identifier, fetched,): (TechnologyEcosystem, & str, javascript :: Fetched,) = (job.ecosystem, &job.identifier, fetched,);
+let inlined_result: LatestResult = {
+'inlined_latest_result: {
+
+    let Some(response) = fetched.response else {
+        break 'inlined_latest_result LatestResult {
+            latest: None,
+            error: fetched
+                .error
+                .or_else(|| Some("Registry returned no response".to_owned())),
+            support_status: None,
+        };
+    };
+    if let Some(error) = fetched.error {
+        break 'inlined_latest_result LatestResult {
+            latest: None,
+            error: Some(error),
+            support_status: None,
+        };
+    }
+    if !(200..300).contains(&response.status) {
+        break 'inlined_latest_result LatestResult {
+            latest: None,
+            error: Some(format!("Registry returned HTTP {}", response.status)),
+            support_status: None,
+        };
+    }
+    if response.body_truncated {
+        break 'inlined_latest_result LatestResult {
+            latest: None,
+            error: Some("Registry metadata exceeded the remaining byte limit".to_owned()),
+            support_status: None,
+        };
+    }
+    if ecosystem == TechnologyEcosystem::WebServer {
+        break 'inlined_latest_result match {
+let (identifier, bytes,): (& str, & [u8],) = (identifier, &response.body,);
+let inlined_result: Result < WebServerRelease , String > = {
+'inlined_parse_web_server_latest: {
+
+    let (identifier, detected_line) = identifier
+        .split_once('@')
+        .map(|(identifier, line)| (identifier, (line != "all").then_some(line)))
+        .unwrap_or((identifier, None));
+    let versions = match {
+let (identifier, bytes,): (& str, & [u8],) = (identifier, bytes,);
+let inlined_result: Result < Vec < String > , String > = {
+'inlined_web_server_versions: {
+
+    let mut versions = match identifier {
+        "gunicorn" | "uvicorn" | "werkzeug" => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "PyPI",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_web_server_versions Err(::core::convert::From::from(error)) };
+            value
+                .get("releases")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flat_map(|releases| releases.iter())
+                .filter(|(_, files)| {
+                    files.as_array().is_some_and(|files| {
+                        files.iter().any(|file| {
+                            !file.get("yanked").and_then(Value::as_bool).unwrap_or(false)
+                        })
+                    })
+                })
+                .map(|(version, _)| version.to_owned())
+                .collect()
+        }
+        "puma" | "passenger" => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "RubyGems",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_web_server_versions Err(::core::convert::From::from(error)) };
+            value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| {
+                    !item
+                        .get("prerelease")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        && !item.get("yanked").and_then(Value::as_bool).unwrap_or(false)
+                })
+                .filter_map(|item| {
+                    item.get("number")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        }
+        "caddy" | "cowboy" => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "GitHub releases",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_web_server_versions Err(::core::convert::From::from(error)) };
+            value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|release| {
+                    !release
+                        .get("draft")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        && !release
+                            .get("prerelease")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                })
+                .filter_map(|release| {
+                    release
+                        .get("tag_name")
+                        .or_else(|| release.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .filter_map(|tag: & str| {
+    let start = tag.find(|character: char| character.is_ascii_digit())?;
+    let version = tag[start..]
+        .chars()
+        .take_while(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '+')
+        })
+        .collect::<String>();
+    version_numbers(&version).is_some().then_some(version)
+})
+                .collect()
+        }
+        "kestrel" => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, ".NET release",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_web_server_versions Err(::core::convert::From::from(error)) };
+            value
+                .get("releases-index")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|release| release.get("latest-release").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        }
+        _ => match {
+let (identifier, bytes,): (& str, & [u8],) = (identifier, bytes,);
+let inlined_result: Result < Vec < String > , String > = {
+'inlined_web_server_html_versions: {
+
+    let text = match std::str::from_utf8(bytes)
+        .map_err(|error| format!("invalid upstream release page: {error}")) { Ok(value) => value, Err(error) => break 'inlined_web_server_html_versions Err(::core::convert::From::from(error)) };
+    if identifier == "iis" {
+        let regex = match Regex::new(r"(?i)\bIIS\s+([0-9]+(?:\.[0-9]+)?)")
+            .map_err(|error| format!("invalid release parser: {error}")) { Ok(value) => value, Err(error) => break 'inlined_web_server_html_versions Err(::core::convert::From::from(error)) };
+        break 'inlined_web_server_html_versions Ok(regex
+            .captures_iter(text)
+            .filter_map(|captures| captures.get(1).map(|value| value.as_str()))
+            .map(|version| {
+                if version.contains('.') {
+                    version.to_owned()
+                } else {
+                    format!("{version}.0")
+                }
+            })
+            .collect());
+    }
+    if identifier == "litespeed" {
+        break 'inlined_web_server_html_versions ({
+let (text, pattern, group,): (& str, & str, usize,) = (text, r"(?i)version\s+([0-9]+(?:\.[0-9]+){1,3})\s+stable", 1,);
+let inlined_result: Result < Vec < String > , String > = {
+'inlined_html_capture_versions: {
+
+    let regex = match Regex::new(pattern).map_err(|error| format!("invalid release parser: {error}")) { Ok(value) => value, Err(error) => break 'inlined_html_capture_versions Err(::core::convert::From::from(error)) };
+    Ok(regex
+        .captures_iter(text)
+        .filter_map(|captures| captures.get(group).map(|value| value.as_str().to_owned()))
+        .collect())
+
+}
+};
+inlined_result
+});
+    }
+    if identifier == "openlitespeed" {
+        break 'inlined_web_server_html_versions ({
+let (text, pattern, group,): (& str, & str, usize,) = (text, r"(?is)openlitespeed\s+v\s*([0-9]+(?:\.[0-9]+){1,3}).{0,200}?\bstable\b", 1,);
+let inlined_result: Result < Vec < String > , String > = {
+'inlined_html_capture_versions: {
+
+    let regex = match Regex::new(pattern).map_err(|error| format!("invalid release parser: {error}")) { Ok(value) => value, Err(error) => break 'inlined_html_capture_versions Err(::core::convert::From::from(error)) };
+    Ok(regex
+        .captures_iter(text)
+        .filter_map(|captures| captures.get(group).map(|value| value.as_str().to_owned()))
+        .collect())
+
+}
+};
+inlined_result
+});
+    }
+    if identifier == "tomcat" {
+        let regex =
+            match Regex::new(r"(?is)([0-9]{1,2}\.[0-9]+)\.x.{0,400}?([0-9]{1,2}\.[0-9]+\.[0-9]+)")
+                .map_err(|error| format!("invalid release parser: {error}")) { Ok(value) => value, Err(error) => break 'inlined_web_server_html_versions Err(::core::convert::From::from(error)) };
+        break 'inlined_web_server_html_versions Ok(regex
+            .captures_iter(text)
+            .filter_map(|captures| {
+                let line = captures.get(1)?.as_str();
+                let version = captures.get(2)?.as_str();
+                version
+                    .starts_with(&format!("{line}."))
+                    .then(|| version.to_owned())
+            })
+            .collect());
+    }
+    if identifier == "jetty" {
+        break 'inlined_web_server_html_versions ({
+let (text, pattern, group,): (& str, & str, usize,) = (text, r"(?i)>\s*([0-9]{1,2}\.[0-9]+\.[0-9]+(?:\.v[0-9]+)?)\s*(?:\(EOL\))?\s*<", 1,);
+let inlined_result: Result < Vec < String > , String > = {
+'inlined_html_capture_versions: {
+
+    let regex = match Regex::new(pattern).map_err(|error| format!("invalid release parser: {error}")) { Ok(value) => value, Err(error) => break 'inlined_html_capture_versions Err(::core::convert::From::from(error)) };
+    Ok(regex
+        .captures_iter(text)
+        .filter_map(|captures| captures.get(group).map(|value| value.as_str().to_owned()))
+        .collect())
+
+}
+};
+inlined_result
+});
+    }
+    let pattern = match identifier {
+        "nginx" => r"(?i)nginx-([0-9]+(?:\.[0-9]+){1,3}(?:[-._](?:alpha|beta|rc)[0-9]*)?)",
+        "apache-httpd" => r"(?i)httpd-([0-9]+(?:\.[0-9]+){1,3}(?:[-._](?:alpha|beta|rc)[0-9]*)?)",
+        "openresty" => r"(?i)openresty-([0-9]+(?:\.[0-9]+){1,3}(?:[-._](?:alpha|beta|rc)[0-9]*)?)",
+        "lighttpd" => r"(?i)lighttpd-([0-9]+(?:\.[0-9]+){1,3})",
+        _ => break 'inlined_web_server_html_versions Ok(Vec::new()),
+    };
+    let regex = match Regex::new(pattern).map_err(|error| format!("invalid release parser: {error}")) { Ok(value) => value, Err(error) => break 'inlined_web_server_html_versions Err(::core::convert::From::from(error)) };
+    Ok(regex
+        .captures_iter(text)
+        .filter_map(|captures| captures.get(1).map(|value| value.as_str().to_owned()))
+        .collect())
+
+}
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_web_server_versions Err(::core::convert::From::from(error)) },
+    };
+    versions.retain(|version| version_numbers(version).is_some() && !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}));
+    versions.sort_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal));
+    versions.dedup();
+    Ok(versions)
+
+}
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_web_server_latest Err(::core::convert::From::from(error)) };
+    let latest_overall = {
+let (versions,): (_,) = (versions.iter().map(String::as_str),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+};
+    let latest_in_line = detected_line.and_then(|line| {
+        {
+let (versions,): (_,) = (versions.iter().filter_map(|version| {
+            (({
+let (identifier, version,): (& str, & str,) = (identifier, version,);
+let inlined_result: Option < String > = {
+'inlined_web_server_release_line: {
+
+    let numbers = match version_numbers(version) { Some(value) => value, None => break 'inlined_web_server_release_line None };
+    let count = match identifier {
+        "caddy" => 1,
+        "openresty" => 3,
+        "nginx" | "apache-httpd" | "iis" | "litespeed" | "openlitespeed" | "lighttpd"
+        | "tomcat" | "jetty" | "kestrel" => 2,
+        _ => break 'inlined_web_server_release_line None,
+    };
+    (numbers.len() >= count).then(|| {
+        numbers
+            .into_iter()
+            .take(count)
+            .map(|number| number.to_string())
+            .collect::<Vec<_>>()
+            .join(".")
+    })
+
+}
+};
+inlined_result
+}).as_deref() == Some(line))
+                .then_some(version.as_str())
+        }),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+}
+    });
+    let latest = latest_in_line.clone().or(latest_overall.clone());
+    if latest.is_none() {
+        break 'inlined_parse_web_server_latest Err("Upstream metadata returned no stable release".to_owned());
+    }
+    let support_status = {
+let (identifier, detected_line, latest_overall, line_found, bytes,): (& str, Option < & str >, Option < & str >, bool, & [u8],) = (identifier, detected_line, latest_overall.as_deref(), latest_in_line.is_some(), bytes,);
+let inlined_result: TechnologySupportStatus = {
+'inlined_web_server_support_status: {
+
+    let Some(line) = detected_line else {
+        break 'inlined_web_server_support_status TechnologySupportStatus::Unknown;
+    };
+    if let Some(supported) = {
+let (identifier, line, bytes,): (& str, & str, & [u8],) = (identifier, line, bytes,);
+let inlined_result: Option < bool > = {
+'inlined_explicitly_supported_line: {
+
+    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    match identifier {
+        "nginx" => {
+            let legacy = match text.find("legacy versions") { Some(value) => value, None => break 'inlined_explicitly_supported_line None };
+            let version = format!("nginx-{line}.");
+            if text[..legacy].contains(&version) {
+                Some(true)
+            } else if text[legacy..].contains(&version) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        "tomcat" => {
+            let unsupported = match text.find("unsupported versions") { Some(value) => value, None => break 'inlined_explicitly_supported_line None };
+            let version = format!("{line}.x");
+            if text[..unsupported].contains(&version) {
+                Some(true)
+            } else if text[unsupported..].contains(&version) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        "kestrel" => {
+            let value = match serde_json::from_slice::<Value>(bytes).ok() { Some(value) => value, None => break 'inlined_explicitly_supported_line None };
+            let release = match match value
+                .get("releases-index")
+                .and_then(Value::as_array) { Some(value) => value, None => break 'inlined_explicitly_supported_line None }
+                .iter()
+                .find(|release| {
+                    release
+                        .get("channel-version")
+                        .and_then(Value::as_str)
+                        .is_some_and(|version| {
+                            ({
+let (identifier, version,): (& str, & str,) = ("kestrel", version,);
+let inlined_result: Option < String > = {
+'inlined_web_server_release_line: {
+
+    let numbers = match version_numbers(version) { Some(value) => value, None => break 'inlined_web_server_release_line None };
+    let count = match identifier {
+        "caddy" => 1,
+        "openresty" => 3,
+        "nginx" | "apache-httpd" | "iis" | "litespeed" | "openlitespeed" | "lighttpd"
+        | "tomcat" | "jetty" | "kestrel" => 2,
+        _ => break 'inlined_web_server_release_line None,
+    };
+    (numbers.len() >= count).then(|| {
+        numbers
+            .into_iter()
+            .take(count)
+            .map(|number| number.to_string())
+            .collect::<Vec<_>>()
+            .join(".")
+    })
+
+}
+};
+inlined_result
+}).as_deref() == Some(line)
+                        })
+                }) { Some(value) => value, None => break 'inlined_explicitly_supported_line None };
+            release
+                .get("support-phase")
+                .and_then(Value::as_str)
+                .map(|phase| !matches!(phase.to_ascii_lowercase().as_str(), "eol" | "end-of-life"))
+        }
+        _ => None,
+    }
+
+}
+};
+inlined_result
+} {
+        break 'inlined_web_server_support_status if supported {
+            TechnologySupportStatus::Supported
+        } else {
+            TechnologySupportStatus::Unsupported
+        };
+    }
+    if {
+let (line, bytes,): (& str, & [u8],) = (line, bytes,);
+{
+'inlined_line_marked_unsupported: {
+
+    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    let markers = [
+        "end of life",
+        "eol",
+        "unsupported",
+        "not supported",
+        "obsolete",
+        "legacy",
+        "archived",
+        "superseded",
+        "deprecated",
+    ];
+    let mut offset = 0;
+    while let Some(index) = text[offset..].find(line) {
+        let index = offset + index;
+        let row_start = text[..index]
+            .rfind("<tr")
+            .filter(|row| index - *row <= 2_000);
+        let line_start = text[..index].rfind('\n').map(|line| line + 1);
+        let start = row_start.or(line_start).unwrap_or(index);
+        let row_end = text[index..]
+            .find("</tr>")
+            .map(|end| index + end + 5)
+            .filter(|end| *end - index <= 2_000);
+        let line_end = text[index..].find('\n').map(|end| index + end);
+        let end = row_end
+            .or(line_end)
+            .unwrap_or(index + line.len())
+            .min(text.len());
+        if markers
+            .iter()
+            .any(|marker| text[start..end].contains(marker))
+        {
+            break 'inlined_line_marked_unsupported true;
+        }
+        offset = index + line.len();
+    }
+    false
+
+}
+}
+
+} {
+        break 'inlined_web_server_support_status TechnologySupportStatus::Unsupported;
+    }
+    if matches!(
+        identifier,
+        "gunicorn" | "uvicorn" | "puma" | "passenger" | "cowboy" | "werkzeug"
+    ) {
+        break 'inlined_web_server_support_status TechnologySupportStatus::Unknown;
+    }
+    if matches!(identifier, "nginx" | "tomcat" | "jetty") {
+        break 'inlined_web_server_support_status if line_found {
+            TechnologySupportStatus::Supported
+        } else {
+            TechnologySupportStatus::Unsupported
+        };
+    }
+    let current_line =
+        latest_overall.and_then(|version| {
+let (identifier, version,): (& str, & str,) = (identifier, version,);
+let inlined_result: Option < String > = {
+'inlined_web_server_release_line: {
+
+    let numbers = match version_numbers(version) { Some(value) => value, None => break 'inlined_web_server_release_line None };
+    let count = match identifier {
+        "caddy" => 1,
+        "openresty" => 3,
+        "nginx" | "apache-httpd" | "iis" | "litespeed" | "openlitespeed" | "lighttpd"
+        | "tomcat" | "jetty" | "kestrel" => 2,
+        _ => break 'inlined_web_server_release_line None,
+    };
+    (numbers.len() >= count).then(|| {
+        numbers
+            .into_iter()
+            .take(count)
+            .map(|number| number.to_string())
+            .collect::<Vec<_>>()
+            .join(".")
+    })
+
+}
+};
+inlined_result
+});
+    if current_line.as_deref() == Some(line) {
+        TechnologySupportStatus::Supported
+    } else {
+        TechnologySupportStatus::Unsupported
+    }
+
+}
+};
+inlined_result
+};
+    Ok(WebServerRelease {
+        latest,
+        support_status,
+    })
+
+}
+};
+inlined_result
+} {
+            Ok(release) => LatestResult {
+                latest: release.latest,
+                error: None,
+                support_status: Some(release.support_status),
+            },
+            Err(error) => LatestResult {
+                latest: None,
+                error: Some(error),
+                support_status: None,
+            },
+        };
+    }
+    match {
+let (ecosystem, identifier, bytes,): (TechnologyEcosystem, & str, & [u8],) = (ecosystem, identifier, &response.body,);
+let inlined_result: Result < Option < String > , String > = {
+'inlined_parse_latest: {
+
+    match ecosystem {
+        TechnologyEcosystem::JavaScript => Ok(None),
+        TechnologyEcosystem::Npm => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "npm",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_latest Err(::core::convert::From::from(error)) };
+            let latest = {
+let (versions,): (_,) = (value
+                    .get("versions")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flat_map(|versions| versions.keys().map(String::as_str)),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+};
+            if latest.is_some() {
+                Ok(latest)
+            } else {
+                Ok(value
+                    .get("dist-tags")
+                    .and_then(|tags| tags.get("latest"))
+                    .and_then(Value::as_str)
+                    .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}))
+                    .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+}))
+            }
+        }
+        TechnologyEcosystem::Composer => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "Packagist",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_latest Err(::core::convert::From::from(error)) };
+            Ok({
+let (versions,): (_,) = (value
+                    .get("packages")
+                    .and_then(|packages| packages.get(identifier))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get("version").and_then(Value::as_str)),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        TechnologyEcosystem::WordPress if identifier == "wordpress" => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "WordPress core",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_latest Err(::core::convert::From::from(error)) };
+            Ok(value
+                .get("offers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.get("current").and_then(Value::as_str))
+                .find(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}))
+                .map(str::to_owned))
+        }
+        TechnologyEcosystem::WordPress => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "WordPress Plugin API",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_latest Err(::core::convert::From::from(error)) };
+            Ok(value
+                .get("version")
+                .and_then(Value::as_str)
+                .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}))
+                .map(str::to_owned))
+        }
+        TechnologyEcosystem::Moodle if identifier == "moodle" => {
+            let text = match std::str::from_utf8(bytes)
+                .map_err(|error| format!("invalid Moodle release page: {error}")) { Ok(value) => value, Err(error) => break 'inlined_parse_latest Err(::core::convert::From::from(error)) };
+            let pattern = Regex::new(
+                r"(?i)<strong>\s*Moodle\s+([0-9]+(?:\.[0-9]+){1,3}(?:[+A-Za-z0-9._-]*)?)\s*</strong>",
+            )
+            .expect("valid regex");
+            Ok({
+let (versions,): (_,) = (pattern
+                    .captures_iter(text)
+                    .filter_map(|captures| captures.get(1).map(|value| value.as_str()))
+                    .filter(|version| !version.contains('+')),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        TechnologyEcosystem::Moodle => Ok(None),
+        TechnologyEcosystem::PyPi => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "PyPI",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_latest Err(::core::convert::From::from(error)) };
+            Ok({
+let (versions,): (_,) = (value
+                    .get("releases")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flat_map(|releases| releases.iter())
+                    .filter(|(_, files)| {
+                        files.as_array().is_some_and(|files| {
+                            files.iter().any(|file| {
+                                !file.get("yanked").and_then(Value::as_bool).unwrap_or(false)
+                            })
+                        })
+                    })
+                    .map(|(version, _)| version.as_str()),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        TechnologyEcosystem::RubyGems => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "RubyGems",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_latest Err(::core::convert::From::from(error)) };
+            Ok({
+let (versions,): (_,) = (value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| {
+                        !item
+                            .get("prerelease")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                            && !item.get("yanked").and_then(Value::as_bool).unwrap_or(false)
+                    })
+                    .filter_map(|item| item.get("number").and_then(Value::as_str)),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        TechnologyEcosystem::MavenCentral => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "Maven Central",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_latest Err(::core::convert::From::from(error)) };
+            Ok({
+let (versions,): (_,) = (value
+                    .get("response")
+                    .and_then(|response| response.get("docs"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get("v").and_then(Value::as_str)),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        TechnologyEcosystem::NuGet => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "NuGet",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_latest Err(::core::convert::From::from(error)) };
+            Ok(value
+                .get("data")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|item| {
+                    item.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id.eq_ignore_ascii_case(identifier))
+                })
+                .and_then(|item| item.get("version"))
+                .and_then(Value::as_str)
+                .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}))
+                .map(str::to_owned))
+        }
+        TechnologyEcosystem::GoModules => {
+            let text = match std::str::from_utf8(bytes)
+                .map_err(|error| format!("invalid Go proxy response: {error}")) { Ok(value) => value, Err(error) => break 'inlined_parse_latest Err(::core::convert::From::from(error)) };
+            Ok({
+let (versions,): (_,) = (text.lines(),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        TechnologyEcosystem::CratesIo => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "crates.io",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_latest Err(::core::convert::From::from(error)) };
+            Ok({
+let (versions,): (_,) = (value
+                    .get("versions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| !item.get("yanked").and_then(Value::as_bool).unwrap_or(false))
+                    .filter_map(|item| item.get("num").and_then(Value::as_str)),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        TechnologyEcosystem::Runtime => {
+let (identifier, bytes,): (& str, & [u8],) = (identifier, bytes,);
+let inlined_result: Result < Option < String > , String > = {
+'inlined_parse_runtime_latest: {
+
+    match identifier {
+        "php" => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "PHP release",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_runtime_latest Err(error.into()) };
+            let versions = value
+                .as_object()
+                .into_iter()
+                .flat_map(|releases| releases.values())
+                .filter_map(|release| {
+                    release
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            release
+                                .get("source")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|source| source.get("name").and_then(Value::as_str))
+                                .find_map(|name| {
+                                    {
+let (text, pattern,): (& str, & str,) = (name, r"(?i)\bPHP\s+([0-9]+(?:\.[0-9]+){1,3})\b",);
+{
+'inlined_capture: {
+
+    match match Regex::new(pattern)
+        .ok() { Some(value) => value, None => break 'inlined_capture None }
+        .captures(text) { Some(value) => value, None => break 'inlined_capture None }
+        .get(1)
+        .map(|value| value.as_str().to_owned())
+
+}
+}
+
+}
+                                })
+                        })
+                })
+                .collect::<Vec<_>>();
+            Ok({
+let (versions,): (_,) = (versions.iter().map(String::as_str),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        "python" => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "Python release",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_runtime_latest Err(error.into()) };
+            Ok({
+let (versions,): (_,) = (value
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .or_else(|| value.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get("name").and_then(Value::as_str))
+                    .filter_map(|name| name.strip_prefix("Python ")),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        "ruby" => {
+            let text = match std::str::from_utf8(bytes)
+                .map_err(|error| format!("invalid Ruby release feed: {error}")) { Ok(value) => value, Err(error) => break 'inlined_parse_runtime_latest Err(error.into()) };
+            let pattern = Regex::new(r"ruby-([0-9]+(?:\.[0-9]+){1,3}(?:-[A-Za-z0-9.]+)?)")
+                .expect("valid regex");
+            Ok({
+let (versions,): (_,) = (pattern.captures_iter(text).filter_map(
+                |captures| captures.get(1).map(|value| value.as_str()),
+            ),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        "java" => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "OpenJDK release",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_runtime_latest Err(error.into()) };
+            Ok(value
+                .get("most_recent_feature_release")
+                .and_then(Value::as_u64)
+                .map(|version| version.to_string()))
+        }
+        "dotnet" => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, ".NET release",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_runtime_latest Err(error.into()) };
+            Ok({
+let (versions,): (_,) = (value
+                    .get("releases-index")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get("latest-release").and_then(Value::as_str)),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        "go" => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "Go release",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_runtime_latest Err(error.into()) };
+            Ok({
+let (versions,): (_,) = (value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| item.get("stable").and_then(Value::as_bool).unwrap_or(false))
+                    .filter_map(|item| item.get("version").and_then(Value::as_str))
+                    .filter_map(|version| version.strip_prefix("go")),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        "rust" => {
+            let text = match std::str::from_utf8(bytes)
+                .map_err(|error| format!("invalid Rust release feed: {error}")) { Ok(value) => value, Err(error) => break 'inlined_parse_runtime_latest Err(error.into()) };
+            Ok(({
+let (text, pattern,): (& str, & str,) = (text, r#"(?ms)^\[pkg\.rust\]\s+version\s*=\s*[\"']([0-9]+(?:\.[0-9]+){1,3})"#,);
+{
+'inlined_capture: {
+
+    match match Regex::new(pattern)
+        .ok() { Some(value) => value, None => break 'inlined_capture None }
+        .captures(text) { Some(value) => value, None => break 'inlined_capture None }
+        .get(1)
+        .map(|value| value.as_str().to_owned())
+
+}
+}
+
+})
+            .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+})))
+        }
+        "node" => {
+            let value = match {
+let (bytes, source,): (& [u8], & str,) = (bytes, "Node.js release",);
+let inlined_result: Result < Value , String > = {
+
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
+
+};
+inlined_result
+} { Ok(value) => value, Err(error) => break 'inlined_parse_runtime_latest Err(error.into()) };
+            Ok({
+let (versions,): (_,) = (value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get("version").and_then(Value::as_str)),);
+{
+
+    versions
+        .filter(|version| !({
+let (version,): (& str,) = (version,);
+{
+'inlined_is_prerelease: {
+
+    if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+    PRERELEASE_PATTERN.is_match(version)
+
+}
+}
+
+}) && version_numbers(version).is_some())
+        .max_by(|left, right| ({
+let (left, right,): (& str, & str,) = (left, right,);
+{
+'inlined_compare_version_values: {
+
+    Some({
+let (left, right,): (& [u64], & [u64],) = (&match version_numbers(left) { Some(value) => value, None => break 'inlined_compare_version_values None }, &match version_numbers(right) { Some(value) => value, None => break 'inlined_compare_version_values None },);
+let inlined_result: Ordering = {
+
+    let length = left.len().max(right.len()).max(3);
+    (0..length)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&right.get(index).copied().unwrap_or(0))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+
+};
+inlined_result
+})
+
+}
+}
+
+}).unwrap_or(Ordering::Equal))
+        .map(|value: & str| {
+    ({
+let (value,): (& str,) = (value,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+}).to_owned()
+})
+
+}
+
+})
+        }
+        _ => Ok(None),
+    }
+
+}
+};
+inlined_result
+},
+        TechnologyEcosystem::WebServer => Ok(None),
+    }
+
+}
+};
+inlined_result
+} {
+        Ok(latest) => LatestResult {
+            latest,
+            error: None,
+            support_status: None,
+        },
+        Err(error) => LatestResult {
+            latest: None,
+            error: Some(error),
+            support_status: None,
+        },
+    }
+
+}
+};
+inlined_result
+})
+                .unwrap_or_else(|| LatestResult {
+                    latest: None,
+                    error: Some(javascript::METADATA_LIMIT_ERROR.to_owned()),
+                    support_status: None,
+                }),
+            None => LatestResult {
+                latest: None,
+                error: Some("No release source is configured for this component".to_owned()),
+                support_status: None,
+            },
+        };
+        cache.insert(key, result);
+        metadata_completed += 1;
+        if !cancel.is_cancelled() {
+            ({
+let (progress, fraction, text,): (& Option < Sender < ExposureScanProgress > >, f32, String,) = (progress, 0.25 + 0.55 * metadata_completed as f32 / metadata_total.max(1) as f32, format!("Parsed {metadata_completed} / {metadata_total} metadata records"),);
+
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::TechnologyAnalysis,
+        ExposureScanPhaseState::Running,
+        fraction,
+        text,
+    );
+
+});
+        }
+    }
+    if !cancel.is_cancelled() {
+        ({
+let (progress, fraction, text,): (& Option < Sender < ExposureScanProgress > >, f32, String,) = (progress, 0.80, "Metadata lookups complete".to_owned(),);
+
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::TechnologyAnalysis,
+        ExposureScanPhaseState::Running,
+        fraction,
+        text,
+    );
+
+});
+    }
+
+}
+})
     .await;
 
     let mut warning_groups = BTreeMap::<(TechnologyEcosystem, String), HashSet<String>>::new();
@@ -447,9 +6439,56 @@ pub(super) async fn analyze(
                 let installed = component.installed_version.clone().unwrap_or_default();
                 let identifier = component.package_identifier.clone().unwrap_or_default();
                 let lookup_identifier = if component.ecosystem == TechnologyEcosystem::WebServer {
-                    web_server_cache_identifier(&identifier, &installed)
+                    {
+                        let (identifier, installed): (&str, &str) = (&identifier, &installed);
+                        {
+                            let line = ({
+                                let (identifier, version): (&str, &str) = (identifier, installed);
+                                let inlined_result: Option<String> = {
+                                    'inlined_web_server_release_line: {
+                                        let numbers = match version_numbers(version) {
+                                            Some(value) => value,
+                                            None => break 'inlined_web_server_release_line None,
+                                        };
+                                        let count = match identifier {
+                                            "caddy" => 1,
+                                            "openresty" => 3,
+                                            "nginx" | "apache-httpd" | "iis" | "litespeed"
+                                            | "openlitespeed" | "lighttpd" | "tomcat" | "jetty"
+                                            | "kestrel" => 2,
+                                            _ => break 'inlined_web_server_release_line None,
+                                        };
+                                        (numbers.len() >= count).then(|| {
+                                            numbers
+                                                .into_iter()
+                                                .take(count)
+                                                .map(|number| number.to_string())
+                                                .collect::<Vec<_>>()
+                                                .join(".")
+                                        })
+                                    }
+                                };
+                                inlined_result
+                            })
+                            .unwrap_or_else(|| "all".to_owned());
+                            format!("{}@{}", identifier.to_ascii_lowercase(), line)
+                        }
+                    }
                 } else {
-                    registry_cache_identifier(component.ecosystem, &identifier)
+                    {
+                        let (ecosystem, identifier): (TechnologyEcosystem, &str) =
+                            (component.ecosystem, &identifier);
+                        {
+                            if matches!(
+                                ecosystem,
+                                TechnologyEcosystem::MavenCentral | TechnologyEcosystem::GoModules
+                            ) {
+                                identifier.to_owned()
+                            } else {
+                                identifier.to_ascii_lowercase()
+                            }
+                        }
+                    }
                 };
                 let result = cache
                     .get(&(component.ecosystem, lookup_identifier))
@@ -464,7 +6503,280 @@ pub(super) async fn analyze(
                         ),
                         support_status: None,
                     });
-                apply_latest_result(component, &installed, result);
+                ({
+                    let (component, installed, result): (
+                        &mut TechnologyComponent,
+                        &str,
+                        LatestResult,
+                    ) = (component, &installed, result);
+
+                    component.latest_version = result.latest;
+                    if component.ecosystem == TechnologyEcosystem::WebServer {
+                        component.support_status = result
+                            .support_status
+                            .unwrap_or(TechnologySupportStatus::NotChecked);
+                    }
+                    if let Some(error) = result.error {
+                        component.status = TechnologyVersionStatus::NotChecked;
+                        component.check_error = Some(error);
+                    } else if let Some(latest) = component.latest_version.as_deref() {
+                        component.status = {
+                            let (ecosystem, installed, latest): (TechnologyEcosystem, &str, &str) =
+                                (component.ecosystem, installed, latest);
+                            let inlined_result: TechnologyVersionStatus = {
+                                'inlined_compare_versions: {
+                                    if ({
+                                        let (version,): (&str,) = (installed,);
+                                        {
+                                            'inlined_is_prerelease: {
+                                                if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+                                                PRERELEASE_PATTERN.is_match(version)
+                                            }
+                                        }
+                                    }) || ({
+                                        let (version,): (&str,) = (latest,);
+                                        {
+                                            'inlined_is_prerelease: {
+                                                if ({
+let (version,): (& str,) = (version,);
+{
+'inlined_parse_semver_flexible: {
+
+    let normalized = {
+let (value,): (& str,) = (version,);
+let inlined_result: & str = {
+
+    value
+        .trim()
+        .trim_start_matches('=')
+        .trim_start()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches("+incompatible")
+
+};
+inlined_result
+};
+    if let Ok(version) = Version::parse(normalized) {
+        break 'inlined_parse_semver_flexible Some(version);
+    }
+    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
+    let (core, suffix) = normalized.split_at(split);
+    let dots = core.chars().filter(|character| *character == '.').count();
+    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+    Version::parse(&padded).ok()
+
+}
+}
+
+}).is_some_and(|version| !version.pre.is_empty()) {
+        break 'inlined_is_prerelease true;
+    }
+                                                PRERELEASE_PATTERN.is_match(version)
+                                            }
+                                        }
+                                    }) {
+                                        break 'inlined_compare_versions TechnologyVersionStatus::Prerelease;
+                                    }
+                                    if matches!(
+                                        ecosystem,
+                                        TechnologyEcosystem::Npm
+                                            | TechnologyEcosystem::NuGet
+                                            | TechnologyEcosystem::GoModules
+                                            | TechnologyEcosystem::CratesIo
+                                    ) && let (Some(installed), Some(latest)) = (
+                                        ({
+                                            let (version,): (&str,) = (installed,);
+                                            {
+                                                'inlined_parse_semver_flexible: {
+                                                    let normalized = {
+                                                        let (value,): (&str,) = (version,);
+                                                        let inlined_result: &str = {
+                                                            value
+                                                                .trim()
+                                                                .trim_start_matches('=')
+                                                                .trim_start()
+                                                                .trim_start_matches(['v', 'V'])
+                                                                .trim_end_matches("+incompatible")
+                                                        };
+                                                        inlined_result
+                                                    };
+                                                    if let Ok(version) = Version::parse(normalized)
+                                                    {
+                                                        break 'inlined_parse_semver_flexible Some(
+                                                            version,
+                                                        );
+                                                    }
+                                                    let split = normalized
+                                                        .find(['-', '+'])
+                                                        .unwrap_or(normalized.len());
+                                                    let (core, suffix) = normalized.split_at(split);
+                                                    let dots = core
+                                                        .chars()
+                                                        .filter(|character| *character == '.')
+                                                        .count();
+                                                    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+                                                    Version::parse(&padded).ok()
+                                                }
+                                            }
+                                        }),
+                                        ({
+                                            let (version,): (&str,) = (latest,);
+                                            {
+                                                'inlined_parse_semver_flexible: {
+                                                    let normalized = {
+                                                        let (value,): (&str,) = (version,);
+                                                        let inlined_result: &str = {
+                                                            value
+                                                                .trim()
+                                                                .trim_start_matches('=')
+                                                                .trim_start()
+                                                                .trim_start_matches(['v', 'V'])
+                                                                .trim_end_matches("+incompatible")
+                                                        };
+                                                        inlined_result
+                                                    };
+                                                    if let Ok(version) = Version::parse(normalized)
+                                                    {
+                                                        break 'inlined_parse_semver_flexible Some(
+                                                            version,
+                                                        );
+                                                    }
+                                                    let split = normalized
+                                                        .find(['-', '+'])
+                                                        .unwrap_or(normalized.len());
+                                                    let (core, suffix) = normalized.split_at(split);
+                                                    let dots = core
+                                                        .chars()
+                                                        .filter(|character| *character == '.')
+                                                        .count();
+                                                    let padded = match dots {
+        0 => format!("{core}.0.0{suffix}"),
+        1 => format!("{core}.0{suffix}"),
+        _ => break 'inlined_parse_semver_flexible None,
+    };
+                                                    Version::parse(&padded).ok()
+                                                }
+                                            }
+                                        }),
+                                    ) {
+                                        break 'inlined_compare_versions match installed.cmp(&latest)
+                                        {
+                                            Ordering::Equal => TechnologyVersionStatus::Current,
+                                            Ordering::Greater => {
+                                                TechnologyVersionStatus::NewerThanLatest
+                                            }
+                                            Ordering::Less if installed.major != latest.major => {
+                                                TechnologyVersionStatus::OutdatedMajor
+                                            }
+                                            Ordering::Less if installed.minor != latest.minor => {
+                                                TechnologyVersionStatus::OutdatedMinor
+                                            }
+                                            Ordering::Less => {
+                                                TechnologyVersionStatus::OutdatedPatch
+                                            }
+                                        };
+                                    }
+                                    let Some(installed_parts) = version_numbers(installed) else {
+                                        break 'inlined_compare_versions TechnologyVersionStatus::Unverifiable;
+                                    };
+                                    let Some(latest_parts) = version_numbers(latest) else {
+                                        break 'inlined_compare_versions TechnologyVersionStatus::Unverifiable;
+                                    };
+                                    match {
+                                        let (left, right): (&[u64], &[u64]) =
+                                            (&installed_parts, &latest_parts);
+                                        let inlined_result: Ordering = {
+                                            let length = left.len().max(right.len()).max(3);
+                                            (0..length)
+                                                .map(|index| {
+                                                    left.get(index).copied().unwrap_or(0).cmp(
+                                                        &right.get(index).copied().unwrap_or(0),
+                                                    )
+                                                })
+                                                .find(|ordering| *ordering != Ordering::Equal)
+                                                .unwrap_or(Ordering::Equal)
+                                        };
+                                        inlined_result
+                                    } {
+                                        Ordering::Equal => TechnologyVersionStatus::Current,
+                                        Ordering::Greater => {
+                                            TechnologyVersionStatus::NewerThanLatest
+                                        }
+                                        Ordering::Less
+                                            if installed_parts.first().copied().unwrap_or(0)
+                                                != latest_parts.first().copied().unwrap_or(0) =>
+                                        {
+                                            TechnologyVersionStatus::OutdatedMajor
+                                        }
+                                        Ordering::Less
+                                            if installed_parts.get(1).copied().unwrap_or(0)
+                                                != latest_parts.get(1).copied().unwrap_or(0) =>
+                                        {
+                                            TechnologyVersionStatus::OutdatedMinor
+                                        }
+                                        Ordering::Less => TechnologyVersionStatus::OutdatedPatch,
+                                    }
+                                }
+                            };
+                            inlined_result
+                        };
+                        if component.status == TechnologyVersionStatus::Unverifiable {
+                            component.check_error = Some(
+                                "Installed or latest version is not an exact comparable version"
+                                    .to_owned(),
+                            );
+                        }
+                    } else {
+                        component.status = TechnologyVersionStatus::NotChecked;
+                        component.check_error =
+                            Some("Registry returned no stable release".to_owned());
+                    }
+                });
             }
             if component.status == TechnologyVersionStatus::NotChecked
                 && component.installed_version.is_some()
@@ -478,11 +6790,26 @@ pub(super) async fn analyze(
             }
             application_completed += 1;
             if !cancel.is_cancelled() {
-                send_technology_progress(
-                    progress,
-                    0.80 + 0.20 * application_completed as f32 / application_total.max(1) as f32,
-                    format!("Applied {application_completed} / {application_total} results"),
-                );
+                ({
+                    let (progress, fraction, text): (
+                        &Option<Sender<ExposureScanProgress>>,
+                        f32,
+                        String,
+                    ) = (
+                        progress,
+                        0.80 + 0.20 * application_completed as f32
+                            / application_total.max(1) as f32,
+                        format!("Applied {application_completed} / {application_total} results"),
+                    );
+
+                    send_phase_progress(
+                        progress,
+                        ExposureScanPhase::TechnologyAnalysis,
+                        ExposureScanPhaseState::Running,
+                        fraction,
+                        text,
+                    );
+                });
             }
         }
         endpoint.technology_components.sort_by(|left, right| {
@@ -511,355 +6838,154 @@ pub(super) async fn analyze(
         );
     }
     AnalysisReport {
-        findings: outdated_findings(endpoints),
-        warnings,
-    }
-}
+        findings: ({
+            let (endpoints,): (&[EndpointScan],) = (endpoints,);
+            let inlined_result: Vec<ExposureFinding> = {
+                let mut findings = BTreeMap::new();
+                for endpoint in endpoints {
+                    for component in &endpoint.technology_components {
+                        if component.support_status == TechnologySupportStatus::Unsupported
+                            && let Some(installed) = component.installed_version.as_deref()
+                        {
+                            let title = format!(
+                                "Unsupported technology release line: {} {installed}",
+                                component.name
+                            );
+                            let mut evidence = component
+                                .evidence_urls
+                                .iter()
+                                .map(|url| format!("Affected resource: {url}"))
+                                .collect::<Vec<_>>();
+                            if let Some(source) = &component.release_source_url {
+                                evidence
+                                    .push(format!("Upstream lifecycle/release source: {source}"));
+                            }
+                            evidence.sort();
+                            evidence.dedup();
+                            let candidate = ExposureFinding {
+                                title,
+                                description: format!(
+                                    "Upstream release metadata designates the detected {} release line as legacy, end-of-life, or outside the currently supported line",
+                                    component.name
+                                ),
+                                ip: endpoint.ip,
+                                port: endpoint.port,
+                                transport: endpoint.transport,
+                                evidence,
+                                component_kind: Some(component.kind),
+                            };
+                            ({
+                                let (findings, finding): (
+                                    &mut BTreeMap<
+                                        (IpAddr, u16, TransportProtocol, String),
+                                        ExposureFinding,
+                                    >,
+                                    ExposureFinding,
+                                ) = (&mut findings, candidate);
 
-fn lookup_priority(component: &TechnologyComponent, identifier: &str) -> (u8, u8, String) {
-    let preferred = matches!(
-        component.kind,
-        TechnologyComponentKind::Server
-            | TechnologyComponentKind::Runtime
-            | TechnologyComponentKind::Framework
-            | TechnologyComponentKind::Cms
-    );
-    let high = component.confidence == Confidence::High;
-    let group = match (high, preferred) {
-        (true, true) => 0,
-        (true, false) => 1,
-        (false, true) => 2,
-        (false, false) => 3,
-    };
-    let kind = match component.kind {
-        TechnologyComponentKind::Server => 0,
-        TechnologyComponentKind::Runtime => 1,
-        TechnologyComponentKind::Framework => 2,
-        TechnologyComponentKind::Cms => 3,
-        TechnologyComponentKind::Plugin => 4,
-        TechnologyComponentKind::Package => 5,
-    };
-    (group, kind, identifier.to_owned())
-}
+                                let key = (
+                                    finding.ip,
+                                    finding.port,
+                                    finding.transport,
+                                    finding.title.clone(),
+                                );
+                                if let Some(existing) = findings.get_mut(&key) {
+                                    existing.evidence.extend(finding.evidence);
+                                    existing.evidence.sort();
+                                    existing.evidence.dedup();
+                                } else {
+                                    findings.insert(key, finding);
+                                }
+                            });
+                        }
+                        if !matches!(
+                            component.status,
+                            TechnologyVersionStatus::OutdatedPatch
+                                | TechnologyVersionStatus::OutdatedMinor
+                                | TechnologyVersionStatus::OutdatedMajor
+                        ) {
+                            continue;
+                        }
+                        let (Some(installed), Some(latest)) = (
+                            component.installed_version.as_deref(),
+                            component.latest_version.as_deref(),
+                        ) else {
+                            continue;
+                        };
+                        let difference = match component.status {
+                            TechnologyVersionStatus::OutdatedPatch => "Patch",
+                            TechnologyVersionStatus::OutdatedMinor => "Minor",
+                            TechnologyVersionStatus::OutdatedMajor => "Major",
+                            _ => unreachable!(),
+                        };
+                        let title = format!(
+                            "Outdated component: {} {installed} - {latest} ({difference} Difference)",
+                            component.name,
+                        );
+                        let mut evidence = component
+                            .evidence_urls
+                            .iter()
+                            .map(|url| format!("Affected resource: {url}"))
+                            .collect::<Vec<_>>();
+                        if let Some(source) = &component.release_source_url {
+                            evidence.push(format!("Upstream release source: {source}"));
+                        }
+                        evidence.sort();
+                        evidence.dedup();
+                        let candidate = ExposureFinding {
+                            title,
+                            description: format!(
+                                "Installed {} {} is behind the newest stable {} release {} ({} difference)",
+                                component.name,
+                                installed,
+                                component.ecosystem,
+                                latest,
+                                difference.to_ascii_lowercase()
+                            ),
+                            ip: endpoint.ip,
+                            port: endpoint.port,
+                            transport: endpoint.transport,
+                            evidence,
+                            component_kind: Some(component.kind),
+                        };
+                        ({
+                            let (findings, finding): (
+                                &mut BTreeMap<
+                                    (IpAddr, u16, TransportProtocol, String),
+                                    ExposureFinding,
+                                >,
+                                ExposureFinding,
+                            ) = (&mut findings, candidate);
 
-async fn fetch_lookup_jobs(
-    jobs: HashMap<(TechnologyEcosystem, String), LookupJob>,
-    cache: &mut HashMap<(TechnologyEcosystem, String), LatestResult>,
-    request: &ExposureScanRequest,
-    cancel: &CancellationToken,
-    limiter: &ConnectionRateLimiter,
-    enrichment: &mut javascript::EnrichmentState,
-    progress: &Option<Sender<ExposureScanProgress>>,
-) {
-    enrichment.start();
-    let mut jobs = jobs.into_iter().collect::<Vec<_>>();
-    jobs.sort_by(|left, right| {
-        left.1
-            .priority
-            .cmp(&right.1.priority)
-            .then(left.0.cmp(&right.0))
-    });
-    let mut fetched = HashMap::new();
-    let mut requests = HashMap::<String, ((u8, u8, String), String)>::new();
-    for (_, job) in &jobs {
-        let Some(url) = registry_url(job.ecosystem, &job.identifier) else {
-            continue;
-        };
-        if let Some(result) = enrichment.cached(&url) {
-            fetched.insert(url, result);
-            continue;
-        }
-        let accept = registry_accept(job.ecosystem, &job.identifier).to_owned();
-        requests
-            .entry(url)
-            .and_modify(|existing| {
-                if job.priority < existing.0 {
-                    *existing = (job.priority.clone(), accept.clone());
+                            let key = (
+                                finding.ip,
+                                finding.port,
+                                finding.transport,
+                                finding.title.clone(),
+                            );
+                            if let Some(existing) = findings.get_mut(&key) {
+                                existing.evidence.extend(finding.evidence);
+                                existing.evidence.sort();
+                                existing.evidence.dedup();
+                            } else {
+                                findings.insert(key, finding);
+                            }
+                        });
+                    }
                 }
-            })
-            .or_insert_with(|| (job.priority.clone(), accept));
-    }
-    let mut requests = requests.into_iter().collect::<Vec<_>>();
-    requests.sort_by(|left, right| left.1.0.cmp(&right.1.0).then(left.0.cmp(&right.0)));
-    let metadata_total = requests.len() + jobs.len();
-    let mut metadata_completed = 0usize;
-    send_technology_progress(
-        progress,
-        0.25,
-        format!("Checking {metadata_total} metadata records"),
-    );
-
-    let context = enrichment.fetch_context();
-    let mut pending = FuturesUnordered::new();
-    let mut next = 0usize;
-    let mut reserved = 0usize;
-    while next < requests.len() || !pending.is_empty() {
-        while pending.len() < MAX_CONCURRENT_VERSION_FETCHES && next < requests.len() {
-            if enrichment.stop_error(cancel).is_some() {
-                break;
-            }
-            let available = enrichment.remaining_bytes().saturating_sub(reserved);
-            if available == 0 {
-                break;
-            }
-            let body_limit = MAX_METADATA_BYTES.min(available);
-            let (url, (_, accept)) = requests[next].clone();
-            next += 1;
-            if !cancel.is_cancelled() {
-                send_technology_progress(
-                    progress,
-                    0.25 + 0.55 * metadata_completed as f32 / metadata_total.max(1) as f32,
-                    format!("Fetching technology metadata: {url}"),
-                );
-            }
-            reserved += body_limit;
-            let context = context.clone();
-            pending.push(async move {
-                let headers = [("Accept", accept.as_str())];
-                let result = javascript::fetch_metadata_url(
-                    &url, body_limit, &headers, request, cancel, limiter, context,
-                )
-                .await;
-                (url, body_limit, result)
-            });
-        }
-        let Some((url, body_limit, result)) = pending.next().await else {
-            break;
-        };
-        reserved = reserved.saturating_sub(body_limit);
-        enrichment.store(url.clone(), result.clone());
-        fetched.insert(url, result);
-        metadata_completed += 1;
-        if !cancel.is_cancelled() {
-            send_technology_progress(
-                progress,
-                0.25 + 0.55 * metadata_completed as f32 / metadata_total.max(1) as f32,
-                format!("Fetched {metadata_completed} / {metadata_total} metadata records"),
-            );
-        }
-    }
-    if next < requests.len() {
-        let error = enrichment
-            .stop_error(cancel)
-            .unwrap_or(javascript::METADATA_LIMIT_ERROR)
-            .to_owned();
-        for (url, _) in &requests[next..] {
-            fetched.insert(url.clone(), metadata_error(url, &error));
-        }
-        metadata_completed += requests.len() - next;
-    }
-
-    for (key, job) in jobs {
-        let result = match registry_url(job.ecosystem, &job.identifier) {
-            Some(url) => fetched
-                .get(&url)
-                .cloned()
-                .map(|fetched| latest_result(job.ecosystem, &job.identifier, fetched))
-                .unwrap_or_else(|| LatestResult {
-                    latest: None,
-                    error: Some(javascript::METADATA_LIMIT_ERROR.to_owned()),
-                    support_status: None,
-                }),
-            None => LatestResult {
-                latest: None,
-                error: Some("No release source is configured for this component".to_owned()),
-                support_status: None,
-            },
-        };
-        cache.insert(key, result);
-        metadata_completed += 1;
-        if !cancel.is_cancelled() {
-            send_technology_progress(
-                progress,
-                0.25 + 0.55 * metadata_completed as f32 / metadata_total.max(1) as f32,
-                format!("Parsed {metadata_completed} / {metadata_total} metadata records"),
-            );
-        }
-    }
-    if !cancel.is_cancelled() {
-        send_technology_progress(progress, 0.80, "Metadata lookups complete".to_owned());
-    }
-}
-
-fn send_technology_progress(
-    progress: &Option<Sender<ExposureScanProgress>>,
-    fraction: f32,
-    text: String,
-) {
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::TechnologyAnalysis,
-        ExposureScanPhaseState::Running,
-        fraction,
-        text,
-    );
-}
-
-fn metadata_error(url: &str, error: &str) -> javascript::Fetched {
-    javascript::Fetched {
-        final_url: Url::parse(url).ok(),
-        response: None,
-        error: Some(error.to_owned()),
-        captured_bytes: 0,
-    }
-}
-
-fn apply_latest_result(component: &mut TechnologyComponent, installed: &str, result: LatestResult) {
-    component.latest_version = result.latest;
-    if component.ecosystem == TechnologyEcosystem::WebServer {
-        component.support_status = result
-            .support_status
-            .unwrap_or(TechnologySupportStatus::NotChecked);
-    }
-    if let Some(error) = result.error {
-        component.status = TechnologyVersionStatus::NotChecked;
-        component.check_error = Some(error);
-    } else if let Some(latest) = component.latest_version.as_deref() {
-        component.status = compare_versions(component.ecosystem, installed, latest);
-        if component.status == TechnologyVersionStatus::Unverifiable {
-            component.check_error =
-                Some("Installed or latest version is not an exact comparable version".to_owned());
-        }
-    } else {
-        component.status = TechnologyVersionStatus::NotChecked;
-        component.check_error = Some("Registry returned no stable release".to_owned());
-    }
-}
-
-fn import_javascript_components(endpoint: &mut EndpointScan) {
-    let mut components = Vec::new();
-    for source in &endpoint.javascript_sources {
-        for library in &source.libraries {
-            let ecosystem = if library.npm_package.is_some() {
-                TechnologyEcosystem::Npm
-            } else {
-                TechnologyEcosystem::JavaScript
-            };
-            components.push(TechnologyComponent {
-                name: library.name.clone(),
-                ecosystem,
-                kind: known_kind(
-                    ecosystem,
-                    library.npm_package.as_deref().unwrap_or(&library.name),
-                ),
-                package_identifier: library.npm_package.clone(),
-                installed_version: library.installed_version.clone(),
-                latest_version: library.latest_version.clone(),
-                status: if library.installed_version.is_some() {
-                    library.status
-                } else {
-                    TechnologyVersionStatus::InventoryOnly
-                },
-                support_status: TechnologySupportStatus::NotApplicable,
-                confidence: if library.installed_version.is_some() {
-                    Confidence::High
-                } else {
-                    Confidence::Medium
-                },
-                release_source_url: None,
-                evidence_urls: vec![source.source_url.clone()],
-                evidence: library.evidence.clone(),
-                check_error: library
-                    .installed_version
-                    .is_some()
-                    .then(|| library.check_error.clone())
-                    .flatten(),
-            });
-        }
-    }
-    for component in components {
-        merge_component(&mut endpoint.technology_components, component);
-    }
-}
-
-fn seed_javascript_cache(
-    endpoints: &[EndpointScan],
-    cache: &mut HashMap<(TechnologyEcosystem, String), LatestResult>,
-) {
-    for component in endpoints
-        .iter()
-        .flat_map(|endpoint| &endpoint.technology_components)
-    {
-        if component.ecosystem != TechnologyEcosystem::Npm {
-            continue;
-        }
-        let Some(identifier) = component.package_identifier.clone() else {
-            continue;
-        };
-        if component.latest_version.is_some() || component.check_error.is_some() {
-            cache
-                .entry((
-                    component.ecosystem,
-                    registry_cache_identifier(component.ecosystem, &identifier),
-                ))
-                .or_insert_with(|| LatestResult {
-                    latest: component.latest_version.clone(),
-                    error: component.check_error.clone(),
-                    support_status: None,
+                let mut findings = findings.into_values().collect::<Vec<_>>();
+                findings.sort_by(|left, right| {
+                    left.ip
+                        .cmp(&right.ip)
+                        .then(left.port.cmp(&right.port))
+                        .then(left.transport.cmp(&right.transport))
+                        .then(left.title.cmp(&right.title))
                 });
-        }
-    }
-}
-
-fn registry_cache_identifier(ecosystem: TechnologyEcosystem, identifier: &str) -> String {
-    if matches!(
-        ecosystem,
-        TechnologyEcosystem::MavenCentral | TechnologyEcosystem::GoModules
-    ) {
-        identifier.to_owned()
-    } else {
-        identifier.to_ascii_lowercase()
-    }
-}
-
-fn merge_component(components: &mut Vec<TechnologyComponent>, mut incoming: TechnologyComponent) {
-    let identity = |component: &TechnologyComponent| {
-        component
-            .package_identifier
-            .as_deref()
-            .unwrap_or(&component.name)
-            .to_ascii_lowercase()
-    };
-    let incoming_identity = identity(&incoming);
-    let matching = components.iter_mut().find(|existing| {
-        existing.ecosystem == incoming.ecosystem
-            && identity(existing) == incoming_identity
-            && (existing.installed_version == incoming.installed_version
-                || existing.installed_version.is_none()
-                || incoming.installed_version.is_none())
-    });
-    if let Some(existing) = matching {
-        if existing.installed_version.is_none() && incoming.installed_version.is_some() {
-            existing.installed_version = incoming.installed_version.take();
-            existing.status = incoming.status;
-        }
-        if existing.latest_version.is_none() {
-            existing.latest_version = incoming.latest_version;
-        }
-        if existing.package_identifier.is_none() {
-            existing.package_identifier = incoming.package_identifier;
-        }
-        if existing.support_status == TechnologySupportStatus::NotApplicable
-            || existing.support_status == TechnologySupportStatus::Unknown
-        {
-            existing.support_status = incoming.support_status;
-        }
-        if existing.release_source_url.is_none() {
-            existing.release_source_url = incoming.release_source_url;
-        }
-        existing.confidence = existing.confidence.max(incoming.confidence);
-        existing.evidence_urls.extend(incoming.evidence_urls);
-        existing.evidence.extend(incoming.evidence);
-        existing.evidence_urls.sort();
-        existing.evidence_urls.dedup();
-        existing.evidence.sort();
-        existing.evidence.dedup();
-    } else {
-        incoming.evidence_urls.sort();
-        incoming.evidence_urls.dedup();
-        incoming.evidence.sort();
-        incoming.evidence.dedup();
-        components.push(incoming);
+                findings
+            };
+            inlined_result
+        }),
+        warnings,
     }
 }
 
@@ -877,7 +7003,25 @@ fn component(
         ecosystem,
         kind: known_kind(ecosystem, identifier.unwrap_or(name)),
         package_identifier: identifier.map(str::to_owned),
-        installed_version: exact.then(|| version.map(normalize_version)).flatten(),
+        installed_version: exact
+            .then(|| {
+                version.map(|value: &str| {
+                    ({
+                        let (value,): (&str,) = (value,);
+                        let inlined_result: &str = {
+                            value
+                                .trim()
+                                .trim_start_matches('=')
+                                .trim_start()
+                                .trim_start_matches(['v', 'V'])
+                                .trim_end_matches("+incompatible")
+                        };
+                        inlined_result
+                    })
+                    .to_owned()
+                })
+            })
+            .flatten(),
         latest_version: None,
         status: if exact && version.is_some() {
             TechnologyVersionStatus::Unknown
@@ -995,121 +7139,6 @@ fn known_kind(ecosystem: TechnologyEcosystem, identifier: &str) -> TechnologyCom
     }
 }
 
-fn parse_resource(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    if resource.truncated {
-        return Vec::new();
-    }
-    let path = Url::parse(&resource.fetch_url)
-        .ok()
-        .map(|url| url.path().to_ascii_lowercase())
-        .unwrap_or_else(|| resource.fetch_url.to_ascii_lowercase());
-    let name = path.rsplit('/').next().unwrap_or(&path);
-    match name {
-        "package.json" | "composer.json" => parse_dependency_manifest(resource, name),
-        "package-lock.json" | "npm-shrinkwrap.json" => parse_package_lock(resource),
-        "yarn.lock" => parse_yarn_lock(resource),
-        "composer.lock" => parse_composer_lock(resource),
-        "requirements.txt" | "pipfile" => parse_python_inventory(resource),
-        "pyproject.toml" => parse_pyproject(resource),
-        "pipfile.lock" => parse_pipfile_lock(resource),
-        "poetry.lock" | "uv.lock" => parse_toml_package_lock(resource, TechnologyEcosystem::PyPi),
-        "gemfile" => parse_gemfile(resource),
-        "pom.xml" => parse_pom(resource),
-        "pnpm-lock.yaml" | "gemfile.lock" | "build.gradle" | "build.gradle.kts"
-        | "gradle.lockfile" | "go.mod" => parse_regex_inventory(resource, name),
-        "packages.config" => parse_nuget_xml(resource, true),
-        "directory.packages.props" => parse_nuget_xml(resource, false),
-        "packages.lock.json" => parse_nuget_lock(resource),
-        "go.sum" => parse_go_sum(resource),
-        "cargo.toml" => parse_cargo_manifest(resource),
-        "cargo.lock" => parse_toml_package_lock(resource, TechnologyEcosystem::CratesIo),
-        _ => Vec::new(),
-    }
-}
-
-fn parse_dependency_manifest(
-    resource: &CapturedTechnologyResource,
-    manifest: &str,
-) -> Vec<TechnologyComponent> {
-    let Ok(value) = serde_json::from_slice::<Value>(&resource.body) else {
-        return Vec::new();
-    };
-    let Some(root) = value.as_object() else {
-        return Vec::new();
-    };
-    let (ecosystem, sections): (_, &[&str]) = match manifest {
-        "composer.json" => (TechnologyEcosystem::Composer, &["require", "require-dev"]),
-        _ => (
-            TechnologyEcosystem::Npm,
-            &["dependencies", "devDependencies", "peerDependencies"],
-        ),
-    };
-    sections
-        .iter()
-        .copied()
-        .filter_map(|key| {
-            root.get(key)
-                .and_then(Value::as_object)
-                .map(|map| (key, map))
-        })
-        .flat_map(|(key, dependencies)| {
-            dependencies.iter().filter_map(move |(name, value)| {
-                if ecosystem == TechnologyEcosystem::Composer
-                    && (name == "php" || name.starts_with("ext-"))
-                {
-                    return None;
-                }
-                let requested = value.as_str()?;
-                Some(component(
-                    name,
-                    ecosystem,
-                    Some(name),
-                    Some(requested),
-                    false,
-                    &resource.url,
-                    format!("{manifest} {key} requests {requested}"),
-                ))
-            })
-        })
-        .collect()
-}
-
-fn parse_package_lock(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let Ok(value) = serde_json::from_slice::<Value>(&resource.body) else {
-        return Vec::new();
-    };
-    let Some(root) = value.as_object() else {
-        return Vec::new();
-    };
-    let mut found = Vec::new();
-    if let Some(packages) = root.get("packages").and_then(Value::as_object) {
-        for (path, item) in packages {
-            let Some(name) = path
-                .rsplit("node_modules/")
-                .next()
-                .filter(|name| !name.is_empty())
-            else {
-                continue;
-            };
-            let Some(version) = item.get("version").and_then(Value::as_str) else {
-                continue;
-            };
-            found.push(component(
-                name,
-                TechnologyEcosystem::Npm,
-                Some(name),
-                Some(version),
-                exact_version(version),
-                &resource.url,
-                format!("npm lockfile pins {version}"),
-            ));
-        }
-    } else if let Some(dependencies) = root.get("dependencies").and_then(Value::as_object) {
-        collect_npm_lock_dependencies(dependencies, resource, &mut found);
-    }
-    found
-}
-
 fn collect_npm_lock_dependencies(
     dependencies: &serde_json::Map<String, Value>,
     resource: &CapturedTechnologyResource,
@@ -1133,519 +7162,25 @@ fn collect_npm_lock_dependencies(
     }
 }
 
-fn parse_regex_inventory(
-    resource: &CapturedTechnologyResource,
-    manifest: &str,
-) -> Vec<TechnologyComponent> {
-    let (ecosystem, pattern, evidence, installed) = match manifest {
-        "pnpm-lock.yaml" => (
-            TechnologyEcosystem::Npm,
-            r#"(?m)^\s{0,4}['\"]?/?((?:@[^/@\s]+/)?[^@:\s'\"]+)@([0-9][^:\s'\"]*)['\"]?:"#,
-            "pnpm lockfile pins",
-            true,
-        ),
-        "gemfile.lock" => (
-            TechnologyEcosystem::RubyGems,
-            r"(?m)^ {4}([A-Za-z0-9_.-]+) \(([^ )]+)\)",
-            "Gemfile.lock pins",
-            true,
-        ),
-        "build.gradle" | "build.gradle.kts" => (
-            TechnologyEcosystem::MavenCentral,
-            r#"[\"']([A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+):([^\"']+)[\"']"#,
-            "Gradle dependency requests",
-            false,
-        ),
-        "gradle.lockfile" => (
-            TechnologyEcosystem::MavenCentral,
-            r"(?m)^([A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+):([^=\s]+)=",
-            "Gradle lockfile pins",
-            true,
-        ),
-        "go.mod" => (
-            TechnologyEcosystem::GoModules,
-            r"(?m)^\s*([A-Za-z0-9._~/-]+)\s+(v[0-9][^\s]*)",
-            "go.mod requires",
-            false,
-        ),
-        _ => return Vec::new(),
-    };
-    let text = String::from_utf8_lossy(&resource.body);
-    Regex::new(pattern)
-        .expect("valid regex")
-        .captures_iter(&text)
-        .filter_map(|captures| {
-            let identifier = captures.get(1)?.as_str();
-            let version = captures.get(2)?.as_str();
-            let name = if ecosystem == TechnologyEcosystem::MavenCentral {
-                identifier.rsplit(':').next()?
-            } else {
-                identifier
-            };
-            Some(component(
-                name,
-                ecosystem,
-                Some(identifier),
-                Some(version),
-                installed && exact_version(version),
-                &resource.url,
-                format!("{evidence} {version}"),
-            ))
-        })
-        .collect()
-}
-
-fn parse_yarn_lock(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let text = String::from_utf8_lossy(&resource.body);
-    let version = Regex::new(r#"^\s*version\s+\"([^\"]+)\""#).expect("valid regex");
-    let mut names = Vec::<String>::new();
-    let mut found = Vec::new();
-    for line in text.lines() {
-        if !line.starts_with(char::is_whitespace) && line.ends_with(':') {
-            names = line
-                .trim_end_matches(':')
-                .split(',')
-                .filter_map(|item| yarn_name(item.trim().trim_matches(['\'', '"'])))
-                .collect();
-        } else if let Some(version) = version
-            .captures(line)
-            .and_then(|captures| captures.get(1))
-            .map(|value| value.as_str())
-        {
-            for name in names.drain(..) {
-                found.push(component(
-                    &name,
-                    TechnologyEcosystem::Npm,
-                    Some(&name),
-                    Some(version),
-                    exact_version(version),
-                    &resource.url,
-                    format!("yarn.lock pins {version}"),
-                ));
-            }
-        }
-    }
-    found
-}
-
-fn yarn_name(spec: &str) -> Option<String> {
-    if spec.starts_with('@') {
-        let slash = spec.find('/')?;
-        let after = &spec[slash + 1..];
-        let end = after
-            .find('@')
-            .map_or(spec.len(), |index| slash + 1 + index);
-        return Some(spec[..end].to_owned());
-    }
-    Some(spec.split('@').next()?.to_owned()).filter(|name| !name.is_empty())
-}
-
-fn parse_composer_lock(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let Ok(value) = serde_json::from_slice::<Value>(&resource.body) else {
-        return Vec::new();
-    };
-    ["packages", "packages-dev"]
-        .into_iter()
-        .filter_map(|key| value.get(key).and_then(Value::as_array))
-        .flatten()
-        .filter_map(|item| {
-            let name = item.get("name")?.as_str()?;
-            let version = item.get("version")?.as_str()?;
-            Some(component(
-                name,
-                TechnologyEcosystem::Composer,
-                Some(name),
-                Some(version),
-                exact_version(version),
-                &resource.url,
-                format!("composer.lock pins {version}"),
-            ))
-        })
-        .collect()
-}
-
-fn parse_python_inventory(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let text = String::from_utf8_lossy(&resource.body);
-    let requirement = Regex::new(r#"(?im)^[\s\"']*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]+\])?\s*(==|~=|>=|<=|!=|>|<|\^|=)?\s*([^\s,;\"']*)"#)
-        .expect("valid regex");
-    requirement
-        .captures_iter(&text)
-        .filter_map(|captures| {
-            let name = captures.get(1)?.as_str();
-            if crate::matches_ascii(name, &["python", "source", "requires-python"]) {
-                return None;
-            }
-            let spec = captures.get(3).map_or("", |value| value.as_str());
-            Some(component(
-                name,
-                TechnologyEcosystem::PyPi,
-                Some(name),
-                (!spec.is_empty()).then_some(spec),
-                false,
-                &resource.url,
-                if spec.is_empty() {
-                    "Python dependency manifest entry".to_owned()
-                } else {
-                    format!("Python dependency manifest requests {spec}")
-                },
-            ))
-        })
-        .take(4096)
-        .collect()
-}
-
-fn parse_pyproject(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let text = String::from_utf8_lossy(&resource.body);
-    let requirement = Regex::new(
-        r#"[\"']([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]+\])?\s*(==|~=|>=|<=|!=|>|<|\^|~)?\s*([^\s,;\"']*)[\"']"#,
-    )
-    .expect("valid regex");
-    let assignment = Regex::new(r#"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*=\s*[\"']([^\"']+)[\"']"#)
-        .expect("valid regex");
-    let mut dependency_section = false;
-    let mut dependency_array = false;
-    let mut found = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            let section = trimmed.trim_matches(['[', ']']).to_ascii_lowercase();
-            dependency_section = section.contains("dependenc");
-            dependency_array = false;
-            continue;
-        }
-        if trimmed.starts_with("dependencies") && trimmed.contains('[') {
-            dependency_array = true;
-            continue;
-        }
-        if dependency_array && trimmed == "]" {
-            dependency_array = false;
-            continue;
-        }
-        if !dependency_section && !dependency_array {
-            continue;
-        }
-        if let Some(captures) = requirement.captures(line) {
-            let Some(name) = captures.get(1).map(|value| value.as_str()) else {
-                continue;
-            };
-            if name.eq_ignore_ascii_case("python") {
-                continue;
-            }
-            let requested = captures
-                .get(3)
-                .map(|value| value.as_str())
-                .filter(|value| !value.is_empty());
-            found.push(component(
-                name,
-                TechnologyEcosystem::PyPi,
-                Some(name),
-                requested,
-                false,
-                &resource.url,
-                requested.map_or_else(
-                    || "pyproject.toml dependency".to_owned(),
-                    |value| format!("pyproject.toml requests {value}"),
-                ),
-            ));
-        } else if let Some(captures) = assignment.captures(line) {
-            let Some(name) = captures.get(1).map(|value| value.as_str()) else {
-                continue;
-            };
-            if name.eq_ignore_ascii_case("python") {
-                continue;
-            }
-            let requested = captures.get(2).map(|value| value.as_str());
-            found.push(component(
-                name,
-                TechnologyEcosystem::PyPi,
-                Some(name),
-                requested,
-                false,
-                &resource.url,
-                requested.map_or_else(
-                    || "pyproject.toml dependency".to_owned(),
-                    |value| format!("pyproject.toml requests {value}"),
-                ),
-            ));
-        }
-    }
-    found
-}
-
-fn parse_pipfile_lock(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let Ok(value) = serde_json::from_slice::<Value>(&resource.body) else {
-        return Vec::new();
-    };
-    ["default", "develop"]
-        .into_iter()
-        .filter_map(|key| value.get(key).and_then(Value::as_object))
-        .flat_map(|dependencies| dependencies.iter())
-        .filter_map(|(name, item)| {
-            let version = item.get("version").and_then(Value::as_str)?;
-            Some(component(
-                name,
-                TechnologyEcosystem::PyPi,
-                Some(name),
-                Some(version),
-                exact_version(version),
-                &resource.url,
-                format!("Pipfile.lock pins {version}"),
-            ))
-        })
-        .collect()
-}
-
-fn parse_toml_package_lock(
-    resource: &CapturedTechnologyResource,
-    ecosystem: TechnologyEcosystem,
-) -> Vec<TechnologyComponent> {
-    let text = String::from_utf8_lossy(&resource.body);
-    let assignment =
-        Regex::new(r#"^\s*(name|version)\s*=\s*[\"']([^\"']+)[\"']"#).expect("valid regex");
-    let mut current_name: Option<String> = None;
-    let mut current_version: Option<String> = None;
-    let mut found = Vec::new();
-    for line in text.lines().chain(std::iter::once("[[package]]")) {
-        if line.trim() == "[[package]]" {
-            if let (Some(name), Some(version)) = (current_name.take(), current_version.take()) {
-                found.push(component(
-                    &name,
-                    ecosystem,
-                    Some(&name),
-                    Some(&version),
-                    exact_version(&version),
-                    &resource.url,
-                    format!("lockfile pins {version}"),
-                ));
-            }
-            continue;
-        }
-        if let Some(captures) = assignment.captures(line) {
-            match captures.get(1).map(|value| value.as_str()) {
-                Some("name") => {
-                    current_name = captures.get(2).map(|value| value.as_str().to_owned())
-                }
-                Some("version") => {
-                    current_version = captures.get(2).map(|value| value.as_str().to_owned())
-                }
-                _ => {}
-            }
-        }
-    }
-    found
-}
-
-fn parse_gemfile(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let text = String::from_utf8_lossy(&resource.body);
-    let pattern = Regex::new(r#"(?m)^\s*gem\s+[\"']([^\"']+)[\"'](?:\s*,\s*[\"']([^\"']+)[\"'])?"#)
-        .expect("valid regex");
-    pattern
-        .captures_iter(&text)
-        .filter_map(|captures| {
-            let name = captures.get(1)?.as_str();
-            let requested = captures.get(2).map(|value| value.as_str());
-            Some(component(
-                name,
-                TechnologyEcosystem::RubyGems,
-                Some(name),
-                requested,
-                false,
-                &resource.url,
-                requested.map_or_else(
-                    || "Gemfile dependency".to_owned(),
-                    |value| format!("Gemfile requests {value}"),
-                ),
-            ))
-        })
-        .collect()
-}
-
-fn parse_pom(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    if !valid_xml(&resource.body) {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&resource.body);
-    let dependency = Regex::new(r"(?s)<dependency\b[^>]*>(.*?)</dependency>").expect("valid regex");
-    dependency
-        .captures_iter(&text)
-        .filter_map(|captures| {
-            let block = captures.get(1)?.as_str();
-            let group = xml_value(block, "groupId")?;
-            let artifact = xml_value(block, "artifactId")?;
-            let identifier = format!("{group}:{artifact}");
-            let version = xml_value(block, "version");
-            let evidence = version.as_ref().map_or_else(
-                || "Maven dependency manifest entry".to_owned(),
-                |value| format!("pom.xml requests {value}"),
-            );
-            Some(component(
-                &artifact,
-                TechnologyEcosystem::MavenCentral,
-                Some(&identifier),
-                version.as_deref(),
-                false,
-                &resource.url,
-                evidence,
-            ))
-        })
-        .collect()
-}
-
-fn parse_nuget_xml(
-    resource: &CapturedTechnologyResource,
-    installed_manifest: bool,
-) -> Vec<TechnologyComponent> {
-    if !valid_xml(&resource.body) {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&resource.body);
-    let package = Regex::new(
-        r#"(?i)<package\b[^>]*\bid=[\"']([^\"']+)[\"'][^>]*\bversion=[\"']([^\"']+)[\"'][^>]*/?>"#,
-    )
-    .expect("valid regex");
-    let version_first = Regex::new(
-        r#"(?i)<package\b[^>]*\bversion=[\"']([^\"']+)[\"'][^>]*\bid=[\"']([^\"']+)[\"'][^>]*/?>"#,
-    )
-    .expect("valid regex");
-    let package_version = Regex::new(r#"(?i)<PackageVersion\b[^>]*\bInclude=[\"']([^\"']+)[\"'][^>]*\bVersion=[\"']([^\"']+)[\"'][^>]*/?>"#)
-        .expect("valid regex");
-    [
-        (&package, 1, 2),
-        (&version_first, 2, 1),
-        (&package_version, 1, 2),
-    ]
-    .into_iter()
-    .flat_map(|(pattern, name, version)| {
-        pattern.captures_iter(&text).filter_map(move |captures| {
-            let name = captures.get(name)?.as_str();
-            let version = captures.get(version)?.as_str();
-            Some(component(
-                name,
-                TechnologyEcosystem::NuGet,
-                Some(name),
-                Some(version),
-                installed_manifest && exact_version(version),
-                &resource.url,
-                format!("NuGet package manifest records {version}"),
-            ))
-        })
-    })
-    .collect()
-}
-
-fn parse_nuget_lock(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let Ok(value) = serde_json::from_slice::<Value>(&resource.body) else {
-        return Vec::new();
-    };
-    let Some(dependencies) = value.get("dependencies").and_then(Value::as_object) else {
-        return Vec::new();
-    };
-    dependencies
-        .values()
-        .filter_map(Value::as_object)
-        .flat_map(|framework| framework.iter())
-        .filter_map(|(name, item)| {
-            let version = item.get("resolved").and_then(Value::as_str)?;
-            Some(component(
-                name,
-                TechnologyEcosystem::NuGet,
-                Some(name),
-                Some(version),
-                exact_version(version),
-                &resource.url,
-                format!("packages.lock.json pins {version}"),
-            ))
-        })
-        .collect()
-}
-
-fn parse_go_sum(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let text = String::from_utf8_lossy(&resource.body);
-    let mut seen = HashSet::new();
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line.split_ascii_whitespace();
-            let name = fields.next()?;
-            let version = fields.next()?.trim_end_matches("/go.mod");
-            if !seen.insert((name.to_owned(), version.to_owned())) {
-                return None;
-            }
-            Some(component(
-                name,
-                TechnologyEcosystem::GoModules,
-                Some(name),
-                Some(version),
-                exact_version(version),
-                &resource.url,
-                format!("go.sum records {version}"),
-            ))
-        })
-        .take(4096)
-        .collect()
-}
-
-fn parse_cargo_manifest(resource: &CapturedTechnologyResource) -> Vec<TechnologyComponent> {
-    let text = String::from_utf8_lossy(&resource.body);
-    let mut in_dependencies = false;
-    let simple =
-        Regex::new(r#"^\s*([A-Za-z0-9_-]+)\s*=\s*[\"']([^\"']+)[\"']"#).expect("valid regex");
-    let table =
-        Regex::new(r#"^\s*([A-Za-z0-9_-]+)\s*=\s*\{[^}]*version\s*=\s*[\"']([^\"']+)[\"']"#)
-            .expect("valid regex");
-    let mut found = Vec::new();
-    for line in text.lines() {
-        if line.trim_start().starts_with('[') {
-            let section = line.trim().trim_matches(['[', ']']).to_ascii_lowercase();
-            in_dependencies = section.ends_with("dependencies");
-            continue;
-        }
-        if !in_dependencies {
-            continue;
-        }
-        let captures = table.captures(line).or_else(|| simple.captures(line));
-        let Some(captures) = captures else {
-            continue;
-        };
-        let Some(name) = captures.get(1).map(|value| value.as_str()) else {
-            continue;
-        };
-        let Some(requested) = captures.get(2).map(|value| value.as_str()) else {
-            continue;
-        };
-        found.push(component(
-            name,
-            TechnologyEcosystem::CratesIo,
-            Some(name),
-            Some(requested),
-            false,
-            &resource.url,
-            format!("Cargo.toml requests {requested}"),
-        ));
-    }
-    found
-}
-
-fn valid_xml(bytes: &[u8]) -> bool {
-    let mut reader = Reader::from_reader(bytes);
-    loop {
-        match reader.read_event() {
-            Ok(Event::Eof) => return true,
-            Err(_) => return false,
-            _ => {}
-        }
-    }
-}
-
-fn xml_value(block: &str, tag: &str) -> Option<String> {
-    Regex::new(&format!(r"(?s)<{tag}\b[^>]*>\s*([^<]+?)\s*</{tag}>"))
-        .ok()?
-        .captures(block)?
-        .get(1)
-        .map(|value| value.as_str().to_owned())
-}
-
 fn exact_version(value: &str) -> bool {
-    let value = normalize_version(value);
+    let value = {
+        let (value,): (&str,) = (value,);
+        {
+            ({
+                let (value,): (&str,) = (value,);
+                let inlined_result: &str = {
+                    value
+                        .trim()
+                        .trim_start_matches('=')
+                        .trim_start()
+                        .trim_start_matches(['v', 'V'])
+                        .trim_end_matches("+incompatible")
+                };
+                inlined_result
+            })
+            .to_owned()
+        }
+    };
     !value.is_empty()
         && value
             .chars()
@@ -1658,360 +7193,6 @@ fn exact_version(value: &str) -> bool {
             )
         })
         && version_numbers(&value).is_some()
-}
-
-fn exact_moodle_version(value: &str) -> bool {
-    matches!(
-        value
-            .trim()
-            .split('.')
-            .try_fold(0, |count, part| (!part.is_empty()
-                && part.chars().all(|character| character.is_ascii_digit()))
-            .then_some(count + 1)),
-        Some(2..=4)
-    )
-}
-
-fn exact_moodle_generator_version(evidence: &str) -> Option<String> {
-    let metadata = evidence.strip_prefix("Generator metadata:")?.trim();
-    capture(
-        metadata,
-        r#"(?i)^Moodle\s+([0-9]+(?:\.[0-9]+){1,3})(?:\s*(?:\(|$))"#,
-    )
-}
-
-fn normalize_version(value: &str) -> String {
-    normalized_version(value).to_owned()
-}
-
-fn normalized_version(value: &str) -> &str {
-    value
-        .trim()
-        .trim_start_matches('=')
-        .trim_start()
-        .trim_start_matches(['v', 'V'])
-        .trim_end_matches("+incompatible")
-}
-
-fn detect_url_components(endpoint: &mut EndpointScan, url: &str) {
-    let Ok(parsed) = Url::parse(url) else {
-        return;
-    };
-    let path = parsed.path().to_ascii_lowercase();
-    if let Some(captures) = Regex::new(r"/wp-content/plugins/([a-z0-9_-]+)(?:/|$)")
-        .expect("valid regex")
-        .captures(&path)
-        && let Some(slug) = captures.get(1).map(|value| value.as_str())
-    {
-        let version = parsed
-            .query_pairs()
-            .find(|(name, _)| name.eq_ignore_ascii_case("ver"))
-            .map(|(_, value)| value.into_owned())
-            .filter(|value| exact_version(value));
-        merge_component(
-            &mut endpoint.technology_components,
-            component(
-                slug,
-                TechnologyEcosystem::WordPress,
-                Some(slug),
-                version.as_deref(),
-                version.is_some(),
-                url,
-                if let Some(version) = &version {
-                    format!("WordPress plugin asset path exposes version {version}")
-                } else {
-                    "WordPress plugin asset path".to_owned()
-                },
-            ),
-        );
-    }
-    for (marker, name, package) in [
-        ("/_next/", "Next.js", "next"),
-        ("/_nuxt/", "Nuxt", "nuxt"),
-        ("/react", "React", "react"),
-        ("/vue.", "Vue", "vue"),
-    ] {
-        if path.contains(marker) {
-            merge_component(
-                &mut endpoint.technology_components,
-                component(
-                    name,
-                    TechnologyEcosystem::Npm,
-                    Some(package),
-                    None,
-                    false,
-                    url,
-                    format!("Curated framework asset marker {marker}"),
-                ),
-            );
-        }
-    }
-}
-
-fn detect_content_components(endpoint: &mut EndpointScan, resource: &CapturedTechnologyResource) {
-    let text = String::from_utf8_lossy(&resource.body);
-    let lower = text.to_ascii_lowercase();
-    let mut detected = Vec::new();
-    for detection in crate::web_server::detect_web_servers(
-        resource
-            .headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str())),
-        &resource.body,
-        Some(resource.status),
-        Some(&resource.url),
-    ) {
-        let layer = match detection.role {
-            crate::web_server::WebProductRole::Server => ProductLayer::Server,
-            crate::web_server::WebProductRole::Proxy => ProductLayer::Proxy,
-            crate::web_server::WebProductRole::Framework => ProductLayer::Framework,
-            crate::web_server::WebProductRole::Runtime => ProductLayer::Runtime,
-        };
-        let confidence = match detection.confidence {
-            crate::web_server::FingerprintConfidence::High => Confidence::High,
-            crate::web_server::FingerprintConfidence::Medium => Confidence::Medium,
-        };
-        for evidence in detection.evidence {
-            super::add_product(
-                endpoint,
-                detection.product,
-                layer,
-                detection.version.clone(),
-                confidence,
-                evidence,
-            );
-        }
-    }
-    if crate::web_server::is_fastapi_branded_document(&resource.fetch_url, &resource.body) {
-        super::add_product(
-            endpoint,
-            "FastAPI",
-            ProductLayer::Framework,
-            None,
-            Confidence::High,
-            format!(
-                "FastAPI-branded OpenAPI or Swagger content at {}",
-                resource.url
-            ),
-        );
-    }
-    if lower.contains("__react_devtools_global_hook__")
-        || lower.contains("data-reactroot")
-        || lower.contains("react.production.min")
-    {
-        detected.push(fingerprint_component(
-            "React",
-            TechnologyEcosystem::Npm,
-            "react",
-            None,
-            resource,
-            "Curated React content fingerprint",
-        ));
-    }
-    if lower.contains("__vue__") || lower.contains("data-v-") || lower.contains("vue.runtime") {
-        detected.push(fingerprint_component(
-            "Vue",
-            TechnologyEcosystem::Npm,
-            "vue",
-            None,
-            resource,
-            "Curated Vue content fingerprint",
-        ));
-    }
-    if let Some(version) = capture(&text, r#"(?i)\bng-version=[\"']([0-9][0-9A-Za-z._-]*)"#) {
-        detected.push(fingerprint_component(
-            "Angular",
-            TechnologyEcosystem::Npm,
-            "@angular/core",
-            Some(&version),
-            resource,
-            "Angular ng-version attribute",
-        ));
-    } else if lower.contains("ng-version=") || lower.contains("ng-app=") {
-        detected.push(fingerprint_component(
-            "Angular",
-            TechnologyEcosystem::Npm,
-            "@angular/core",
-            None,
-            resource,
-            "Curated Angular content fingerprint",
-        ));
-    }
-    if lower.contains("__next_data__") {
-        detected.push(fingerprint_component(
-            "Next.js",
-            TechnologyEcosystem::Npm,
-            "next",
-            None,
-            resource,
-            "Next.js __NEXT_DATA__ marker",
-        ));
-    }
-    if lower.contains("__nuxt__") {
-        detected.push(fingerprint_component(
-            "Nuxt",
-            TechnologyEcosystem::Npm,
-            "nuxt",
-            None,
-            resource,
-            "Nuxt __NUXT__ marker",
-        ));
-    }
-    if lower.contains("name=\"csrfmiddlewaretoken\"")
-        || lower.contains("name='csrfmiddlewaretoken'")
-    {
-        super::add_product(
-            endpoint,
-            "Django",
-            ProductLayer::Framework,
-            None,
-            Confidence::Medium,
-            format!(
-                "Django csrfmiddlewaretoken form control at {}",
-                resource.url
-            ),
-        );
-        detected.push(fingerprint_component(
-            "Django",
-            TechnologyEcosystem::PyPi,
-            "Django",
-            None,
-            resource,
-            "Django CSRF field marker",
-        ));
-    }
-    if lower.contains("csrf verification failed. request aborted") {
-        super::add_product(
-            endpoint,
-            "Django",
-            ProductLayer::Framework,
-            None,
-            Confidence::High,
-            format!("Distinctive Django CSRF failure page at {}", resource.url),
-        );
-    }
-    if lower.contains("rails-ujs") || (lower.contains("csrf-param") && lower.contains("csrf-token"))
-    {
-        detected.push(fingerprint_component(
-            "Ruby on Rails",
-            TechnologyEcosystem::RubyGems,
-            "rails",
-            None,
-            resource,
-            "Ruby on Rails content fingerprint",
-        ));
-    }
-    if lower.contains("whitelabel error page") {
-        detected.push(fingerprint_component(
-            "Spring Boot",
-            TechnologyEcosystem::MavenCentral,
-            "org.springframework.boot:spring-boot",
-            None,
-            resource,
-            "Spring Boot Whitelabel Error Page",
-        ));
-    }
-    if lower.contains("__viewstate") {
-        detected.push(TechnologyComponent {
-            name: "ASP.NET".to_owned(),
-            ecosystem: TechnologyEcosystem::Runtime,
-            kind: TechnologyComponentKind::Framework,
-            package_identifier: None,
-            installed_version: None,
-            latest_version: None,
-            status: TechnologyVersionStatus::InventoryOnly,
-            support_status: TechnologySupportStatus::NotApplicable,
-            confidence: Confidence::High,
-            release_source_url: None,
-            evidence_urls: vec![resource.url.clone()],
-            evidence: vec!["ASP.NET __VIEWSTATE field".to_owned()],
-            check_error: None,
-        });
-    }
-    if lower.contains("_framework/blazor") {
-        detected.push(TechnologyComponent {
-            name: "Blazor".to_owned(),
-            ecosystem: TechnologyEcosystem::Runtime,
-            kind: TechnologyComponentKind::Framework,
-            package_identifier: None,
-            installed_version: None,
-            latest_version: None,
-            status: TechnologyVersionStatus::InventoryOnly,
-            support_status: TechnologySupportStatus::NotApplicable,
-            confidence: Confidence::High,
-            release_source_url: None,
-            evidence_urls: vec![resource.url.clone()],
-            evidence: vec!["Blazor framework asset marker".to_owned()],
-            check_error: None,
-        });
-    }
-    if let Some(version) = capture(
-        &text,
-        r#"(?i)<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"']wordpress\s+([0-9][0-9A-Za-z._-]*)"#,
-    )
-    .or_else(|| {
-        capture(
-            &text,
-            r#"(?i)<meta[^>]+content=[\"']wordpress\s+([0-9][0-9A-Za-z._-]*)[\"'][^>]+name=[\"']generator[\"']"#,
-        )
-    }) {
-        let mut item = component(
-            "WordPress",
-            TechnologyEcosystem::WordPress,
-            Some("wordpress"),
-            Some(&version),
-            exact_version(&version),
-            &resource.url,
-            format!("WordPress generator exposes {version}"),
-        );
-        item.kind = TechnologyComponentKind::Cms;
-        detected.push(item);
-    }
-    if let Some(version) = capture(
-        &text,
-        r#"(?i)<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"']moodle\s+([0-9][0-9A-Za-z._+-]*)"#,
-    )
-    .or_else(|| {
-        capture(
-            &text,
-            r#"(?i)<meta[^>]+content=[\"']moodle\s+([0-9][0-9A-Za-z._+-]*)[\"'][^>]+name=[\"']generator[\"']"#,
-        )
-    }) {
-        let exact = exact_moodle_version(&version);
-        let mut item = component(
-            "Moodle",
-            TechnologyEcosystem::Moodle,
-            Some("moodle"),
-            Some(&version),
-            exact,
-            &resource.url,
-            format!("Moodle generator exposes {version}"),
-        );
-        item.kind = TechnologyComponentKind::Cms;
-        detected.push(item);
-    }
-    for component in detected {
-        merge_component(&mut endpoint.technology_components, component);
-    }
-}
-
-fn fingerprint_component(
-    name: &str,
-    ecosystem: TechnologyEcosystem,
-    package: &str,
-    version: Option<&str>,
-    resource: &CapturedTechnologyResource,
-    evidence: &str,
-) -> TechnologyComponent {
-    component(
-        name,
-        ecosystem,
-        Some(package),
-        version,
-        version.is_some_and(exact_version),
-        &resource.url,
-        evidence.to_owned(),
-    )
 }
 
 #[derive(Clone, Copy)]
@@ -3075,136 +8256,6 @@ const PRODUCT_COMPONENT_MAPPINGS: &[ProductComponentMapping] = &[
     ),
 ];
 
-fn product_component_mapping(
-    name: &str,
-    layer: ProductLayer,
-) -> Option<&'static ProductComponentMapping> {
-    let normalized = name.to_ascii_lowercase();
-    PRODUCT_COMPONENT_MAPPINGS.iter().find(|mapping| {
-        mapping
-            .product_layer
-            .is_none_or(|expected| expected == layer)
-            && mapping.aliases.contains(&normalized.as_str())
-    })
-}
-
-fn product_package_identifier(
-    mapping: &ProductComponentMapping,
-    version: Option<&str>,
-) -> Option<&'static str> {
-    let major = version
-        .map(normalized_version)
-        .and_then(|version| version.split('.').next())
-        .and_then(|major| major.parse::<u64>().ok());
-    match (mapping.name, major) {
-        ("Fiber", Some(1)) => Some("github.com/gofiber/fiber"),
-        ("Fiber", Some(2)) => Some("github.com/gofiber/fiber/v2"),
-        ("Fiber", Some(3)) => Some("github.com/gofiber/fiber/v3"),
-        ("Echo", Some(3)) => Some("github.com/labstack/echo/v3"),
-        ("Echo", Some(4)) => Some("github.com/labstack/echo/v4"),
-        ("Echo", Some(5)) => Some("github.com/labstack-go/echo/v5"),
-        ("GoFrame", Some(1)) => Some("github.com/gogf/gf"),
-        ("Chi", Some(4)) => Some("github.com/go-chi/chi/v4"),
-        ("Chi", Some(5)) => Some("github.com/go-chi/chi/v5"),
-        _ => mapping.package_identifier,
-    }
-}
-
-fn import_product_components(endpoint: &mut EndpointScan) {
-    let mut detected = Vec::new();
-    for product in &endpoint.products {
-        let Some(mapping) = product_component_mapping(&product.name, product.layer) else {
-            continue;
-        };
-        let package_identifier = product_package_identifier(mapping, product.version.as_deref());
-        let url = endpoint
-            .http
-            .iter()
-            .find(|response| (200..400).contains(&response.status))
-            .map(|response| response.url.clone())
-            .unwrap_or_else(|| format!("{}:{}", endpoint.ip, endpoint.port));
-        let exact = product.version.as_deref().is_some_and(|version| {
-            if mapping.ecosystem == TechnologyEcosystem::WebServer {
-                crate::web_server::is_exact_web_server_version(version)
-            } else if mapping.ecosystem == TechnologyEcosystem::Moodle {
-                exact_moodle_version(version)
-            } else {
-                exact_version(version)
-            }
-        });
-        let exact = if mapping.ecosystem == TechnologyEcosystem::Moodle {
-            exact
-                && product.confidence == Confidence::High
-                && product.version.as_deref().is_some_and(|version| {
-                    product.evidence.iter().any(|evidence| {
-                        exact_moodle_generator_version(evidence).as_deref() == Some(version)
-                    })
-                })
-        } else {
-            exact
-        };
-        let mut item = component(
-            mapping.name,
-            mapping.ecosystem,
-            package_identifier,
-            product.version.as_deref(),
-            exact,
-            &url,
-            format!("Product fingerprint: {}", product.evidence.join("; ")),
-        );
-        if package_identifier.is_none()
-            && let Some(version) = product.version.as_deref().filter(|_| exact)
-        {
-            item.installed_version = Some(normalize_version(version));
-            item.status = TechnologyVersionStatus::InventoryOnly;
-            item.support_status = if mapping.ecosystem == TechnologyEcosystem::WebServer {
-                TechnologySupportStatus::Unknown
-            } else {
-                TechnologySupportStatus::NotApplicable
-            };
-        }
-        item.kind = mapping.kind;
-        item.confidence = product.confidence;
-        detected.push(item);
-    }
-    detect_runtime_headers(endpoint, &mut detected);
-    for component in detected {
-        merge_component(&mut endpoint.technology_components, component);
-    }
-}
-
-fn infer_runtime_components(endpoint: &mut EndpointScan) {
-    let inferred = endpoint
-        .technology_components
-        .iter()
-        .filter(|component| component.kind != TechnologyComponentKind::Runtime)
-        .filter_map(|component| {
-            let (runtime_name, runtime_identifier) = implied_runtime(component)?;
-            Some(TechnologyComponent {
-                name: runtime_name.to_owned(),
-                ecosystem: TechnologyEcosystem::Runtime,
-                kind: TechnologyComponentKind::Runtime,
-                package_identifier: runtime_identifier.map(str::to_owned),
-                installed_version: None,
-                latest_version: None,
-                status: TechnologyVersionStatus::InventoryOnly,
-                support_status: TechnologySupportStatus::NotApplicable,
-                confidence: Confidence::High,
-                release_source_url: None,
-                evidence_urls: component.evidence_urls.clone(),
-                evidence: vec![format!(
-                    "{runtime_name} runtime implied by detected {} {}",
-                    component.ecosystem, component.name
-                )],
-                check_error: None,
-            })
-        })
-        .collect::<Vec<_>>();
-    for component in inferred {
-        merge_component(&mut endpoint.technology_components, component);
-    }
-}
-
 fn implied_runtime(
     component: &TechnologyComponent,
 ) -> Option<(&'static str, Option<&'static str>)> {
@@ -3250,228 +8301,6 @@ fn implied_runtime(
     })
 }
 
-fn detect_runtime_headers(endpoint: &EndpointScan, detected: &mut Vec<TechnologyComponent>) {
-    let rules = [
-        (
-            "php",
-            r"(?i)\bPHP/?([0-9]+(?:\.[0-9]+){1,3}(?:[-._A-Za-z0-9]+)?)",
-            "PHP",
-        ),
-        (
-            "python",
-            r"(?i)\bPython/?([0-9]+(?:\.[0-9]+){1,3}(?:[-._A-Za-z0-9]+)?)",
-            "Python",
-        ),
-        (
-            "ruby",
-            r"(?i)\bRuby/?([0-9]+(?:\.[0-9]+){1,3}(?:[-._A-Za-z0-9]+)?)",
-            "Ruby",
-        ),
-        (
-            "node",
-            r"(?i)\bNode(?:\.js)?/?v?([0-9]+(?:\.[0-9]+){1,3}(?:[-._A-Za-z0-9]+)?)",
-            "Node.js",
-        ),
-    ];
-    for response in &endpoint.http {
-        for (header_name, header_value) in &response.headers {
-            if !crate::matches_ascii(header_name, &["server", "x-powered-by", "x-runtime"]) {
-                continue;
-            }
-            for (identifier, pattern, name) in rules {
-                let Some(version) = capture(header_value, pattern) else {
-                    continue;
-                };
-                let mut item = component(
-                    name,
-                    TechnologyEcosystem::Runtime,
-                    Some(identifier),
-                    Some(&version),
-                    exact_version(&version),
-                    &response.url,
-                    format!("{header_name} header exposes {name} {version}"),
-                );
-                item.kind = TechnologyComponentKind::Runtime;
-                detected.push(item);
-            }
-        }
-    }
-}
-
-fn capture(text: &str, pattern: &str) -> Option<String> {
-    Regex::new(pattern)
-        .ok()?
-        .captures(text)?
-        .get(1)
-        .map(|value| value.as_str().to_owned())
-}
-
-fn registry_accept(ecosystem: TechnologyEcosystem, identifier: &str) -> &'static str {
-    let base_identifier = identifier
-        .split_once('@')
-        .map(|(identifier, _)| identifier)
-        .unwrap_or(identifier);
-    if ecosystem == TechnologyEcosystem::Npm {
-        "application/vnd.npm.install-v1+json"
-    } else if ecosystem == TechnologyEcosystem::Moodle {
-        "text/html"
-    } else if ecosystem == TechnologyEcosystem::WebServer && base_identifier == "lighttpd" {
-        "text/plain"
-    } else if ecosystem == TechnologyEcosystem::WebServer
-        && matches!(
-            base_identifier,
-            "nginx"
-                | "apache-httpd"
-                | "iis"
-                | "openresty"
-                | "litespeed"
-                | "openlitespeed"
-                | "tomcat"
-                | "jetty"
-        )
-    {
-        "text/html"
-    } else if matches!(
-        ecosystem,
-        TechnologyEcosystem::GoModules | TechnologyEcosystem::Runtime
-    ) && matches!(identifier, "ruby" | "rust")
-    {
-        "text/plain"
-    } else {
-        "application/json"
-    }
-}
-
-fn latest_result(
-    ecosystem: TechnologyEcosystem,
-    identifier: &str,
-    fetched: javascript::Fetched,
-) -> LatestResult {
-    let Some(response) = fetched.response else {
-        return LatestResult {
-            latest: None,
-            error: fetched
-                .error
-                .or_else(|| Some("Registry returned no response".to_owned())),
-            support_status: None,
-        };
-    };
-    if let Some(error) = fetched.error {
-        return LatestResult {
-            latest: None,
-            error: Some(error),
-            support_status: None,
-        };
-    }
-    if !(200..300).contains(&response.status) {
-        return LatestResult {
-            latest: None,
-            error: Some(format!("Registry returned HTTP {}", response.status)),
-            support_status: None,
-        };
-    }
-    if response.body_truncated {
-        return LatestResult {
-            latest: None,
-            error: Some("Registry metadata exceeded the remaining byte limit".to_owned()),
-            support_status: None,
-        };
-    }
-    if ecosystem == TechnologyEcosystem::WebServer {
-        return match parse_web_server_latest(identifier, &response.body) {
-            Ok(release) => LatestResult {
-                latest: release.latest,
-                error: None,
-                support_status: Some(release.support_status),
-            },
-            Err(error) => LatestResult {
-                latest: None,
-                error: Some(error),
-                support_status: None,
-            },
-        };
-    }
-    match parse_latest(ecosystem, identifier, &response.body) {
-        Ok(latest) => LatestResult {
-            latest,
-            error: None,
-            support_status: None,
-        },
-        Err(error) => LatestResult {
-            latest: None,
-            error: Some(error),
-            support_status: None,
-        },
-    }
-}
-
-fn registry_url(ecosystem: TechnologyEcosystem, identifier: &str) -> Option<String> {
-    let identifier = identifier
-        .split_once('@')
-        .map(|(identifier, _)| identifier)
-        .unwrap_or(identifier);
-    let encoded = utf8_percent_encode(identifier, NON_ALPHANUMERIC).to_string();
-    Some(match ecosystem {
-        TechnologyEcosystem::JavaScript => return None,
-        TechnologyEcosystem::Npm => format!("https://registry.npmjs.org/{encoded}"),
-        TechnologyEcosystem::Composer => format!(
-            "https://repo.packagist.org/p2/{}.json",
-            encode_path(identifier)
-        ),
-        TechnologyEcosystem::WordPress if identifier == "wordpress" => {
-            "https://api.wordpress.org/core/version-check/1.7/".to_owned()
-        }
-        TechnologyEcosystem::WordPress => format!(
-            "https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&request%5Bslug%5D={encoded}"
-        ),
-        TechnologyEcosystem::Moodle if identifier == "moodle" => {
-            MOODLE_LATEST_RELEASE_URL.to_owned()
-        }
-        TechnologyEcosystem::Moodle => return None,
-        TechnologyEcosystem::PyPi => format!("https://pypi.org/pypi/{encoded}/json"),
-        TechnologyEcosystem::RubyGems => {
-            format!("https://rubygems.org/api/v1/versions/{encoded}.json")
-        }
-        TechnologyEcosystem::MavenCentral => {
-            let (group, artifact) = identifier.split_once(':')?;
-            let query_text = format!("g:\"{group}\" AND a:\"{artifact}\"");
-            let query = utf8_percent_encode(&query_text, NON_ALPHANUMERIC);
-            format!(
-                "https://search.maven.org/solrsearch/select?q={query}&core=gav&rows=200&wt=json"
-            )
-        }
-        TechnologyEcosystem::NuGet => format!(
-            "https://api-v2v3search-0.nuget.org/query?q=packageid%3A{encoded}&prerelease=false&semVerLevel=2.0.0&take=20"
-        ),
-        TechnologyEcosystem::GoModules => {
-            format!(
-                "https://proxy.golang.org/{}/@v/list",
-                go_module_escape(identifier)
-            )
-        }
-        TechnologyEcosystem::CratesIo => {
-            format!("https://crates.io/api/v1/crates/{encoded}")
-        }
-        TechnologyEcosystem::Runtime => match identifier {
-            "php" => "https://www.php.net/releases/index.php?json&max=100".to_owned(),
-            "python" => {
-                "https://www.python.org/api/v2/downloads/release/?is_published=true".to_owned()
-            }
-            "ruby" => "https://cache.ruby-lang.org/pub/ruby/index.txt".to_owned(),
-            "java" => "https://api.adoptium.net/v3/info/available_releases".to_owned(),
-            "dotnet" => {
-                "https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json"
-                    .to_owned()
-            }
-            "go" => "https://go.dev/dl/?mode=json&include=all".to_owned(),
-            "rust" => "https://static.rust-lang.org/dist/channel-rust-stable.toml".to_owned(),
-            "node" => "https://nodejs.org/dist/index.json".to_owned(),
-            _ => return None,
-        },
-        TechnologyEcosystem::WebServer => web_server_release_source(identifier)?.to_owned(),
-    })
-}
-
 fn web_server_release_source(identifier: &str) -> Option<&'static str> {
     Some(match identifier {
         "nginx" => "https://nginx.org/en/download.html",
@@ -3499,668 +8328,24 @@ fn web_server_release_source(identifier: &str) -> Option<&'static str> {
     })
 }
 
-fn encode_path(value: &str) -> String {
-    value
-        .split('/')
-        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn go_module_escape(value: &str) -> String {
-    let mut escaped = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_uppercase() {
-            escaped.push('!');
-            escaped.push(char::from(byte.to_ascii_lowercase()));
-        } else if byte.is_ascii_alphanumeric() || b"-._~+/".contains(&byte) {
-            escaped.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            let _ = write!(escaped, "%{byte:02X}");
-        }
-    }
-    escaped
-}
-
 struct WebServerRelease {
     latest: Option<String>,
     support_status: TechnologySupportStatus,
 }
 
-fn web_server_cache_identifier(identifier: &str, installed: &str) -> String {
-    let line = web_server_release_line(identifier, installed).unwrap_or_else(|| "all".to_owned());
-    format!("{}@{}", identifier.to_ascii_lowercase(), line)
-}
-
-fn web_server_release_line(identifier: &str, version: &str) -> Option<String> {
-    let numbers = version_numbers(version)?;
-    let count = match identifier {
-        "caddy" => 1,
-        "openresty" => 3,
-        "nginx" | "apache-httpd" | "iis" | "litespeed" | "openlitespeed" | "lighttpd"
-        | "tomcat" | "jetty" | "kestrel" => 2,
-        _ => return None,
-    };
-    (numbers.len() >= count).then(|| {
-        numbers
-            .into_iter()
-            .take(count)
-            .map(|number| number.to_string())
-            .collect::<Vec<_>>()
-            .join(".")
-    })
-}
-
-fn parse_web_server_latest(identifier: &str, bytes: &[u8]) -> Result<WebServerRelease, String> {
-    let (identifier, detected_line) = identifier
-        .split_once('@')
-        .map(|(identifier, line)| (identifier, (line != "all").then_some(line)))
-        .unwrap_or((identifier, None));
-    let versions = web_server_versions(identifier, bytes)?;
-    let latest_overall = max_stable(versions.iter().map(String::as_str));
-    let latest_in_line = detected_line.and_then(|line| {
-        max_stable(versions.iter().filter_map(|version| {
-            (web_server_release_line(identifier, version).as_deref() == Some(line))
-                .then_some(version.as_str())
-        }))
-    });
-    let latest = latest_in_line.clone().or(latest_overall.clone());
-    if latest.is_none() {
-        return Err("Upstream metadata returned no stable release".to_owned());
-    }
-    let support_status = web_server_support_status(
-        identifier,
-        detected_line,
-        latest_overall.as_deref(),
-        latest_in_line.is_some(),
-        bytes,
-    );
-    Ok(WebServerRelease {
-        latest,
-        support_status,
-    })
-}
-
-fn web_server_versions(identifier: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
-    let mut versions = match identifier {
-        "gunicorn" | "uvicorn" | "werkzeug" => {
-            let value = json(bytes, "PyPI")?;
-            value
-                .get("releases")
-                .and_then(Value::as_object)
-                .into_iter()
-                .flat_map(|releases| releases.iter())
-                .filter(|(_, files)| {
-                    files.as_array().is_some_and(|files| {
-                        files.iter().any(|file| {
-                            !file.get("yanked").and_then(Value::as_bool).unwrap_or(false)
-                        })
-                    })
-                })
-                .map(|(version, _)| version.to_owned())
-                .collect()
-        }
-        "puma" | "passenger" => {
-            let value = json(bytes, "RubyGems")?;
-            value
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|item| {
-                    !item
-                        .get("prerelease")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                        && !item.get("yanked").and_then(Value::as_bool).unwrap_or(false)
-                })
-                .filter_map(|item| {
-                    item.get("number")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .collect()
-        }
-        "caddy" | "cowboy" => {
-            let value = json(bytes, "GitHub releases")?;
-            value
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|release| {
-                    !release
-                        .get("draft")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                        && !release
-                            .get("prerelease")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                })
-                .filter_map(|release| {
-                    release
-                        .get("tag_name")
-                        .or_else(|| release.get("name"))
-                        .and_then(Value::as_str)
-                })
-                .filter_map(server_version_from_tag)
-                .collect()
-        }
-        "kestrel" => {
-            let value = json(bytes, ".NET release")?;
-            value
-                .get("releases-index")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|release| release.get("latest-release").and_then(Value::as_str))
-                .map(str::to_owned)
-                .collect()
-        }
-        _ => web_server_html_versions(identifier, bytes)?,
-    };
-    versions.retain(|version| version_numbers(version).is_some() && !is_prerelease(version));
-    versions.sort_by(|left, right| compare_version_values(left, right).unwrap_or(Ordering::Equal));
-    versions.dedup();
-    Ok(versions)
-}
-
-fn web_server_html_versions(identifier: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|error| format!("invalid upstream release page: {error}"))?;
-    if identifier == "iis" {
-        let regex = Regex::new(r"(?i)\bIIS\s+([0-9]+(?:\.[0-9]+)?)")
-            .map_err(|error| format!("invalid release parser: {error}"))?;
-        return Ok(regex
-            .captures_iter(text)
-            .filter_map(|captures| captures.get(1).map(|value| value.as_str()))
-            .map(|version| {
-                if version.contains('.') {
-                    version.to_owned()
-                } else {
-                    format!("{version}.0")
-                }
-            })
-            .collect());
-    }
-    if identifier == "litespeed" {
-        return html_capture_versions(text, r"(?i)version\s+([0-9]+(?:\.[0-9]+){1,3})\s+stable", 1);
-    }
-    if identifier == "openlitespeed" {
-        return html_capture_versions(
-            text,
-            r"(?is)openlitespeed\s+v\s*([0-9]+(?:\.[0-9]+){1,3}).{0,200}?\bstable\b",
-            1,
-        );
-    }
-    if identifier == "tomcat" {
-        let regex =
-            Regex::new(r"(?is)([0-9]{1,2}\.[0-9]+)\.x.{0,400}?([0-9]{1,2}\.[0-9]+\.[0-9]+)")
-                .map_err(|error| format!("invalid release parser: {error}"))?;
-        return Ok(regex
-            .captures_iter(text)
-            .filter_map(|captures| {
-                let line = captures.get(1)?.as_str();
-                let version = captures.get(2)?.as_str();
-                version
-                    .starts_with(&format!("{line}."))
-                    .then(|| version.to_owned())
-            })
-            .collect());
-    }
-    if identifier == "jetty" {
-        return html_capture_versions(
-            text,
-            r"(?i)>\s*([0-9]{1,2}\.[0-9]+\.[0-9]+(?:\.v[0-9]+)?)\s*(?:\(EOL\))?\s*<",
-            1,
-        );
-    }
-    let pattern = match identifier {
-        "nginx" => r"(?i)nginx-([0-9]+(?:\.[0-9]+){1,3}(?:[-._](?:alpha|beta|rc)[0-9]*)?)",
-        "apache-httpd" => r"(?i)httpd-([0-9]+(?:\.[0-9]+){1,3}(?:[-._](?:alpha|beta|rc)[0-9]*)?)",
-        "openresty" => r"(?i)openresty-([0-9]+(?:\.[0-9]+){1,3}(?:[-._](?:alpha|beta|rc)[0-9]*)?)",
-        "lighttpd" => r"(?i)lighttpd-([0-9]+(?:\.[0-9]+){1,3})",
-        _ => return Ok(Vec::new()),
-    };
-    let regex = Regex::new(pattern).map_err(|error| format!("invalid release parser: {error}"))?;
-    Ok(regex
-        .captures_iter(text)
-        .filter_map(|captures| captures.get(1).map(|value| value.as_str().to_owned()))
-        .collect())
-}
-
-fn html_capture_versions(text: &str, pattern: &str, group: usize) -> Result<Vec<String>, String> {
-    let regex = Regex::new(pattern).map_err(|error| format!("invalid release parser: {error}"))?;
-    Ok(regex
-        .captures_iter(text)
-        .filter_map(|captures| captures.get(group).map(|value| value.as_str().to_owned()))
-        .collect())
-}
-
-fn server_version_from_tag(tag: &str) -> Option<String> {
-    let start = tag.find(|character: char| character.is_ascii_digit())?;
-    let version = tag[start..]
-        .chars()
-        .take_while(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '+')
-        })
-        .collect::<String>();
-    version_numbers(&version).is_some().then_some(version)
-}
-
-fn web_server_support_status(
-    identifier: &str,
-    detected_line: Option<&str>,
-    latest_overall: Option<&str>,
-    line_found: bool,
-    bytes: &[u8],
-) -> TechnologySupportStatus {
-    let Some(line) = detected_line else {
-        return TechnologySupportStatus::Unknown;
-    };
-    if let Some(supported) = explicitly_supported_line(identifier, line, bytes) {
-        return if supported {
-            TechnologySupportStatus::Supported
-        } else {
-            TechnologySupportStatus::Unsupported
-        };
-    }
-    if line_marked_unsupported(line, bytes) {
-        return TechnologySupportStatus::Unsupported;
-    }
-    if matches!(
-        identifier,
-        "gunicorn" | "uvicorn" | "puma" | "passenger" | "cowboy" | "werkzeug"
-    ) {
-        return TechnologySupportStatus::Unknown;
-    }
-    if matches!(identifier, "nginx" | "tomcat" | "jetty") {
-        return if line_found {
-            TechnologySupportStatus::Supported
-        } else {
-            TechnologySupportStatus::Unsupported
-        };
-    }
-    let current_line =
-        latest_overall.and_then(|version| web_server_release_line(identifier, version));
-    if current_line.as_deref() == Some(line) {
-        TechnologySupportStatus::Supported
-    } else {
-        TechnologySupportStatus::Unsupported
-    }
-}
-
-fn explicitly_supported_line(identifier: &str, line: &str, bytes: &[u8]) -> Option<bool> {
-    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
-    match identifier {
-        "nginx" => {
-            let legacy = text.find("legacy versions")?;
-            let version = format!("nginx-{line}.");
-            if text[..legacy].contains(&version) {
-                Some(true)
-            } else if text[legacy..].contains(&version) {
-                Some(false)
-            } else {
-                None
-            }
-        }
-        "tomcat" => {
-            let unsupported = text.find("unsupported versions")?;
-            let version = format!("{line}.x");
-            if text[..unsupported].contains(&version) {
-                Some(true)
-            } else if text[unsupported..].contains(&version) {
-                Some(false)
-            } else {
-                None
-            }
-        }
-        "kestrel" => {
-            let value = serde_json::from_slice::<Value>(bytes).ok()?;
-            let release = value
-                .get("releases-index")
-                .and_then(Value::as_array)?
-                .iter()
-                .find(|release| {
-                    release
-                        .get("channel-version")
-                        .and_then(Value::as_str)
-                        .is_some_and(|version| {
-                            web_server_release_line("kestrel", version).as_deref() == Some(line)
-                        })
-                })?;
-            release
-                .get("support-phase")
-                .and_then(Value::as_str)
-                .map(|phase| !matches!(phase.to_ascii_lowercase().as_str(), "eol" | "end-of-life"))
-        }
-        _ => None,
-    }
-}
-
-fn line_marked_unsupported(line: &str, bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
-    let markers = [
-        "end of life",
-        "eol",
-        "unsupported",
-        "not supported",
-        "obsolete",
-        "legacy",
-        "archived",
-        "superseded",
-        "deprecated",
-    ];
-    let mut offset = 0;
-    while let Some(index) = text[offset..].find(line) {
-        let index = offset + index;
-        let row_start = text[..index]
-            .rfind("<tr")
-            .filter(|row| index - *row <= 2_000);
-        let line_start = text[..index].rfind('\n').map(|line| line + 1);
-        let start = row_start.or(line_start).unwrap_or(index);
-        let row_end = text[index..]
-            .find("</tr>")
-            .map(|end| index + end + 5)
-            .filter(|end| *end - index <= 2_000);
-        let line_end = text[index..].find('\n').map(|end| index + end);
-        let end = row_end
-            .or(line_end)
-            .unwrap_or(index + line.len())
-            .min(text.len());
-        if markers
-            .iter()
-            .any(|marker| text[start..end].contains(marker))
-        {
-            return true;
-        }
-        offset = index + line.len();
-    }
-    false
-}
-
-fn parse_latest(
-    ecosystem: TechnologyEcosystem,
-    identifier: &str,
-    bytes: &[u8],
-) -> Result<Option<String>, String> {
-    match ecosystem {
-        TechnologyEcosystem::JavaScript => Ok(None),
-        TechnologyEcosystem::Npm => {
-            let value = json(bytes, "npm")?;
-            let latest = max_stable(
-                value
-                    .get("versions")
-                    .and_then(Value::as_object)
-                    .into_iter()
-                    .flat_map(|versions| versions.keys().map(String::as_str)),
-            );
-            if latest.is_some() {
-                Ok(latest)
-            } else {
-                Ok(value
-                    .get("dist-tags")
-                    .and_then(|tags| tags.get("latest"))
-                    .and_then(Value::as_str)
-                    .filter(|version| !is_prerelease(version))
-                    .map(normalize_version))
-            }
-        }
-        TechnologyEcosystem::Composer => {
-            let value = json(bytes, "Packagist")?;
-            Ok(max_stable(
-                value
-                    .get("packages")
-                    .and_then(|packages| packages.get(identifier))
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|item| item.get("version").and_then(Value::as_str)),
-            ))
-        }
-        TechnologyEcosystem::WordPress if identifier == "wordpress" => {
-            let value = json(bytes, "WordPress core")?;
-            Ok(value
-                .get("offers")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|item| item.get("current").and_then(Value::as_str))
-                .find(|version| !is_prerelease(version))
-                .map(str::to_owned))
-        }
-        TechnologyEcosystem::WordPress => {
-            let value = json(bytes, "WordPress Plugin API")?;
-            Ok(value
-                .get("version")
-                .and_then(Value::as_str)
-                .filter(|version| !is_prerelease(version))
-                .map(str::to_owned))
-        }
-        TechnologyEcosystem::Moodle if identifier == "moodle" => {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|error| format!("invalid Moodle release page: {error}"))?;
-            let pattern = Regex::new(
-                r"(?i)<strong>\s*Moodle\s+([0-9]+(?:\.[0-9]+){1,3}(?:[+A-Za-z0-9._-]*)?)\s*</strong>",
-            )
-            .expect("valid regex");
-            Ok(max_stable(
-                pattern
-                    .captures_iter(text)
-                    .filter_map(|captures| captures.get(1).map(|value| value.as_str()))
-                    .filter(|version| !version.contains('+')),
-            ))
-        }
-        TechnologyEcosystem::Moodle => Ok(None),
-        TechnologyEcosystem::PyPi => {
-            let value = json(bytes, "PyPI")?;
-            Ok(max_stable(
-                value
-                    .get("releases")
-                    .and_then(Value::as_object)
-                    .into_iter()
-                    .flat_map(|releases| releases.iter())
-                    .filter(|(_, files)| {
-                        files.as_array().is_some_and(|files| {
-                            files.iter().any(|file| {
-                                !file.get("yanked").and_then(Value::as_bool).unwrap_or(false)
-                            })
-                        })
-                    })
-                    .map(|(version, _)| version.as_str()),
-            ))
-        }
-        TechnologyEcosystem::RubyGems => {
-            let value = json(bytes, "RubyGems")?;
-            Ok(max_stable(
-                value
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|item| {
-                        !item
-                            .get("prerelease")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                            && !item.get("yanked").and_then(Value::as_bool).unwrap_or(false)
-                    })
-                    .filter_map(|item| item.get("number").and_then(Value::as_str)),
-            ))
-        }
-        TechnologyEcosystem::MavenCentral => {
-            let value = json(bytes, "Maven Central")?;
-            Ok(max_stable(
-                value
-                    .get("response")
-                    .and_then(|response| response.get("docs"))
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|item| item.get("v").and_then(Value::as_str)),
-            ))
-        }
-        TechnologyEcosystem::NuGet => {
-            let value = json(bytes, "NuGet")?;
-            Ok(value
-                .get("data")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .find(|item| {
-                    item.get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| id.eq_ignore_ascii_case(identifier))
-                })
-                .and_then(|item| item.get("version"))
-                .and_then(Value::as_str)
-                .filter(|version| !is_prerelease(version))
-                .map(str::to_owned))
-        }
-        TechnologyEcosystem::GoModules => {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|error| format!("invalid Go proxy response: {error}"))?;
-            Ok(max_stable(text.lines()))
-        }
-        TechnologyEcosystem::CratesIo => {
-            let value = json(bytes, "crates.io")?;
-            Ok(max_stable(
-                value
-                    .get("versions")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter(|item| !item.get("yanked").and_then(Value::as_bool).unwrap_or(false))
-                    .filter_map(|item| item.get("num").and_then(Value::as_str)),
-            ))
-        }
-        TechnologyEcosystem::Runtime => parse_runtime_latest(identifier, bytes),
-        TechnologyEcosystem::WebServer => Ok(None),
-    }
-}
-
-fn json(bytes: &[u8], source: &str) -> Result<Value, String> {
-    serde_json::from_slice(bytes).map_err(|error| format!("invalid {source} metadata: {error}"))
-}
-
-fn parse_runtime_latest(identifier: &str, bytes: &[u8]) -> Result<Option<String>, String> {
-    match identifier {
-        "php" => {
-            let value = json(bytes, "PHP release")?;
-            let versions = value
-                .as_object()
-                .into_iter()
-                .flat_map(|releases| releases.values())
-                .filter_map(|release| {
-                    release
-                        .get("version")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .or_else(|| {
-                            release
-                                .get("source")
-                                .and_then(Value::as_array)
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|source| source.get("name").and_then(Value::as_str))
-                                .find_map(|name| {
-                                    capture(name, r"(?i)\bPHP\s+([0-9]+(?:\.[0-9]+){1,3})\b")
-                                })
-                        })
-                })
-                .collect::<Vec<_>>();
-            Ok(max_stable(versions.iter().map(String::as_str)))
-        }
-        "python" => {
-            let value = json(bytes, "Python release")?;
-            Ok(max_stable(
-                value
-                    .get("results")
-                    .and_then(Value::as_array)
-                    .or_else(|| value.as_array())
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|item| item.get("name").and_then(Value::as_str))
-                    .filter_map(|name| name.strip_prefix("Python ")),
-            ))
-        }
-        "ruby" => {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|error| format!("invalid Ruby release feed: {error}"))?;
-            let pattern = Regex::new(r"ruby-([0-9]+(?:\.[0-9]+){1,3}(?:-[A-Za-z0-9.]+)?)")
-                .expect("valid regex");
-            Ok(max_stable(pattern.captures_iter(text).filter_map(
-                |captures| captures.get(1).map(|value| value.as_str()),
-            )))
-        }
-        "java" => {
-            let value = json(bytes, "OpenJDK release")?;
-            Ok(value
-                .get("most_recent_feature_release")
-                .and_then(Value::as_u64)
-                .map(|version| version.to_string()))
-        }
-        "dotnet" => {
-            let value = json(bytes, ".NET release")?;
-            Ok(max_stable(
-                value
-                    .get("releases-index")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|item| item.get("latest-release").and_then(Value::as_str)),
-            ))
-        }
-        "go" => {
-            let value = json(bytes, "Go release")?;
-            Ok(max_stable(
-                value
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|item| item.get("stable").and_then(Value::as_bool).unwrap_or(false))
-                    .filter_map(|item| item.get("version").and_then(Value::as_str))
-                    .filter_map(|version| version.strip_prefix("go")),
-            ))
-        }
-        "rust" => {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|error| format!("invalid Rust release feed: {error}"))?;
-            Ok(capture(
-                text,
-                r#"(?ms)^\[pkg\.rust\]\s+version\s*=\s*[\"']([0-9]+(?:\.[0-9]+){1,3})"#,
-            )
-            .filter(|version| !is_prerelease(version)))
-        }
-        "node" => {
-            let value = json(bytes, "Node.js release")?;
-            Ok(max_stable(
-                value
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|item| item.get("version").and_then(Value::as_str)),
-            ))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn max_stable<'a>(versions: impl Iterator<Item = &'a str>) -> Option<String> {
-    versions
-        .filter(|version| !is_prerelease(version) && version_numbers(version).is_some())
-        .max_by(|left, right| compare_version_values(left, right).unwrap_or(Ordering::Equal))
-        .map(normalize_version)
-}
-
-fn is_prerelease(version: &str) -> bool {
-    if parse_semver_flexible(version).is_some_and(|version| !version.pre.is_empty()) {
-        return true;
-    }
-    PRERELEASE_PATTERN.is_match(version)
-}
-
 fn version_numbers(version: &str) -> Option<Vec<u64>> {
-    let normalized = normalized_version(version);
+    let normalized = {
+        let (value,): (&str,) = (version,);
+        let inlined_result: &str = {
+            value
+                .trim()
+                .trim_start_matches('=')
+                .trim_start()
+                .trim_start_matches(['v', 'V'])
+                .trim_end_matches("+incompatible")
+        };
+        inlined_result
+    };
     let start = normalized.find(|character: char| character.is_ascii_digit())?;
     let value = &normalized[start..];
     let end = value
@@ -4173,213 +8358,4 @@ fn version_numbers(version: &str) -> Option<Vec<u64>> {
         .collect::<Result<Vec<u64>, _>>()
         .ok()?;
     (!numbers.is_empty()).then_some(numbers)
-}
-
-fn compare_version_values(left: &str, right: &str) -> Option<Ordering> {
-    Some(compare_version_parts(
-        &version_numbers(left)?,
-        &version_numbers(right)?,
-    ))
-}
-
-fn compare_version_parts(left: &[u64], right: &[u64]) -> Ordering {
-    let length = left.len().max(right.len()).max(3);
-    (0..length)
-        .map(|index| {
-            left.get(index)
-                .copied()
-                .unwrap_or(0)
-                .cmp(&right.get(index).copied().unwrap_or(0))
-        })
-        .find(|ordering| *ordering != Ordering::Equal)
-        .unwrap_or(Ordering::Equal)
-}
-
-fn compare_versions(
-    ecosystem: TechnologyEcosystem,
-    installed: &str,
-    latest: &str,
-) -> TechnologyVersionStatus {
-    if is_prerelease(installed) || is_prerelease(latest) {
-        return TechnologyVersionStatus::Prerelease;
-    }
-    if matches!(
-        ecosystem,
-        TechnologyEcosystem::Npm
-            | TechnologyEcosystem::NuGet
-            | TechnologyEcosystem::GoModules
-            | TechnologyEcosystem::CratesIo
-    ) && let (Some(installed), Some(latest)) = (
-        parse_semver_flexible(installed),
-        parse_semver_flexible(latest),
-    ) {
-        return match installed.cmp(&latest) {
-            Ordering::Equal => TechnologyVersionStatus::Current,
-            Ordering::Greater => TechnologyVersionStatus::NewerThanLatest,
-            Ordering::Less if installed.major != latest.major => {
-                TechnologyVersionStatus::OutdatedMajor
-            }
-            Ordering::Less if installed.minor != latest.minor => {
-                TechnologyVersionStatus::OutdatedMinor
-            }
-            Ordering::Less => TechnologyVersionStatus::OutdatedPatch,
-        };
-    }
-    let Some(installed_parts) = version_numbers(installed) else {
-        return TechnologyVersionStatus::Unverifiable;
-    };
-    let Some(latest_parts) = version_numbers(latest) else {
-        return TechnologyVersionStatus::Unverifiable;
-    };
-    match compare_version_parts(&installed_parts, &latest_parts) {
-        Ordering::Equal => TechnologyVersionStatus::Current,
-        Ordering::Greater => TechnologyVersionStatus::NewerThanLatest,
-        Ordering::Less
-            if installed_parts.first().copied().unwrap_or(0)
-                != latest_parts.first().copied().unwrap_or(0) =>
-        {
-            TechnologyVersionStatus::OutdatedMajor
-        }
-        Ordering::Less
-            if installed_parts.get(1).copied().unwrap_or(0)
-                != latest_parts.get(1).copied().unwrap_or(0) =>
-        {
-            TechnologyVersionStatus::OutdatedMinor
-        }
-        Ordering::Less => TechnologyVersionStatus::OutdatedPatch,
-    }
-}
-
-fn parse_semver_flexible(version: &str) -> Option<Version> {
-    let normalized = normalized_version(version);
-    if let Ok(version) = Version::parse(normalized) {
-        return Some(version);
-    }
-    let split = normalized.find(['-', '+']).unwrap_or(normalized.len());
-    let (core, suffix) = normalized.split_at(split);
-    let dots = core.chars().filter(|character| *character == '.').count();
-    let padded = match dots {
-        0 => format!("{core}.0.0{suffix}"),
-        1 => format!("{core}.0{suffix}"),
-        _ => return None,
-    };
-    Version::parse(&padded).ok()
-}
-
-fn outdated_findings(endpoints: &[EndpointScan]) -> Vec<ExposureFinding> {
-    let mut findings = BTreeMap::new();
-    for endpoint in endpoints {
-        for component in &endpoint.technology_components {
-            if component.support_status == TechnologySupportStatus::Unsupported
-                && let Some(installed) = component.installed_version.as_deref()
-            {
-                let title = format!(
-                    "Unsupported technology release line: {} {installed}",
-                    component.name
-                );
-                let mut evidence = component
-                    .evidence_urls
-                    .iter()
-                    .map(|url| format!("Affected resource: {url}"))
-                    .collect::<Vec<_>>();
-                if let Some(source) = &component.release_source_url {
-                    evidence.push(format!("Upstream lifecycle/release source: {source}"));
-                }
-                evidence.sort();
-                evidence.dedup();
-                let candidate = ExposureFinding {
-                    title,
-                    description: format!(
-                        "Upstream release metadata designates the detected {} release line as legacy, end-of-life, or outside the currently supported line",
-                        component.name
-                    ),
-                    ip: endpoint.ip,
-                    port: endpoint.port,
-                    transport: endpoint.transport,
-                    evidence,
-                    component_kind: Some(component.kind),
-                };
-                insert_outdated_finding(&mut findings, candidate);
-            }
-            if !matches!(
-                component.status,
-                TechnologyVersionStatus::OutdatedPatch
-                    | TechnologyVersionStatus::OutdatedMinor
-                    | TechnologyVersionStatus::OutdatedMajor
-            ) {
-                continue;
-            }
-            let (Some(installed), Some(latest)) = (
-                component.installed_version.as_deref(),
-                component.latest_version.as_deref(),
-            ) else {
-                continue;
-            };
-            let difference = match component.status {
-                TechnologyVersionStatus::OutdatedPatch => "Patch",
-                TechnologyVersionStatus::OutdatedMinor => "Minor",
-                TechnologyVersionStatus::OutdatedMajor => "Major",
-                _ => unreachable!(),
-            };
-            let title = format!(
-                "Outdated component: {} {installed} - {latest} ({difference} Difference)",
-                component.name,
-            );
-            let mut evidence = component
-                .evidence_urls
-                .iter()
-                .map(|url| format!("Affected resource: {url}"))
-                .collect::<Vec<_>>();
-            if let Some(source) = &component.release_source_url {
-                evidence.push(format!("Upstream release source: {source}"));
-            }
-            evidence.sort();
-            evidence.dedup();
-            let candidate = ExposureFinding {
-                title,
-                description: format!(
-                    "Installed {} {} is behind the newest stable {} release {} ({} difference)",
-                    component.name,
-                    installed,
-                    component.ecosystem,
-                    latest,
-                    difference.to_ascii_lowercase()
-                ),
-                ip: endpoint.ip,
-                port: endpoint.port,
-                transport: endpoint.transport,
-                evidence,
-                component_kind: Some(component.kind),
-            };
-            insert_outdated_finding(&mut findings, candidate);
-        }
-    }
-    let mut findings = findings.into_values().collect::<Vec<_>>();
-    findings.sort_by(|left, right| {
-        left.ip
-            .cmp(&right.ip)
-            .then(left.port.cmp(&right.port))
-            .then(left.transport.cmp(&right.transport))
-            .then(left.title.cmp(&right.title))
-    });
-    findings
-}
-
-fn insert_outdated_finding(
-    findings: &mut BTreeMap<(IpAddr, u16, TransportProtocol, String), ExposureFinding>,
-    finding: ExposureFinding,
-) {
-    let key = (
-        finding.ip,
-        finding.port,
-        finding.transport,
-        finding.title.clone(),
-    );
-    if let Some(existing) = findings.get_mut(&key) {
-        existing.evidence.extend(finding.evidence);
-        existing.evidence.sort();
-        existing.evidence.dedup();
-    } else {
-        findings.insert(key, finding);
-    }
 }

@@ -2,7 +2,6 @@ use crate::diagnostics::{
     DiagnosticProgress, DiagnosticTrace, StageKind, StageStatus, TraceError, TraceOutcome,
 };
 use std::future::Future;
-use std::net::IpAddr;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -19,7 +18,7 @@ pub(super) enum WaitError {
 pub(super) fn begin_stage(
     trace: &mut DiagnosticTrace,
     kind: StageKind,
-    progress: &Sender<DiagnosticProgress>,
+    progress: &Option<Sender<DiagnosticProgress>>,
 ) -> Instant {
     if let Some(stage) = trace
         .stages
@@ -30,7 +29,14 @@ pub(super) fn begin_stage(
         stage.duration_ms = None;
         stage.detail.clear();
     }
-    publish(trace, progress);
+    ({
+        let (trace, progress): (&DiagnosticTrace, &Option<Sender<DiagnosticProgress>>) =
+            (trace, progress);
+
+        if let Some(progress) = progress {
+            let _ = progress.send(DiagnosticProgress::HttpHopUpdated(trace.clone()));
+        }
+    });
     Instant::now()
 }
 
@@ -40,10 +46,17 @@ pub(super) fn finish_stage(
     status: StageStatus,
     started: Instant,
     detail: String,
-    progress: &Sender<DiagnosticProgress>,
+    progress: &Option<Sender<DiagnosticProgress>>,
 ) {
     set_stage(trace, kind, status, started, detail);
-    publish(trace, progress);
+    ({
+        let (trace, progress): (&DiagnosticTrace, &Option<Sender<DiagnosticProgress>>) =
+            (trace, progress);
+
+        if let Some(progress) = progress {
+            let _ = progress.send(DiagnosticProgress::HttpHopUpdated(trace.clone()));
+        }
+    });
 }
 
 pub(super) fn set_stage(
@@ -59,7 +72,7 @@ pub(super) fn set_stage(
         .find(|stage| stage.kind == kind && stage.status == StageStatus::Running)
     {
         stage.status = status;
-        stage.duration_ms = Some(elapsed_ms(started));
+        stage.duration_ms = Some((started).elapsed().as_secs_f64() * 1000.0);
         stage.detail = detail;
     }
 }
@@ -70,7 +83,6 @@ pub(super) fn fail_trace(
     status: StageStatus,
     started: Instant,
     message: String,
-    _progress: &Sender<DiagnosticProgress>,
 ) -> DiagnosticTrace {
     if matches!(stage, StageKind::FirstByte | StageKind::Body) && !trace.body.raw.is_empty() {
         decode_body(&mut trace);
@@ -96,10 +108,6 @@ pub(super) fn fail_trace(
     trace
 }
 
-pub(super) fn publish(trace: &DiagnosticTrace, progress: &Sender<DiagnosticProgress>) {
-    let _ = progress.send(DiagnosticProgress::HttpHopUpdated(trace.clone()));
-}
-
 pub(super) async fn wait_for<T, F>(
     duration: Duration,
     cancel: &CancellationToken,
@@ -114,12 +122,4 @@ where
             result.map_err(|_| WaitError::TimedOut)
         }
     }
-}
-
-pub(super) fn address_family(ip: IpAddr) -> String {
-    if ip.is_ipv4() { "IPv4" } else { "IPv6" }.to_owned()
-}
-
-pub(super) fn elapsed_ms(started: Instant) -> f64 {
-    started.elapsed().as_secs_f64() * 1000.0
 }

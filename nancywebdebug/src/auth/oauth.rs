@@ -2,7 +2,6 @@ use bytes::Bytes;
 use http::header::HOST;
 use http::{Request, Response, Uri, Version};
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use oauth2::basic::BasicClient;
 use oauth2::{
@@ -59,13 +58,86 @@ pub async fn sign_in_interactive(
         .set_redirect_uri(RedirectUrl::new(redirect.clone()).map_err(|error| error.to_string())?);
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
     let mut authorization = client.authorize_url(CsrfToken::new_random);
-    for scope in interactive_scopes(&config.scopes) {
+    for scope in {
+        let (scopes,): (&str,) = (&config.scopes,);
+
+        let mut scopes = (scopes)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if !scopes.iter().any(|scope| scope == "offline_access") {
+            scopes.push("offline_access".to_owned());
+        }
+        scopes
+    } {
         authorization = authorization.add_scope(Scope::new(scope));
     }
     let (authorization_url, expected_state) = authorization.set_pkce_challenge(challenge).url();
     webbrowser::open(authorization_url.as_str())
         .map_err(|error| format!("Unable to open the system browser: {error}"))?;
-    let (code, returned_state) = receive_oauth_callback(listener, &cancel).await?;
+    let (code, returned_state) = {
+let (listener, cancel,): (TcpListener, & CancellationToken,) = (listener, &cancel,);
+async move {
+
+    let accepted = tokio::select! {
+        _ = cancel.cancelled() => return Err("Authentication cancelled".to_owned()),
+        accepted = tokio::time::timeout(Duration::from_secs(300), listener.accept()) => accepted,
+    };
+    let (mut stream, _) = accepted
+        .map_err(|_| "Azure sign-in timed out".to_owned())?
+        .map_err(|error| format!("OAuth callback failed: {error}"))?;
+    let mut request = vec![0_u8; 16 * 1024];
+    let length = stream
+        .read(&mut request)
+        .await
+        .map_err(|error| format!("Unable to read OAuth callback: {error}"))?;
+    let request = String::from_utf8_lossy(&request[..length]);
+    let target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| "OAuth callback request was invalid".to_owned())?;
+    let callback = Url::parse(&format!("http://127.0.0.1{target}"))
+        .map_err(|error| format!("OAuth callback URL was invalid: {error}"))?;
+    let parameters = callback.query_pairs().collect::<Vec<_>>();
+    let error = parameters
+        .iter()
+        .find(|(key, _)| key == "error_description")
+        .map(|(_, value)| value.to_string());
+    let result = if let Some(error) = error {
+        Err(error)
+    } else {
+        let code = parameters
+            .iter()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.to_string())
+            .ok_or_else(|| "OAuth callback did not contain an authorization code".to_owned());
+        let state = parameters
+            .iter()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.to_string())
+            .ok_or_else(|| "OAuth callback did not contain state".to_owned());
+        code.and_then(|code| state.map(|state| (code, state)))
+    };
+    let successful = result.is_ok();
+    let body = if successful {
+        "Sign-in completed. You can close this tab."
+    } else {
+        "Sign-in failed. Return to Nancy API Debugger for details."
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    result
+
+}
+}.await?;
     if returned_state != *expected_state.secret() {
         return Err("OAuth state validation failed".to_owned());
     }
@@ -153,65 +225,6 @@ fn cache_token(
     }
 }
 
-async fn receive_oauth_callback(
-    listener: TcpListener,
-    cancel: &CancellationToken,
-) -> Result<(String, String), String> {
-    let accepted = tokio::select! {
-        _ = cancel.cancelled() => return Err("Authentication cancelled".to_owned()),
-        accepted = tokio::time::timeout(Duration::from_secs(300), listener.accept()) => accepted,
-    };
-    let (mut stream, _) = accepted
-        .map_err(|_| "Azure sign-in timed out".to_owned())?
-        .map_err(|error| format!("OAuth callback failed: {error}"))?;
-    let mut request = vec![0_u8; 16 * 1024];
-    let length = stream
-        .read(&mut request)
-        .await
-        .map_err(|error| format!("Unable to read OAuth callback: {error}"))?;
-    let request = String::from_utf8_lossy(&request[..length]);
-    let target = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .ok_or_else(|| "OAuth callback request was invalid".to_owned())?;
-    let callback = Url::parse(&format!("http://127.0.0.1{target}"))
-        .map_err(|error| format!("OAuth callback URL was invalid: {error}"))?;
-    let parameters = callback.query_pairs().collect::<Vec<_>>();
-    let error = parameters
-        .iter()
-        .find(|(key, _)| key == "error_description")
-        .map(|(_, value)| value.to_string());
-    let result = if let Some(error) = error {
-        Err(error)
-    } else {
-        let code = parameters
-            .iter()
-            .find(|(key, _)| key == "code")
-            .map(|(_, value)| value.to_string())
-            .ok_or_else(|| "OAuth callback did not contain an authorization code".to_owned());
-        let state = parameters
-            .iter()
-            .find(|(key, _)| key == "state")
-            .map(|(_, value)| value.to_string())
-            .ok_or_else(|| "OAuth callback did not contain state".to_owned());
-        code.and_then(|code| state.map(|state| (code, state)))
-    };
-    let successful = result.is_ok();
-    let body = if successful {
-        "Sign-in completed. You can close this tab."
-    } else {
-        "Sign-in failed. Return to Nancy API Debugger for details."
-    };
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(response.as_bytes()).await;
-    result
-}
-
 fn azure_endpoints(tenant: &str) -> Result<(String, String), String> {
     let tenant = tenant.trim();
     if tenant.is_empty()
@@ -227,27 +240,17 @@ fn azure_endpoints(tenant: &str) -> Result<(String, String), String> {
     Ok((format!("{base}/authorize"), format!("{base}/token")))
 }
 
-fn interactive_scopes(scopes: &str) -> Vec<String> {
-    let mut scopes = normalize_scopes(scopes)
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if !scopes.iter().any(|scope| scope == "offline_access") {
-        scopes.push("offline_access".to_owned());
-    }
-    scopes
-}
-
-pub(super) fn normalize_scopes(scopes: &str) -> String {
-    scopes.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 pub(super) fn validate_azure(tenant: &str, client_id: &str, scopes: &str) -> Result<(), String> {
     azure_endpoints(tenant)?;
     if client_id.trim().is_empty() {
         return Err("Client ID is required".to_owned());
     }
-    if normalize_scopes(scopes).is_empty() {
+    if (scopes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .is_empty()
+    {
         return Err("At least one scope is required".to_owned());
     }
     Ok(())
@@ -260,101 +263,154 @@ impl<'c> AsyncHttpClient<'c> for OAuthHttpClient {
     type Future = Pin<Box<dyn Future<Output = Result<HttpResponse, Self::Error>> + 'c>>;
 
     fn call(&'c self, request: HttpRequest) -> Self::Future {
-        Box::pin(send_oauth_request(request))
+        Box::pin({
+            let (request,): (HttpRequest,) = (request,);
+            async move {
+                let authority = request.uri().authority().cloned().ok_or_else(|| {
+                    let (value,): (_,) = ("OAuth request URL has no authority",);
+                    let inlined_result: io::Error = { io::Error::other(value.to_string()) };
+                    inlined_result
+                })?;
+                if request.uri().scheme_str() != Some("https") {
+                    return Err({
+                        let (value,): (_,) = ("OAuth token requests require HTTPS",);
+                        let inlined_result: io::Error = { io::Error::other(value.to_string()) };
+                        inlined_result
+                    });
+                }
+                let host = authority.host().to_owned();
+                let tcp = TcpStream::connect((host.as_str(), authority.port_u16().unwrap_or(443)))
+                    .await?;
+                let server_name = ServerName::try_from(host)
+                    .map_err(|value| -> io::Error { io::Error::other(value.to_string()) })?;
+                let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+                let verifier = PlatformVerifier::new(provider.clone())
+                    .map_err(|value| -> io::Error { io::Error::other(value.to_string()) })?;
+                let mut config = ClientConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .map_err(|value| -> io::Error { io::Error::other(value.to_string()) })?
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(verifier))
+                    .with_no_client_auth();
+                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                let tls = TlsConnector::from(Arc::new(config))
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|value| -> io::Error { io::Error::other(value.to_string()) })?;
+                let version = match tls.get_ref().1.alpn_protocol() {
+                    Some(b"h2") => Version::HTTP_2,
+                    _ => Version::HTTP_11,
+                };
+                let request = {
+                    let (request, authority, version): (
+                        HttpRequest,
+                        http::uri::Authority,
+                        Version,
+                    ) = (request, authority, version);
+                    let inlined_result: Result<Request<Full<Bytes>>, io::Error> = 'inlined_oauth_origin_form_request: {
+                        let (mut parts, body) = request.into_parts();
+                        let path = parts
+                            .uri
+                            .path_and_query()
+                            .map_or("/", http::uri::PathAndQuery::as_str);
+                        parts.uri = match path
+                            .parse::<Uri>()
+                            .map_err(|value| -> io::Error { io::Error::other(value.to_string()) })
+                        {
+                            Ok(value) => value,
+                            Err(error) => {
+                                break 'inlined_oauth_origin_form_request Err(
+                                    ::core::convert::From::from(error),
+                                );
+                            }
+                        };
+                        parts.version = version;
+                        if !parts.headers.contains_key(HOST) {
+                            parts.headers.insert(
+                                HOST,
+                                match authority.as_str().parse::<http::HeaderValue>().map_err(
+                                    |value| -> io::Error { io::Error::other(value.to_string()) },
+                                ) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        break 'inlined_oauth_origin_form_request Err(
+                                            ::core::convert::From::from(error),
+                                        );
+                                    }
+                                },
+                            );
+                        }
+                        Ok(Request::from_parts(parts, Full::new(Bytes::from(body))))
+                    };
+                    inlined_result
+                }?;
+                let response =
+                    match version {
+                        Version::HTTP_2 => {
+                            {
+                                let (stream, request): (
+                                    tokio_rustls::client::TlsStream<TcpStream>,
+                                    Request<Full<Bytes>>,
+                                ) = (tls, request);
+                                async move {
+                                    let (mut sender, connection) =
+                                        hyper::client::conn::http2::handshake(
+                                            TokioExecutor::new(),
+                                            TokioIo::new(stream),
+                                        )
+                                        .await
+                                        .map_err(
+                                            |value| -> io::Error {
+                                                io::Error::other(value.to_string())
+                                            },
+                                        )?;
+                                    tokio::spawn(async move {
+                                        let _ = connection.await;
+                                    });
+                                    sender.send_request(request).await.map_err(
+                                        |value| -> io::Error {
+                                            io::Error::other(value.to_string())
+                                        },
+                                    )
+                                }
+                            }
+                            .await?
+                        }
+                        _ => {
+                            {
+                                let (stream, request): (
+                                    tokio_rustls::client::TlsStream<TcpStream>,
+                                    Request<Full<Bytes>>,
+                                ) = (tls, request);
+                                async move {
+                                    let (mut sender, connection) =
+                                        hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                                            .await
+                                            .map_err(|value| -> io::Error {
+                                                io::Error::other(value.to_string())
+                                            })?;
+                                    tokio::spawn(async move {
+                                        let _ = connection.await;
+                                    });
+                                    sender.send_request(request).await.map_err(
+                                        |value| -> io::Error {
+                                            io::Error::other(value.to_string())
+                                        },
+                                    )
+                                }
+                            }
+                            .await?
+                        }
+                    };
+                let (parts, body) = response.into_parts();
+                let body = body
+                    .collect()
+                    .await
+                    .map_err(|value| -> io::Error { io::Error::other(value.to_string()) })?
+                    .to_bytes()
+                    .to_vec();
+                Ok(Response::from_parts(parts, body))
+            }
+        })
     }
-}
-
-async fn send_oauth_request(request: HttpRequest) -> Result<HttpResponse, io::Error> {
-    let authority = request
-        .uri()
-        .authority()
-        .cloned()
-        .ok_or_else(|| oauth_io_error("OAuth request URL has no authority"))?;
-    if request.uri().scheme_str() != Some("https") {
-        return Err(oauth_io_error("OAuth token requests require HTTPS"));
-    }
-    let host = authority.host().to_owned();
-    let tcp = TcpStream::connect((host.as_str(), authority.port_u16().unwrap_or(443))).await?;
-    let server_name = ServerName::try_from(host).map_err(oauth_io_error)?;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let verifier = PlatformVerifier::new(provider.clone()).map_err(oauth_io_error)?;
-    let mut config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(oauth_io_error)?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    let tls = TlsConnector::from(Arc::new(config))
-        .connect(server_name, tcp)
-        .await
-        .map_err(oauth_io_error)?;
-    let version = match tls.get_ref().1.alpn_protocol() {
-        Some(b"h2") => Version::HTTP_2,
-        _ => Version::HTTP_11,
-    };
-    let request = oauth_origin_form_request(request, authority, version)?;
-    let response = match version {
-        Version::HTTP_2 => send_oauth_http2(tls, request).await?,
-        _ => send_oauth_http1(tls, request).await?,
-    };
-    let (parts, body) = response.into_parts();
-    let body = body
-        .collect()
-        .await
-        .map_err(oauth_io_error)?
-        .to_bytes()
-        .to_vec();
-    Ok(Response::from_parts(parts, body))
-}
-
-fn oauth_origin_form_request(
-    request: HttpRequest,
-    authority: http::uri::Authority,
-    version: Version,
-) -> Result<Request<Full<Bytes>>, io::Error> {
-    let (mut parts, body) = request.into_parts();
-    let path = parts
-        .uri
-        .path_and_query()
-        .map_or("/", http::uri::PathAndQuery::as_str);
-    parts.uri = path.parse::<Uri>().map_err(oauth_io_error)?;
-    parts.version = version;
-    if !parts.headers.contains_key(HOST) {
-        parts
-            .headers
-            .insert(HOST, authority.as_str().parse().map_err(oauth_io_error)?);
-    }
-    Ok(Request::from_parts(parts, Full::new(Bytes::from(body))))
-}
-
-async fn send_oauth_http1(
-    stream: tokio_rustls::client::TlsStream<TcpStream>,
-    request: Request<Full<Bytes>>,
-) -> Result<Response<Incoming>, io::Error> {
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .map_err(oauth_io_error)?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    sender.send_request(request).await.map_err(oauth_io_error)
-}
-
-async fn send_oauth_http2(
-    stream: tokio_rustls::client::TlsStream<TcpStream>,
-    request: Request<Full<Bytes>>,
-) -> Result<Response<Incoming>, io::Error> {
-    let (mut sender, connection) =
-        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
-            .await
-            .map_err(oauth_io_error)?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    sender.send_request(request).await.map_err(oauth_io_error)
-}
-
-fn oauth_io_error(value: impl ToString) -> io::Error {
-    io::Error::other(value.to_string())
 }

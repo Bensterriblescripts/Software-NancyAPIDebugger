@@ -2,7 +2,7 @@ use http::HeaderValue;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use zeroize::Zeroizing;
@@ -85,7 +85,26 @@ pub fn capture_browser_cookies(
         .lines()
         .find_map(|line| line.strip_prefix("NANCY_COOKIE_ERROR:"))
     {
-        return Err(decode_protocol_text(encoded)?);
+        return Err({
+            let (encoded,): (&str,) = (encoded,);
+            let inlined_result: Result<String, String> = 'inlined_decode_protocol_text: {
+                use base64::Engine;
+                let decoded = match base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|_| "The WebView2 error result was invalid".to_owned())
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        break 'inlined_decode_protocol_text Err(::core::convert::From::from(
+                            error,
+                        ));
+                    }
+                };
+                String::from_utf8(decoded)
+                    .map_err(|_| "The WebView2 error result was not valid text".to_owned())
+            };
+            inlined_result
+        }?);
     }
     let encoded = output_text
         .lines()
@@ -138,35 +157,11 @@ pub(super) fn normalize_cookie(input: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
-pub(super) fn normalize_cookie_path(path: &str) -> String {
-    if path.starts_with('/') {
-        path.to_owned()
-    } else {
-        "/".to_owned()
-    }
-}
-
 pub(super) fn cookie_path_matches(cookie_path: &str, request_path: &str) -> bool {
     request_path == cookie_path
         || (request_path.starts_with(cookie_path)
             && (cookie_path.ends_with('/')
                 || request_path.as_bytes().get(cookie_path.len()) == Some(&b'/')))
-}
-
-pub(super) fn unix_timestamp_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
-fn decode_protocol_text(encoded: &str) -> Result<String, String> {
-    use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|_| "The WebView2 error result was invalid".to_owned())?;
-    String::from_utf8(decoded)
-        .map_err(|_| "The WebView2 error result was not valid text".to_owned())
 }
 
 pub(super) fn parse_http_url(input: &str) -> Result<Url, String> {
@@ -183,27 +178,28 @@ pub(super) fn parse_http_url(input: &str) -> Result<Url, String> {
 }
 
 pub(super) fn require_host_scope(input: &str) -> Result<String, String> {
-    let scope = normalize_host_scope(input);
+    let scope = {
+        let (input,): (&str,) = (input,);
+        {
+            input
+                .trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or_default()
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+        }
+    };
     if scope.is_empty() {
         Err("Host scope is required".to_owned())
     } else {
         Ok(scope)
     }
-}
-
-pub(super) fn normalize_host_scope(input: &str) -> String {
-    input
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
 }
 
 pub(super) fn validate_host(target_url: &str, host_scope: &str) -> Result<(), String> {

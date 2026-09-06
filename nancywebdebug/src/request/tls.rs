@@ -379,7 +379,31 @@ pub(crate) fn parse_certificate(der: &[u8]) -> CertificateTrace {
                         .map(|name| match name {
                             GeneralName::DNSName(name) => format!("DNS: {name}"),
                             GeneralName::IPAddress(bytes) => {
-                                format!("IP: {}", format_ip_bytes(bytes))
+                                format!(
+                                    "IP: {}",
+                                    ({
+                                        let (bytes,): (&[u8],) = (bytes,);
+                                        let inlined_result: String = {
+                                            match bytes.len() {
+                                                4 => IpAddr::V4(Ipv4Addr::new(
+                                                    bytes[0], bytes[1], bytes[2], bytes[3],
+                                                ))
+                                                .to_string(),
+                                                16 => {
+                                                    let mut octets = [0u8; 16];
+                                                    octets.copy_from_slice(bytes);
+                                                    IpAddr::V6(Ipv6Addr::from(octets)).to_string()
+                                                }
+                                                _ => bytes
+                                                    .iter()
+                                                    .map(|byte| format!("{byte:02X}"))
+                                                    .collect::<Vec<_>>()
+                                                    .join(":"),
+                                            }
+                                        };
+                                        inlined_result
+                                    })
+                                )
                             }
                             other => format!("{other:?}"),
                         })
@@ -469,21 +493,5 @@ pub(crate) fn parse_certificate(der: &[u8]) -> CertificateTrace {
             extended_key_usage: Vec::new(),
             sha256,
         },
-    }
-}
-
-fn format_ip_bytes(bytes: &[u8]) -> String {
-    match bytes.len() {
-        4 => IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])).to_string(),
-        16 => {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(bytes);
-            IpAddr::V6(Ipv6Addr::from(octets)).to_string()
-        }
-        _ => bytes
-            .iter()
-            .map(|byte| format!("{byte:02X}"))
-            .collect::<Vec<_>>()
-            .join(":"),
     }
 }
