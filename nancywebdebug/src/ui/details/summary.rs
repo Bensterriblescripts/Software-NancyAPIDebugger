@@ -1,4 +1,6 @@
 use crate::diagnostics::DiagnosticTrace;
+use crate::ui::disclosure::show as disclosure;
+use crate::ui::report_layout::{ITEM_SPACING, LabelValueRows, section_space};
 use eframe::egui;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -71,90 +73,83 @@ pub(in crate::ui) fn show(
         inlined_result
     };
     ({
-        eframe::egui::ScrollArea::both().auto_shrink([false, true]).show(ui, |ui| { ui.style_mut().wrap_mode = Some(eframe::egui::TextWrapMode::Extend);
+        eframe::egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| { ui.style_mut().wrap_mode = Some(eframe::egui::TextWrapMode::Wrap);
+        ui.spacing_mut().item_spacing.y = ITEM_SPACING;
         ui.heading("Diagnostic Summary");
-        egui::Grid::new("summary_grid")
-            .striped(true)
-            .show(ui, |ui| {
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Outcome", &trace.outcome.to_string()); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Method", &trace.request.method); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Start URL", start_url); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Additional Redirects", &additional_redirects); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Final URL", final_url); ui.strong(label); ui.label(value); ui.end_row(); });
+        LabelValueRows::show(ui, "summary_grid", |ui, rows| {
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Outcome", &trace.outcome.to_string()); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Method", &trace.request.method); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Start URL", start_url); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Additional Redirects", &additional_redirects); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Final URL", final_url); rows.row(ui, label, value); });
                 ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Authentication", &trace
                         .request
                         .auth
                         .as_ref()
                         .map(|auth| format!("{} ({})", auth.profile_name, auth.profile_kind))
-                        .unwrap_or_else(|| "None".to_owned())); ui.strong(label); ui.label(value); ui.end_row(); });
+                        .unwrap_or_else(|| "None".to_owned())); rows.row(ui, label, value); });
                 ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Client certificate", &trace
                         .request
                         .client_certificate
                         .as_ref()
-                        .map(|certificate| {
-                            format!(
-                                "{} — subject {} — issuer {} — serial {} — valid until {} — SHA-256 {}",
-                                certificate.profile_name,
-                                certificate.subject,
-                                certificate.issuer,
-                                certificate.serial,
-                                certificate.not_after,
-                                certificate.sha256
-                            )
-                        })
-                        .unwrap_or_else(|| "None".to_owned())); ui.strong(label); ui.label(value); ui.end_row(); });
+                        .map(|certificate| certificate.profile_name.clone())
+                        .unwrap_or_else(|| "None".to_owned())); rows.row(ui, label, value); });
                 ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Request mode", if trace.request.follow_redirects {
                         "Follow redirects (each hop is traced)"
                     } else {
                         "Direct (redirects are not followed)"
-                    }); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Raw Location", &redirect_location); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Redirect target", trace.redirect_target.as_deref().unwrap_or("None")); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Redirect followed", if trace.redirect_followed { "Yes" } else { "No" }); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Redirect stop reason", trace.redirect_stop_reason.as_deref().unwrap_or("None")); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Mode", &trace.connection_mode); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Requested protocol", &trace.http.requested_protocol); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Negotiated protocol", trace.http.version.as_deref().unwrap_or("Pending")); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Status", &trace.status_text()); ui.strong(label); ui.label(value); ui.end_row(); });
+                    }); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Raw Location", &redirect_location); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Redirect target", trace.redirect_target.as_deref().unwrap_or("None")); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Redirect followed", if trace.redirect_followed { "Yes" } else { "No" }); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Redirect stop reason", trace.redirect_stop_reason.as_deref().unwrap_or("None")); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Mode", &trace.connection_mode); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Requested protocol", &trace.http.requested_protocol); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Negotiated protocol", trace.http.version.as_deref().unwrap_or("Pending")); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Status", &trace.status_text()); rows.row(ui, label, value); });
                 ({
 let (ui, label, value, color,): (& mut egui :: Ui, & str, & str, Option < egui :: Color32 >,) = (ui, "Certificate expiry", &certificate_expiry, certificate_expiry_color,);
 
-    ui.strong(label);
+    let mut value = egui::RichText::new(value);
     if let Some(color) = color {
-        ui.colored_label(color, value);
-    } else {
-        ui.label(value);
+        value = value.color(color);
     }
-    ui.end_row();
+    rows.row(ui, label, value);
 
 });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Web server", &trace.fingerprint.web_server); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Fingerprint status", &trace.fingerprint.status.to_string()); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Confidence", &trace.fingerprint.confidence); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Raw body capture", &trace.body.raw_capture_status()); ui.strong(label); ui.label(value); ui.end_row(); });
-                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Decoded body capture", &trace.body.decoded_capture_status()); ui.strong(label); ui.label(value); ui.end_row(); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Web server", &trace.fingerprint.web_server); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Fingerprint status", &trace.fingerprint.status.to_string()); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Confidence", &trace.fingerprint.confidence); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Raw body capture", &trace.body.raw_capture_status()); rows.row(ui, label, value); });
+                ({ let (ui, label, value): (&mut eframe::egui::Ui, &str, &str) = (ui, "Decoded body capture", &trace.body.decoded_capture_status()); rows.row(ui, label, value); });
             });
+        if let Some(certificate) = &trace.request.client_certificate {
+            section_space(ui);
+            disclosure(ui, "client-certificate", "Client Certificate Details", |_| {}, |ui| {
+                ui.label(format!("{} — subject {} — issuer {} — serial {} — valid until {} — SHA-256 {}", certificate.profile_name, certificate.subject, certificate.issuer, certificate.serial, certificate.not_after, certificate.sha256));
+            });
+        }
         if let Some(error) = &trace.error {
-            ui.add_space(12.0);
             ui.colored_label(
                 egui::Color32::LIGHT_RED,
                 format!("{}: {}", error.stage, error.message),
             );
         }
         if let Some(reason) = &trace.redirect_stop_reason {
-            ui.add_space(12.0);
             ui.colored_label(egui::Color32::YELLOW, reason);
         }
         if !trace.complete {
-            ui.add_space(12.0);
             ui.spinner();
         }
-        ui.add_space(12.0);
+        section_space(ui);
         ({
             let (ui, trace): (&mut egui::Ui, &DiagnosticTrace) = (ui, trace);
 
-            ui.heading("Timeline");
-            egui::Grid::new("timeline_grid")
+            crate::ui::disclosure::show_with_default_open(ui, "timeline", egui::RichText::new(format!("Timeline ({} stages)", trace.stages.len())).heading(), true,
+                |ui| { ui.label(format!("Recorded stage time: {:.2} ms", trace.stages.iter().filter_map(|stage| stage.duration_ms).sum::<f64>())); }, |ui| {
+            egui::ScrollArea::horizontal().id_salt("timeline_grid-scroll").auto_shrink([false, true]).show(ui, |ui| {
+egui::Grid::new("timeline_grid")
+                .num_columns(4)
                 .striped(true)
                 .min_col_width(120.0)
                 .show(ui, |ui| {
@@ -174,6 +169,8 @@ let (ui, label, value, color,): (& mut egui :: Ui, & str, & str, Option < egui :
                         ui.end_row();
                     }
                 });
+                });
+            });
         });
     });
     });

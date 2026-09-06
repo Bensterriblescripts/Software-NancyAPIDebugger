@@ -4,7 +4,7 @@ use hickory_resolver::proto::rr::{Name, RData, RecordType};
 use std::future::Future;
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 
 pub(crate) const STOP_REASON: &str =
     "Skipped: sustained target-specific failure; automated blocking suspected";
@@ -12,6 +12,7 @@ pub(crate) const STOP_REASON: &str =
 tokio::task_local! {
     static TRACKER: Arc<Tracker>;
     static INSIDE_ATTEMPT: bool;
+    static INDEPENDENT: bool;
 }
 
 struct Tracker {
@@ -21,7 +22,9 @@ struct Tracker {
 }
 
 struct Endpoint {
-    gate: Arc<AsyncMutex<()>>,
+    gate: Arc<RwLock<()>>,
+    independent_slots: Arc<Semaphore>,
+    finish_gate: AsyncMutex<()>,
     state: Mutex<State>,
 }
 
@@ -117,6 +120,10 @@ pub(crate) async fn inside<T>(future: impl Future<Output = T>) -> T {
     INSIDE_ATTEMPT.scope(true, future).await
 }
 
+pub(super) async fn independent<T>(future: impl Future<Output = T>) -> T {
+    INDEPENDENT.scope(true, future).await
+}
+
 pub(super) fn register(ip: IpAddr) {
     let _ = TRACKER.try_with(|tracker| tracker.addresses.lock().unwrap().insert(ip));
 }
@@ -152,7 +159,8 @@ pub(crate) struct Attempt {
     endpoint: Arc<Endpoint>,
     remote: SocketAddr,
     elapsed_ms: f64,
-    _guard: OwnedMutexGuard<()>,
+    _exclusive: Option<OwnedRwLockWriteGuard<()>>,
+    _shared: Option<(OwnedRwLockReadGuard<()>, OwnedSemaphorePermit)>,
 }
 
 pub(crate) async fn begin(
@@ -180,15 +188,26 @@ pub(crate) async fn begin(
         .entry(remote)
         .or_insert_with(|| {
             Arc::new(Endpoint {
-                gate: Arc::new(AsyncMutex::new(())),
+                gate: Arc::new(RwLock::new(())),
+                independent_slots: Arc::new(Semaphore::new(4)),
+                finish_gate: AsyncMutex::new(()),
                 state: Mutex::new(State::default()),
             })
         })
         .clone();
-    let guard = tokio::select! {
+    let (exclusive, shared) = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err("Scan cancelled".to_owned()),
-        guard = endpoint.gate.clone().lock_owned() => guard,
+        guards = async {
+            if INDEPENDENT.try_with(|independent| *independent).unwrap_or(false) {
+                let permit = endpoint.independent_slots.clone().acquire_owned().await
+                    .map_err(|error| error.to_string())?;
+                let guard = endpoint.gate.clone().read_owned().await;
+                Ok::<_, String>((None, Some((guard, permit))))
+            } else {
+                Ok((Some(endpoint.gate.clone().write_owned().await), None))
+            }
+        } => guards?,
     };
     if endpoint.state.lock().unwrap().stopped {
         return Err(STOP_REASON.to_owned());
@@ -197,7 +216,8 @@ pub(crate) async fn begin(
         endpoint,
         remote,
         elapsed_ms: ((tracker.started).elapsed().as_secs_f64() * 1000.0),
-        _guard: guard,
+        _exclusive: exclusive,
+        _shared: shared,
     }))
 }
 
@@ -245,6 +265,14 @@ impl Attempt {
         baseline: Option<Baseline>,
         cancel: &CancellationToken,
     ) {
+        let _finish = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            guard = self.endpoint.finish_gate.lock() => guard,
+        };
+        if self.endpoint.state.lock().unwrap().stopped {
+            return;
+        }
         let confirmation = {
             let mut state = self.endpoint.state.lock().unwrap();
             if result == Outcome::Ignored || cancel.is_cancelled() {

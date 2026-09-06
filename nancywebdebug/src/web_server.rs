@@ -26,6 +26,7 @@ impl fmt::Display for FingerprintConfidence {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WebServerDetection {
+    pub observations: Vec<crate::TechnologyEvidence>,
     pub product: &'static str,
     pub identifier: &'static str,
     pub role: WebProductRole,
@@ -1006,7 +1007,30 @@ fn detect_web_servers_inner<'a>(
                                 version: None,
                                 confidence,
                                 evidence: Vec::new(),
+                                observations: Vec::new(),
                             });
+                    if let Some(detail) = &evidence {
+                        let observed = detail.split_once(": ").map_or(detail.as_str(), |(_, value)| value);
+                        let (source, value) = observed.split_once(": ").filter(|(name, _)| name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')).map_or_else(|| ("Body / cookie signature".to_owned(), observed), |(name, value)| (format!("Header {name}"), value));
+                        let mut record = crate::exposure::technology_evidence::observation(&source, value);
+                        if source.starts_with("Header ") && value.len() > 512 {
+                            let lower_value = value.to_ascii_lowercase();
+                            let start = entry.aliases.iter().filter_map(|(alias, _)| lower_value.find(alias)).min().or_else(|| version.as_deref().and_then(|version| value.find(version)));
+                            if let Some(start) = start {
+                                let (value, shortened) = crate::exposure::technology_evidence::excerpt(value, start..(start + 80).min(value.len()));
+                                record.observed_value = Some(value);
+                                record.excerpt_shortened = shortened;
+                            }
+                        }
+                        if observed.starts_with("Response body") || observed.starts_with("Apache fallback") {
+                            record.excerpt_shortened |= body.len() > value.len();
+                        }
+                        if let Some(url) = response_url { crate::exposure::technology_evidence::locate(&mut record, url, None, None, status, false); }
+                        record.status = status;
+                        record.extracted_version = version.as_deref().map(crate::exposure::technology_evidence::safe_value);
+                        detection.observations.push(record);
+                    }
+
                     if detection.version.is_none() {
                         detection.version = version;
                     }
@@ -1112,7 +1136,30 @@ fn detect_web_servers_inner<'a>(
                                 version: None,
                                 confidence,
                                 evidence: Vec::new(),
+                                observations: Vec::new(),
                             });
+                    if let Some(detail) = &evidence {
+                        let observed = detail.split_once(": ").map_or(detail.as_str(), |(_, value)| value);
+                        let (source, value) = observed.split_once(": ").filter(|(name, _)| name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')).map_or_else(|| ("Body / cookie signature".to_owned(), observed), |(name, value)| (format!("Header {name}"), value));
+                        let mut record = crate::exposure::technology_evidence::observation(&source, value);
+                        if source.starts_with("Header ") && value.len() > 512 {
+                            let lower_value = value.to_ascii_lowercase();
+                            let start = entry.aliases.iter().filter_map(|(alias, _)| lower_value.find(alias)).min().or_else(|| version.as_deref().and_then(|version| value.find(version)));
+                            if let Some(start) = start {
+                                let (value, shortened) = crate::exposure::technology_evidence::excerpt(value, start..(start + 80).min(value.len()));
+                                record.observed_value = Some(value);
+                                record.excerpt_shortened = shortened;
+                            }
+                        }
+                        if observed.starts_with("Response body") || observed.starts_with("Apache fallback") {
+                            record.excerpt_shortened |= body.len() > value.len();
+                        }
+                        if let Some(url) = response_url { crate::exposure::technology_evidence::locate(&mut record, url, None, None, status, false); }
+                        record.status = status;
+                        record.extracted_version = version.as_deref().map(crate::exposure::technology_evidence::safe_value);
+                        detection.observations.push(record);
+                    }
+
                     if detection.version.is_none() {
                         detection.version = version;
                     }
@@ -1213,7 +1260,30 @@ fn detect_web_servers_inner<'a>(
                             version: None,
                             confidence,
                             evidence: Vec::new(),
+                                observations: Vec::new(),
                         });
+                if let Some(detail) = &evidence {
+                        let observed = detail.split_once(": ").map_or(detail.as_str(), |(_, value)| value);
+                        let (source, value) = observed.split_once(": ").filter(|(name, _)| name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')).map_or_else(|| ("Body / cookie signature".to_owned(), observed), |(name, value)| (format!("Header {name}"), value));
+                        let mut record = crate::exposure::technology_evidence::observation(&source, value);
+                        if source.starts_with("Header ") && value.len() > 512 {
+                            let lower_value = value.to_ascii_lowercase();
+                            let start = entry.aliases.iter().filter_map(|(alias, _)| lower_value.find(alias)).min().or_else(|| version.as_deref().and_then(|version| value.find(version)));
+                            if let Some(start) = start {
+                                let (value, shortened) = crate::exposure::technology_evidence::excerpt(value, start..(start + 80).min(value.len()));
+                                record.observed_value = Some(value);
+                                record.excerpt_shortened = shortened;
+                            }
+                        }
+                        if observed.starts_with("Response body") || observed.starts_with("Apache fallback") {
+                            record.excerpt_shortened |= body.len() > value.len();
+                        }
+                        if let Some(url) = response_url { crate::exposure::technology_evidence::locate(&mut record, url, None, None, status, false); }
+                        record.status = status;
+                        record.extracted_version = version.as_deref().map(crate::exposure::technology_evidence::safe_value);
+                        detection.observations.push(record);
+                    }
+
                 if detection.version.is_none() {
                     detection.version = version;
                 }
@@ -1313,7 +1383,30 @@ fn detect_web_servers_inner<'a>(
                                 version: None,
                                 confidence,
                                 evidence: Vec::new(),
+                                observations: Vec::new(),
                             });
+                    if let Some(detail) = &evidence {
+                        let observed = detail.split_once(": ").map_or(detail.as_str(), |(_, value)| value);
+                        let (source, value) = observed.split_once(": ").filter(|(name, _)| name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')).map_or_else(|| ("Body / cookie signature".to_owned(), observed), |(name, value)| (format!("Header {name}"), value));
+                        let mut record = crate::exposure::technology_evidence::observation(&source, value);
+                        if source.starts_with("Header ") && value.len() > 512 {
+                            let lower_value = value.to_ascii_lowercase();
+                            let start = entry.aliases.iter().filter_map(|(alias, _)| lower_value.find(alias)).min().or_else(|| version.as_deref().and_then(|version| value.find(version)));
+                            if let Some(start) = start {
+                                let (value, shortened) = crate::exposure::technology_evidence::excerpt(value, start..(start + 80).min(value.len()));
+                                record.observed_value = Some(value);
+                                record.excerpt_shortened = shortened;
+                            }
+                        }
+                        if observed.starts_with("Response body") || observed.starts_with("Apache fallback") {
+                            record.excerpt_shortened |= body.len() > value.len();
+                        }
+                        if let Some(url) = response_url { crate::exposure::technology_evidence::locate(&mut record, url, None, None, status, false); }
+                        record.status = status;
+                        record.extracted_version = version.as_deref().map(crate::exposure::technology_evidence::safe_value);
+                        detection.observations.push(record);
+                    }
+
                     if detection.version.is_none() {
                         detection.version = version;
                     }
@@ -1497,8 +1590,9 @@ fn detect_web_servers_inner<'a>(
                             status,
                             response_url,
                             &format!(
-                                "Response body contains a distinctive {} default/error-page marker",
-                                entry.product
+                                "Response body marker for {}: {}",
+                                entry.product,
+                                markers.iter().filter_map(|marker| lower.find(marker).map(|start| crate::exposure::technology_evidence::excerpt(&text, start..start + marker.len()).0)).collect::<Vec<_>>().join(" … ")
                             ),
                         );
                         let inlined_result: String = {
@@ -1544,7 +1638,30 @@ fn detect_web_servers_inner<'a>(
                             version: None,
                             confidence,
                             evidence: Vec::new(),
+                                observations: Vec::new(),
                         });
+                if let Some(detail) = &evidence {
+                        let observed = detail.split_once(": ").map_or(detail.as_str(), |(_, value)| value);
+                        let (source, value) = observed.split_once(": ").filter(|(name, _)| name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')).map_or_else(|| ("Body / cookie signature".to_owned(), observed), |(name, value)| (format!("Header {name}"), value));
+                        let mut record = crate::exposure::technology_evidence::observation(&source, value);
+                        if source.starts_with("Header ") && value.len() > 512 {
+                            let lower_value = value.to_ascii_lowercase();
+                            let start = entry.aliases.iter().filter_map(|(alias, _)| lower_value.find(alias)).min().or_else(|| version.as_deref().and_then(|version| value.find(version)));
+                            if let Some(start) = start {
+                                let (value, shortened) = crate::exposure::technology_evidence::excerpt(value, start..(start + 80).min(value.len()));
+                                record.observed_value = Some(value);
+                                record.excerpt_shortened = shortened;
+                            }
+                        }
+                        if observed.starts_with("Response body") || observed.starts_with("Apache fallback") {
+                            record.excerpt_shortened |= body.len() > value.len();
+                        }
+                        if let Some(url) = response_url { crate::exposure::technology_evidence::locate(&mut record, url, None, None, status, false); }
+                        record.status = status;
+                        record.extracted_version = version.as_deref().map(crate::exposure::technology_evidence::safe_value);
+                        detection.observations.push(record);
+                    }
+
                 if detection.version.is_none() {
                     detection.version = version;
                 }
@@ -1619,7 +1736,7 @@ inlined_result
         ({
 let (detections, entry, version, confidence, evidence,): (& mut BTreeMap < & 'static str , WebServerDetection >, & 'static CatalogEntry, Option < String >, FingerprintConfidence, Option < String >,) = (detections, entry, None, FingerprintConfidence::High, include_evidence.then(|| {
                 {
-let (status, response_url, detail,): (Option < u16 >, Option < & str >, & str,) = (status, response_url, "Response body matches Apache's fallback ErrorDocument page",);
+let (status, response_url, detail,): (Option < u16 >, Option < & str >, & str,) = (status, response_url, &format!("Apache fallback ErrorDocument body: {}", crate::exposure::technology_evidence::excerpt(&text, lower.find("errordocument").unwrap_or(0)..lower.find("errordocument").unwrap_or(0) + 13).0),);
 let inlined_result: String = {
 
     let url = response_url
@@ -1661,7 +1778,30 @@ inlined_result
             version: None,
             confidence,
             evidence: Vec::new(),
+                                observations: Vec::new(),
         });
+    if let Some(detail) = &evidence {
+                        let observed = detail.split_once(": ").map_or(detail.as_str(), |(_, value)| value);
+                        let (source, value) = observed.split_once(": ").filter(|(name, _)| name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')).map_or_else(|| ("Body / cookie signature".to_owned(), observed), |(name, value)| (format!("Header {name}"), value));
+                        let mut record = crate::exposure::technology_evidence::observation(&source, value);
+                        if source.starts_with("Header ") && value.len() > 512 {
+                            let lower_value = value.to_ascii_lowercase();
+                            let start = entry.aliases.iter().filter_map(|(alias, _)| lower_value.find(alias)).min().or_else(|| version.as_deref().and_then(|version| value.find(version)));
+                            if let Some(start) = start {
+                                let (value, shortened) = crate::exposure::technology_evidence::excerpt(value, start..(start + 80).min(value.len()));
+                                record.observed_value = Some(value);
+                                record.excerpt_shortened = shortened;
+                            }
+                        }
+                        if observed.starts_with("Response body") || observed.starts_with("Apache fallback") {
+                            record.excerpt_shortened |= body.len() > value.len();
+                        }
+                        if let Some(url) = response_url { crate::exposure::technology_evidence::locate(&mut record, url, None, None, status, false); }
+                        record.status = status;
+                        record.extracted_version = version.as_deref().map(crate::exposure::technology_evidence::safe_value);
+                        detection.observations.push(record);
+                    }
+
     if detection.version.is_none() {
         detection.version = version;
     }

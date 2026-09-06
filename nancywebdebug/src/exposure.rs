@@ -16,7 +16,7 @@ use cookie::{Cookie, SameSite};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use rustls::pki_types::ServerName;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::mpsc::Sender;
@@ -36,6 +36,8 @@ mod active_web;
 mod artifact_analysis;
 #[path = "asset_dns.rs"]
 mod asset_dns;
+#[path = "finding_assessment.rs"]
+pub(crate) mod finding_assessment;
 #[path = "browser_policy.rs"]
 mod browser_policy;
 #[path = "crawl.rs"]
@@ -52,6 +54,8 @@ mod service_access;
 mod stream_inventory;
 #[path = "technology.rs"]
 mod technology;
+#[path = "technology_evidence.rs"]
+pub(crate) mod technology_evidence;
 #[path = "udp_scan.rs"]
 mod udp_scan;
 
@@ -136,18 +140,22 @@ public_ports![
     (1521, "Oracle database", "Database service"),
     (1723, "PPTP", "Legacy VPN control service"),
     (1883, "MQTT", "Message broker service"),
-    (1935, "RTMP", "Media streaming handshake service"),
     (
         1911,
         "Niagara Fox",
         "Building automation protocol association"
     ),
+    (1935, "RTMP", "Media streaming handshake service"),
     (2049, "NFS", "Network file system service"),
+    (2082, "cPanel HTTP", "Hosting panel listener association; requires response evidence"),
+    (2083, "cPanel HTTPS", "TLS-backed hosting panel listener association"),
+    (2086, "WHM HTTP", "Server management panel listener association; requires response evidence"),
+    (2087, "WHM HTTPS", "TLS-backed server management panel listener association"),
     (2181, "ZooKeeper", "Distributed coordination service"),
     (
         2222,
-        "SSH alternate",
-        "Common alternate secure shell and remote administration service"
+        "DirectAdmin / SSH alternate",
+        "Shared HTTP, HTTPS or alternate SSH listener; requires protocol evidence"
     ),
     (
         2375,
@@ -231,18 +239,24 @@ public_ports![
     (8000, "HTTP alternate", "Alternate web service"),
     (8008, "HTTP alternate", "Alternate web service"),
     (8009, "AJP", "Apache JServ Protocol service"),
-    (8080, "HTTP alternate", "Alternate web service"),
+    (8080, "HTTP alternate", "Alternate HTTP/HTTPS web service, including ISPConfig"),
     (
         8081,
         "HTTP alternate",
         "Alternate web or management service"
     ),
+    (8083, "HestiaCP", "HTTP/HTTPS hosting panel listener association"),
     (8086, "InfluxDB", "InfluxDB HTTP API"),
     (8088, "HTTP management", "Common management web service"),
     (
         8089,
         "Splunk management",
         "Common TLS-backed Splunk management API"
+    ),
+    (
+        8090,
+        "CyberPanel",
+        "HTTP/HTTPS hosting panel listener association"
     ),
     (
         8291,
@@ -252,10 +266,11 @@ public_ports![
     (
         8443,
         "HTTPS alternate",
-        "Alternate TLS-backed web or management service"
+        "Alternate HTTP/HTTPS web or management service, including Plesk"
     ),
     (8500, "Consul", "Consul HTTP API"),
     (8554, "RTSP alternate", "Media signalling service"),
+    (8880, "Plesk HTTP", "HTTP/HTTPS hosting panel listener association"),
     (8883, "MQTT over TLS", "TLS-backed message broker service"),
     (
         8888,
@@ -276,7 +291,7 @@ public_ports![
     (
         9090,
         "HTTP management",
-        "Common monitoring or management web service"
+        "HTTP/HTTPS monitoring or management service, including Cockpit"
     ),
     (9100, "Printer service", "Raw printing service"),
     (9200, "Elasticsearch", "Elasticsearch HTTP API"),
@@ -293,8 +308,8 @@ public_ports![
     ),
     (
         10000,
-        "Webmin",
-        "Common TLS-backed Webmin administration service"
+        "Webmin / Virtualmin",
+        "HTTP/HTTPS administration panel listener association"
     ),
     (10050, "Zabbix agent", "Monitoring agent service"),
     (10051, "Zabbix server", "Monitoring server service"),
@@ -341,12 +356,15 @@ pub fn curated_tcp_port_metadata(port: u16) -> Option<&'static PublicPortMetadat
 }
 
 const HTTP_PORTS: &[u16] = &[
-    80, 2375, 2379, 2380, 3000, 5000, 5601, 5984, 5985, 7001, 8000, 8008, 8080, 8081, 8086, 8088,
-    8500, 8888, 9000, 9001, 9090, 9200, 10255, 15672,
+    80, 2082, 2086, 2222, 2375, 2379, 2380, 3000, 5000, 5601, 5984, 5985, 7001, 8000, 8008, 8080,
+    8081, 8083, 8086, 8088, 8090, 8443, 8500, 8880, 8888, 9000, 9001, 9090, 9200, 10000, 10255, 15672,
 ];
-const HTTPS_PORTS: &[u16] = &[443, 2376, 5986, 6443, 8089, 8443, 10000, 10250];
+const HTTPS_PORTS: &[u16] = &[
+    443, 2083, 2087, 2222, 2376, 5986, 6443, 8080, 8083, 8089, 8090, 8443, 8880, 9090, 10000, 10250,
+];
 const TLS_PORTS: &[u16] = &[
-    443, 465, 636, 993, 995, 2376, 3269, 5671, 5986, 6443, 8089, 8443, 8883, 10000, 10250,
+    443, 465, 636, 993, 995, 2083, 2087, 2222, 2376, 3269, 5671, 5986, 6443, 8080, 8083, 8089, 8090,
+    8443, 8880, 8883, 9090, 10000, 10250,
 ];
 const NEGOTIATION_ONLY_TCP_PORTS: &[u16] = &[
     111, 139, 389, 445, 554, 636, 1883, 1935, 2049, 3268, 3269, 8554, 8883, 27017,
@@ -747,6 +765,7 @@ let (request, error, started,): (ExposureScanRequest, String, Instant,) = (reque
         udp_endpoints: Vec::new(),
         service_access: Vec::new(),
         discovered_assets: Vec::new(),
+        discovery_coverage: crate::DiscoveryCoverage::default(),
         dns_observations: Vec::new(),
         stream_observations: Vec::new(),
         findings: Vec::new(),
@@ -777,97 +796,7 @@ inlined_result
 }
 
 };
-            ({
-let (report, started, progress,): (& mut ExposureScanReport, Instant, & Option < Sender < ExposureScanProgress > >,) = (&mut report, total_started, &progress,);
-
-    report.endpoint_health = endpoint_health::observations();
-    for endpoint in &mut report.endpoints {
-        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
-            let reason = endpoint_health::STOP_REASON.to_owned();
-            if !endpoint.evidence.contains(&reason) {
-                endpoint.evidence.push(reason);
-            }
-        }
-    }
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Running,
-        0.0,
-        "Building security summary",
-    );
-    report.security_checks = report
-        .endpoints
-        .iter()
-        .flat_map(|endpoint| endpoint.security_checks.iter().cloned())
-        .collect();
-    report.security_checks.sort_by(|left, right| {
-        left.ip
-            .cmp(&right.ip)
-            .then(left.port.cmp(&right.port))
-            .then(left.class.cmp(&right.class))
-            .then(left.check_id.cmp(&right.check_id))
-            .then(left.probe_url.cmp(&right.probe_url))
-    });
-    report.security_checks.dedup_by(|left, right| {
-        left.ip == right.ip
-            && left.port == right.port
-            && left.check_id == right.check_id
-            && left.probe_url == right.probe_url
-    });
-    report.findings.extend(
-        report
-            .security_checks
-            .iter()
-            .filter(|check| check.outcome == CheckOutcome::Vulnerable)
-            .map(|check| ExposureFinding {
-                title: check.title.clone(),
-                description: format!(
-                    "The {} security check confirmed the tested condition",
-                    check.class
-                ),
-                ip: check.ip,
-                port: check.port,
-                transport: TransportProtocol::Tcp,
-                evidence: check.evidence.clone(),
-                component_kind: None,
-            }),
-    );
-    let crawl_findings = std::mem::take(&mut report.findings);
-    let mut findings =
-        build_security_summary(&report.endpoints, report.request.security_operations)
-            .into_iter()
-            .map(|finding| (({ let finding = &finding; (finding.ip, finding.port, finding.transport, finding.title.clone()) }), finding))
-            .collect::<BTreeMap<_, _>>();
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Running,
-        0.65,
-        "Assembling report findings",
-    );
-    for finding in crawl_findings {
-        add_security_summary_finding(&mut findings, finding);
-    }
-    report.findings = findings.into_values().collect();
-    report.timings.total_ms = {
-
-let inlined_result: f64 = {
-
-    started.elapsed().as_secs_f64() * 1000.0
-
-};
-inlined_result
-};
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Complete,
-        1.0,
-        "Report assembled",
-    );
-
-});
+            finalize_report(&mut report, total_started, &cancel, &progress).await;
             ({
 let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
                 ExposureScanProgress::Completed(report.clone())
@@ -946,6 +875,7 @@ let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&p
         udp_endpoints: Vec::new(),
         service_access: Vec::new(),
         discovered_assets: Vec::new(),
+        discovery_coverage: crate::DiscoveryCoverage::default(),
         dns_observations: Vec::new(),
         stream_observations: Vec::new(),
         findings: Vec::new(),
@@ -977,97 +907,7 @@ let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&p
             Err(error) => {
                 report.status = ExposureScanStatus::Failed;
                 report.error = Some(error);
-                ({
-let (report, started, progress,): (& mut ExposureScanReport, Instant, & Option < Sender < ExposureScanProgress > >,) = (&mut report, total_started, &progress,);
-
-    report.endpoint_health = endpoint_health::observations();
-    for endpoint in &mut report.endpoints {
-        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
-            let reason = endpoint_health::STOP_REASON.to_owned();
-            if !endpoint.evidence.contains(&reason) {
-                endpoint.evidence.push(reason);
-            }
-        }
-    }
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Running,
-        0.0,
-        "Building security summary",
-    );
-    report.security_checks = report
-        .endpoints
-        .iter()
-        .flat_map(|endpoint| endpoint.security_checks.iter().cloned())
-        .collect();
-    report.security_checks.sort_by(|left, right| {
-        left.ip
-            .cmp(&right.ip)
-            .then(left.port.cmp(&right.port))
-            .then(left.class.cmp(&right.class))
-            .then(left.check_id.cmp(&right.check_id))
-            .then(left.probe_url.cmp(&right.probe_url))
-    });
-    report.security_checks.dedup_by(|left, right| {
-        left.ip == right.ip
-            && left.port == right.port
-            && left.check_id == right.check_id
-            && left.probe_url == right.probe_url
-    });
-    report.findings.extend(
-        report
-            .security_checks
-            .iter()
-            .filter(|check| check.outcome == CheckOutcome::Vulnerable)
-            .map(|check| ExposureFinding {
-                title: check.title.clone(),
-                description: format!(
-                    "The {} security check confirmed the tested condition",
-                    check.class
-                ),
-                ip: check.ip,
-                port: check.port,
-                transport: TransportProtocol::Tcp,
-                evidence: check.evidence.clone(),
-                component_kind: None,
-            }),
-    );
-    let crawl_findings = std::mem::take(&mut report.findings);
-    let mut findings =
-        build_security_summary(&report.endpoints, report.request.security_operations)
-            .into_iter()
-            .map(|finding| (({ let finding = &finding; (finding.ip, finding.port, finding.transport, finding.title.clone()) }), finding))
-            .collect::<BTreeMap<_, _>>();
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Running,
-        0.65,
-        "Assembling report findings",
-    );
-    for finding in crawl_findings {
-        add_security_summary_finding(&mut findings, finding);
-    }
-    report.findings = findings.into_values().collect();
-    report.timings.total_ms = {
-
-let inlined_result: f64 = {
-
-    started.elapsed().as_secs_f64() * 1000.0
-
-};
-inlined_result
-};
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Complete,
-        1.0,
-        "Report assembled",
-    );
-
-});
+                finalize_report(&mut report, total_started, &cancel, &progress).await;
                 ({
 let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
                     ExposureScanProgress::Completed(report.clone())
@@ -1125,227 +965,14 @@ let inlined_result: f64 = {
 };
 inlined_result
 };
-    let limiter = Arc::new(ConnectionRateLimiter::new(
-        request.connection_starts_per_second,
-    ));
-    if request.dns_assessment {
-        let (observations, warnings) = asset_dns::assess_dns(
-            &report.hostname, request, &cancel, limiter.as_ref(), &progress,
-        ).await;
-        report.dns_observations = observations;
-        report.warnings.extend(warnings);
-    }
-    if cancel.is_cancelled() {
-        report.status = ExposureScanStatus::Cancelled;
-        report.error = Some("Scan cancelled".to_owned());
-        ({
-let (report, started, progress,): (& mut ExposureScanReport, Instant, & Option < Sender < ExposureScanProgress > >,) = (&mut report, total_started, &progress,);
-
-    report.endpoint_health = endpoint_health::observations();
-    for endpoint in &mut report.endpoints {
-        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
-            let reason = endpoint_health::STOP_REASON.to_owned();
-            if !endpoint.evidence.contains(&reason) {
-                endpoint.evidence.push(reason);
-            }
-        }
-    }
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Running,
-        0.0,
-        "Building security summary",
-    );
-    report.security_checks = report
-        .endpoints
-        .iter()
-        .flat_map(|endpoint| endpoint.security_checks.iter().cloned())
-        .collect();
-    report.security_checks.sort_by(|left, right| {
-        left.ip
-            .cmp(&right.ip)
-            .then(left.port.cmp(&right.port))
-            .then(left.class.cmp(&right.class))
-            .then(left.check_id.cmp(&right.check_id))
-            .then(left.probe_url.cmp(&right.probe_url))
-    });
-    report.security_checks.dedup_by(|left, right| {
-        left.ip == right.ip
-            && left.port == right.port
-            && left.check_id == right.check_id
-            && left.probe_url == right.probe_url
-    });
-    report.findings.extend(
-        report
-            .security_checks
-            .iter()
-            .filter(|check| check.outcome == CheckOutcome::Vulnerable)
-            .map(|check| ExposureFinding {
-                title: check.title.clone(),
-                description: format!(
-                    "The {} security check confirmed the tested condition",
-                    check.class
-                ),
-                ip: check.ip,
-                port: check.port,
-                transport: TransportProtocol::Tcp,
-                evidence: check.evidence.clone(),
-                component_kind: None,
-            }),
-    );
-    let crawl_findings = std::mem::take(&mut report.findings);
-    let mut findings =
-        build_security_summary(&report.endpoints, report.request.security_operations)
-            .into_iter()
-            .map(|finding| (({ let finding = &finding; (finding.ip, finding.port, finding.transport, finding.title.clone()) }), finding))
-            .collect::<BTreeMap<_, _>>();
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Running,
-        0.65,
-        "Assembling report findings",
-    );
-    for finding in crawl_findings {
-        add_security_summary_finding(&mut findings, finding);
-    }
-    report.findings = findings.into_values().collect();
-    report.timings.total_ms = {
-
-let inlined_result: f64 = {
-
-    started.elapsed().as_secs_f64() * 1000.0
-
-};
-inlined_result
-};
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Complete,
-        1.0,
-        "Report assembled",
-    );
-
-});
-        ({
-let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
-            ExposureScanProgress::Completed(report.clone())
-        },);
-
-    if let Some(progress) = progress {
-        let _ = progress.send(event());
-    }
-
-});
-        return report;
-    }
-    if let Err(error) = resolution {
-        report.status = ExposureScanStatus::Failed;
-        report.error = Some(error);
-        ({
-let (report, started, progress,): (& mut ExposureScanReport, Instant, & Option < Sender < ExposureScanProgress > >,) = (&mut report, total_started, &progress,);
-
-    report.endpoint_health = endpoint_health::observations();
-    for endpoint in &mut report.endpoints {
-        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
-            let reason = endpoint_health::STOP_REASON.to_owned();
-            if !endpoint.evidence.contains(&reason) {
-                endpoint.evidence.push(reason);
-            }
-        }
-    }
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Running,
-        0.0,
-        "Building security summary",
-    );
-    report.security_checks = report
-        .endpoints
-        .iter()
-        .flat_map(|endpoint| endpoint.security_checks.iter().cloned())
-        .collect();
-    report.security_checks.sort_by(|left, right| {
-        left.ip
-            .cmp(&right.ip)
-            .then(left.port.cmp(&right.port))
-            .then(left.class.cmp(&right.class))
-            .then(left.check_id.cmp(&right.check_id))
-            .then(left.probe_url.cmp(&right.probe_url))
-    });
-    report.security_checks.dedup_by(|left, right| {
-        left.ip == right.ip
-            && left.port == right.port
-            && left.check_id == right.check_id
-            && left.probe_url == right.probe_url
-    });
-    report.findings.extend(
-        report
-            .security_checks
-            .iter()
-            .filter(|check| check.outcome == CheckOutcome::Vulnerable)
-            .map(|check| ExposureFinding {
-                title: check.title.clone(),
-                description: format!(
-                    "The {} security check confirmed the tested condition",
-                    check.class
-                ),
-                ip: check.ip,
-                port: check.port,
-                transport: TransportProtocol::Tcp,
-                evidence: check.evidence.clone(),
-                component_kind: None,
-            }),
-    );
-    let crawl_findings = std::mem::take(&mut report.findings);
-    let mut findings =
-        build_security_summary(&report.endpoints, report.request.security_operations)
-            .into_iter()
-            .map(|finding| (({ let finding = &finding; (finding.ip, finding.port, finding.transport, finding.title.clone()) }), finding))
-            .collect::<BTreeMap<_, _>>();
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Running,
-        0.65,
-        "Assembling report findings",
-    );
-    for finding in crawl_findings {
-        add_security_summary_finding(&mut findings, finding);
-    }
-    report.findings = findings.into_values().collect();
-    report.timings.total_ms = {
-
-let inlined_result: f64 = {
-
-    started.elapsed().as_secs_f64() * 1000.0
-
-};
-inlined_result
-};
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Complete,
-        1.0,
-        "Report assembled",
-    );
-
-});
-        ({
-let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
-            ExposureScanProgress::Completed(report.clone())
-        },);
-
-    if let Some(progress) = progress {
-        let _ = progress.send(event());
-    }
-
-});
-        return report;
+    let address_collection_incomplete = dns.lookup_outcomes.iter().any(|outcome|
+        matches!(outcome.record_type.as_str(), "A" | "AAAA") && !outcome.status.conclusive());
+    let incomplete_dns = dns.lookup_outcomes.iter().filter(|outcome| !outcome.status.conclusive())
+        .map(|outcome| format!("{}: {}{}", outcome.record_type, outcome.status,
+            outcome.failure.as_ref().map(|error| format!(" ({error})")).unwrap_or_default()))
+        .collect::<Vec<_>>();
+    if !incomplete_dns.is_empty() {
+        report.warnings.push(format!("Initial DNS coverage incomplete: {}", incomplete_dns.join("; ")));
     }
     let mut seen = HashSet::new();
     for address in dns.addresses {
@@ -1362,100 +989,69 @@ let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&p
             report.resolved_addresses.push(address);
         }
     }
-    if report.resolved_addresses.is_empty() {
-        report.status = ExposureScanStatus::Failed;
-        report.error = Some("Target has no publicly routable A or AAAA address".to_owned());
+    let limiter = Arc::new(ConnectionRateLimiter::new(
+        request.connection_starts_per_second,
+    ));
+    if request.dns_assessment && !cancel.is_cancelled() {
+        let (observations, warnings) = asset_dns::assess_dns(
+            &report.hostname, request, &cancel, limiter.as_ref(), &progress,
+        ).await;
+        report.dns_observations = observations;
+        report.warnings.extend(warnings);
+    }
+    if request.asset_discovery && !cancel.is_cancelled() {
+        let (assets, warnings, coverage) = asset_dns::discover_assets(
+            &report.hostname,
+            request,
+            &cancel,
+            limiter.clone(),
+            &progress,
+        )
+        .await;
+        report.discovered_assets = assets;
+        report.discovery_coverage = coverage;
+        report.warnings.extend(warnings);
+    }
+    if cancel.is_cancelled() {
+        report.status = ExposureScanStatus::Cancelled;
+        report.error = Some("Scan cancelled".to_owned());
+        finalize_report(&mut report, total_started, &cancel, &progress).await;
         ({
-let (report, started, progress,): (& mut ExposureScanReport, Instant, & Option < Sender < ExposureScanProgress > >,) = (&mut report, total_started, &progress,);
+let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
+            ExposureScanProgress::Completed(report.clone())
+        },);
 
-    report.endpoint_health = endpoint_health::observations();
-    for endpoint in &mut report.endpoints {
-        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
-            let reason = endpoint_health::STOP_REASON.to_owned();
-            if !endpoint.evidence.contains(&reason) {
-                endpoint.evidence.push(reason);
-            }
-        }
+    if let Some(progress) = progress {
+        let _ = progress.send(event());
     }
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Running,
-        0.0,
-        "Building security summary",
-    );
-    report.security_checks = report
-        .endpoints
-        .iter()
-        .flat_map(|endpoint| endpoint.security_checks.iter().cloned())
-        .collect();
-    report.security_checks.sort_by(|left, right| {
-        left.ip
-            .cmp(&right.ip)
-            .then(left.port.cmp(&right.port))
-            .then(left.class.cmp(&right.class))
-            .then(left.check_id.cmp(&right.check_id))
-            .then(left.probe_url.cmp(&right.probe_url))
-    });
-    report.security_checks.dedup_by(|left, right| {
-        left.ip == right.ip
-            && left.port == right.port
-            && left.check_id == right.check_id
-            && left.probe_url == right.probe_url
-    });
-    report.findings.extend(
-        report
-            .security_checks
-            .iter()
-            .filter(|check| check.outcome == CheckOutcome::Vulnerable)
-            .map(|check| ExposureFinding {
-                title: check.title.clone(),
-                description: format!(
-                    "The {} security check confirmed the tested condition",
-                    check.class
-                ),
-                ip: check.ip,
-                port: check.port,
-                transport: TransportProtocol::Tcp,
-                evidence: check.evidence.clone(),
-                component_kind: None,
-            }),
-    );
-    let crawl_findings = std::mem::take(&mut report.findings);
-    let mut findings =
-        build_security_summary(&report.endpoints, report.request.security_operations)
-            .into_iter()
-            .map(|finding| (({ let finding = &finding; (finding.ip, finding.port, finding.transport, finding.title.clone()) }), finding))
-            .collect::<BTreeMap<_, _>>();
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Running,
-        0.65,
-        "Assembling report findings",
-    );
-    for finding in crawl_findings {
-        add_security_summary_finding(&mut findings, finding);
-    }
-    report.findings = findings.into_values().collect();
-    report.timings.total_ms = {
-
-let inlined_result: f64 = {
-
-    started.elapsed().as_secs_f64() * 1000.0
-
-};
-inlined_result
-};
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Complete,
-        1.0,
-        "Report assembled",
-    );
 
 });
+        return report;
+    }
+    if let Err(error) = resolution {
+        report.status = ExposureScanStatus::Failed;
+        report.error = Some(error);
+        finalize_report(&mut report, total_started, &cancel, &progress).await;
+        ({
+let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
+            ExposureScanProgress::Completed(report.clone())
+        },);
+
+    if let Some(progress) = progress {
+        let _ = progress.send(event());
+    }
+
+});
+        return report;
+    }
+    if report.resolved_addresses.is_empty() {
+        report.status = ExposureScanStatus::Failed;
+        report.error = Some(if address_collection_incomplete {
+            "Target address collection was incomplete; no usable public destination was obtained".to_owned()
+        } else {
+            "Target has no publicly routable A or AAAA address".to_owned()
+        });
+        finalize_report(&mut report, total_started, &cancel, &progress).await;
         ({
 let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
             ExposureScanProgress::Completed(report.clone())
@@ -1494,18 +1090,6 @@ let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&p
 
 });
     let scan_started = Instant::now();
-    if request.asset_discovery && !cancel.is_cancelled() {
-        let (assets, warnings) = asset_dns::discover_assets(
-            &report.hostname,
-            request,
-            &cancel,
-            limiter.clone(),
-            &progress,
-        )
-        .await;
-        report.discovered_assets = assets;
-        report.warnings.extend(warnings);
-    }
     send_phase_progress(
         &progress,
         ExposureScanPhase::PortScanning,
@@ -1884,14 +1468,13 @@ inlined_result
             .await;
             report.warnings.extend(javascript.warnings);
             if !cancel.is_cancelled() {
-                report.warnings.extend(fingerprints::detect(
+                report.warnings.extend(fingerprints::detect_async(
                     &mut report.endpoints,
                     &crawl.technology_resources,
                     &javascript.captured_responses,
                     &cancel,
                     &progress,
-                ));
-                reconcile_web_server_products(&mut report.endpoints);
+                ).await);
             }
             captured_stream_scripts = javascript.captured_responses;
             if !cancel.is_cancelled() {
@@ -1951,22 +1534,13 @@ inlined_result
             )
             .await;
         }
-        report.warnings.extend(fingerprints::detect(
+        report.warnings.extend(fingerprints::detect_async(
             &mut report.endpoints,
             &[],
             &[],
             &cancel,
             &progress,
-        ));
-        reconcile_web_server_products(&mut report.endpoints);
-    }
-    for endpoint in &mut report.endpoints {
-        exposure_probe::product_identification::record_service_results(
-            endpoint,
-            &report.service_access,
-        );
-        exposure_probe::product_identification::record_captured(endpoint);
-        crate::product_catalog::reconcile(endpoint);
+        ).await);
     }
     report.timings.scan_ms = {
 let (started,): (Instant,) = (scan_started,);
@@ -1985,97 +1559,7 @@ inlined_result
     if cancel.is_cancelled() {
         report.error = Some("Scan cancelled".to_owned());
     }
-    ({
-let (report, started, progress,): (& mut ExposureScanReport, Instant, & Option < Sender < ExposureScanProgress > >,) = (&mut report, total_started, &progress,);
-
-    report.endpoint_health = endpoint_health::observations();
-    for endpoint in &mut report.endpoints {
-        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
-            let reason = endpoint_health::STOP_REASON.to_owned();
-            if !endpoint.evidence.contains(&reason) {
-                endpoint.evidence.push(reason);
-            }
-        }
-    }
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Running,
-        0.0,
-        "Building security summary",
-    );
-    report.security_checks = report
-        .endpoints
-        .iter()
-        .flat_map(|endpoint| endpoint.security_checks.iter().cloned())
-        .collect();
-    report.security_checks.sort_by(|left, right| {
-        left.ip
-            .cmp(&right.ip)
-            .then(left.port.cmp(&right.port))
-            .then(left.class.cmp(&right.class))
-            .then(left.check_id.cmp(&right.check_id))
-            .then(left.probe_url.cmp(&right.probe_url))
-    });
-    report.security_checks.dedup_by(|left, right| {
-        left.ip == right.ip
-            && left.port == right.port
-            && left.check_id == right.check_id
-            && left.probe_url == right.probe_url
-    });
-    report.findings.extend(
-        report
-            .security_checks
-            .iter()
-            .filter(|check| check.outcome == CheckOutcome::Vulnerable)
-            .map(|check| ExposureFinding {
-                title: check.title.clone(),
-                description: format!(
-                    "The {} security check confirmed the tested condition",
-                    check.class
-                ),
-                ip: check.ip,
-                port: check.port,
-                transport: TransportProtocol::Tcp,
-                evidence: check.evidence.clone(),
-                component_kind: None,
-            }),
-    );
-    let crawl_findings = std::mem::take(&mut report.findings);
-    let mut findings =
-        build_security_summary(&report.endpoints, report.request.security_operations)
-            .into_iter()
-            .map(|finding| (({ let finding = &finding; (finding.ip, finding.port, finding.transport, finding.title.clone()) }), finding))
-            .collect::<BTreeMap<_, _>>();
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Running,
-        0.65,
-        "Assembling report findings",
-    );
-    for finding in crawl_findings {
-        add_security_summary_finding(&mut findings, finding);
-    }
-    report.findings = findings.into_values().collect();
-    report.timings.total_ms = {
-
-let inlined_result: f64 = {
-
-    started.elapsed().as_secs_f64() * 1000.0
-
-};
-inlined_result
-};
-    send_phase_progress(
-        progress,
-        ExposureScanPhase::FinalizingReport,
-        ExposureScanPhaseState::Complete,
-        1.0,
-        "Report assembled",
-    );
-
-});
+    finalize_report(&mut report, total_started, &cancel, &progress).await;
     ({
 let (progress, event,): (& Option < Sender < ExposureScanProgress > >, _,) = (&progress, || {
         ExposureScanProgress::Completed(report.clone())
@@ -2103,6 +1587,7 @@ fn public_stream_finding(
 ) -> ExposureFinding {
     evidence.insert(0, format!("Handshake method: {method}"));
     ExposureFinding {
+        details: Vec::new(),
         title: format!("Public {protocol} endpoint confirmed"),
         description: format!(
             "A protocol-valid {protocol} response confirmed a publicly reachable protocol endpoint. The bounded check did not access media, credentials, stream keys, or application content."
@@ -2243,4 +1728,151 @@ impl EndpointCookieJar {
             });
         }
     }
+}
+
+async fn finalize_report(
+    report: &mut ExposureScanReport,
+    started: Instant,
+    cancel: &CancellationToken,
+    progress: &Option<Sender<ExposureScanProgress>>,
+) {
+    if report.resolved_addresses.is_empty() {
+        let reason = report.error.as_deref().unwrap_or("Target resolution did not complete");
+        for phase in ExposureScanPhase::ALL {
+            if !matches!(phase, ExposureScanPhase::DnsAssessment | ExposureScanPhase::AssetDiscovery | ExposureScanPhase::FinalizingReport) {
+                send_phase_progress(progress, phase, ExposureScanPhaseState::Skipped, 1.0, reason);
+            }
+        }
+    }
+    report.endpoint_health = endpoint_health::observations();
+    for endpoint in &mut report.endpoints {
+        if endpoint_health::stopped(endpoint.ip, endpoint.port) {
+            let reason = endpoint_health::STOP_REASON.to_owned();
+            if !endpoint.evidence.contains(&reason) {
+                endpoint.evidence.push(reason);
+            }
+        }
+    }
+    send_phase_progress(
+        progress,
+        ExposureScanPhase::FinalizingReport,
+        ExposureScanPhaseState::Running,
+        0.0,
+        "Building security summary",
+    );
+    if cancel.is_cancelled() {
+        report.status = ExposureScanStatus::Cancelled;
+        report.error = Some("Scan cancelled".to_owned());
+        report.timings.total_ms = started.elapsed().as_secs_f64() * 1000.0;
+        return;
+    }
+    let mut input = report.clone();
+    match crate::blocking::run(cancel, move |cancel| {
+        let report = &mut input;
+        for endpoint in &mut report.endpoints {
+            if cancel.is_cancelled() {
+                return input;
+            }
+            exposure_probe::product_identification::record_service_results(
+                endpoint,
+                &report.service_access,
+            );
+            exposure_probe::product_identification::record_captured(endpoint, cancel);
+            crate::product_catalog::reconcile(endpoint);
+        }
+
+        let mut report = input;
+        report.security_checks = report
+            .endpoints
+            .iter()
+            .flat_map(|endpoint| endpoint.security_checks.iter().cloned())
+            .collect();
+        report.security_checks.sort_by(|left, right| {
+            left.ip
+                .cmp(&right.ip)
+                .then(left.port.cmp(&right.port))
+                .then(left.class.cmp(&right.class))
+                .then(left.check_id.cmp(&right.check_id))
+                .then(left.probe_url.cmp(&right.probe_url))
+        });
+        report.security_checks.dedup_by(|left, right| {
+            left.ip == right.ip
+                && left.port == right.port
+                && left.check_id == right.check_id
+                && left.probe_url == right.probe_url
+        });
+        report.findings.extend(
+            report
+                .security_checks
+                .iter()
+                .filter(|check| check.outcome == CheckOutcome::Vulnerable)
+                .map(|check| ExposureFinding {
+                    details: Vec::new(),
+                    title: check.title.clone(),
+                    description: format!(
+                        "The {} security check confirmed the tested condition",
+                        check.class
+                    ),
+                    ip: check.ip,
+                    port: check.port,
+                    transport: TransportProtocol::Tcp,
+                    evidence: check.evidence.clone(),
+                    component_kind: None,
+                }),
+        );
+        let crawl_findings = std::mem::take(&mut report.findings);
+        let mut findings = build_security_summary(
+            &report.endpoints,
+            report.request.security_operations,
+            cancel,
+        )
+        .into_iter()
+        .map(|finding| {
+            (
+                ({
+                    let finding = &finding;
+                    (
+                        finding.ip,
+                        finding.port,
+                        finding.transport,
+                        finding.title.clone(),
+                    )
+                }),
+                finding,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+        for finding in crawl_findings {
+            if cancel.is_cancelled() {
+                return report;
+            }
+            add_security_summary_finding(&mut findings, finding);
+        }
+        report.findings = findings.into_values().collect();
+    finding_assessment::finalize_findings(&mut report, cancel);
+
+        report
+    })
+    .await
+    {
+        Ok(processed) => {
+            *report = processed;
+            send_phase_progress(
+                progress,
+                ExposureScanPhase::FinalizingReport,
+                ExposureScanPhaseState::Complete,
+                1.0,
+                "Report assembled",
+            );
+        }
+        Err(crate::blocking::Error::Cancelled) => {
+            report.status = ExposureScanStatus::Cancelled;
+            report.error = Some("Scan cancelled".to_owned());
+        }
+        Err(error) => {
+            report.status = ExposureScanStatus::Failed;
+            report.error = Some(error.to_string());
+        }
+    }
+    report.timings.total_ms = started.elapsed().as_secs_f64() * 1000.0;
 }

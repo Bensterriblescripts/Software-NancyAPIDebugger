@@ -1706,6 +1706,7 @@ pub(super) fn access_finding(result: &ServiceAccessResult) -> Option<ExposureFin
         return None;
     }
     Some(ExposureFinding {
+        details: Vec::new(),
         title: format!("Unauthenticated {} access confirmed", result.service),
         description: result.summary.clone(),
         ip: result.ip,

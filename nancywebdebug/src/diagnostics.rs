@@ -204,6 +204,36 @@ pub struct DnsTrace {
     pub records: Vec<DnsRecord>,
     pub addresses: Vec<IpAddr>,
     pub incomplete_record_types: Vec<String>,
+    pub lookup_outcomes: Vec<DnsLookupOutcome>,
+}
+
+display_enum! {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DnsLookupStatus {
+        Pending => "Pending",
+        Answer => "Answer",
+        NoData => "Confirmed NODATA",
+        NxDomain => "NXDOMAIN",
+        Failed => "Failed",
+        Cancelled => "Cancelled",
+        LimitReached => "Limit reached",
+    }
+}
+
+impl DnsLookupStatus {
+    pub fn conclusive(self) -> bool {
+        matches!(self, Self::Answer | Self::NoData | Self::NxDomain)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DnsLookupOutcome {
+    pub record_type: String,
+    pub queried_name: String,
+    pub terminal_name: String,
+    pub aliases: Vec<(String, String)>,
+    pub status: DnsLookupStatus,
+    pub failure: Option<String>,
 }
 
 #[derive(Debug, Clone)]

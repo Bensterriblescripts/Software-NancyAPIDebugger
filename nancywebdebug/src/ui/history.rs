@@ -5,6 +5,7 @@ pub(super) struct HistoryEntry {
     pub(super) scan_number: usize,
     pub(super) request: ExposureScanRequest,
     pub(super) error: Option<String>,
+    pub(super) warnings: Vec<String>,
 }
 
 pub(super) fn show(
@@ -42,12 +43,28 @@ pub(super) fn show(
                                     .small()
                                     .weak(),
                             );
-                            if let Some(error) = &entry.error {
-                                ui.colored_label(egui::Color32::RED, error);
+                            if entry.error.is_some() {
+                                ui.colored_label(egui::Color32::RED, "Failed");
                             } else {
                                 ui.colored_label(egui::Color32::GREEN, "Success");
                             }
                         });
+                        if let Some(error) = &entry.error {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(error).color(egui::Color32::RED),
+                                )
+                                .wrap(),
+                            );
+                        }
+                        for warning in &entry.warnings {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(warning).color(egui::Color32::YELLOW),
+                                )
+                                .wrap(),
+                            );
+                        }
                     });
                     ui.add_space(6.0);
                 }

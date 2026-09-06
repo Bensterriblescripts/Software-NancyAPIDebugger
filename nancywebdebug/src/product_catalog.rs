@@ -1,6 +1,9 @@
 use crate::{Confidence, EndpointScan, PortState, ProductLayer, ServiceKind, TransportProtocol};
 
 pub(crate) fn canonical_product_name(name: &str) -> &str {
+    if let Some(name) = panel_product_name(name) {
+        return name;
+    }
     if let Some(name) = crate::web_server::canonical_product_name(name) {
         return name;
     }
@@ -24,6 +27,22 @@ pub(crate) fn canonical_product_name(name: &str) -> &str {
         "apache cassandra" => "Cassandra",
         _ => name.trim(),
     }
+}
+
+pub(crate) fn panel_product_name(name: &str) -> Option<&'static str> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "cpanel" => "cPanel",
+        "whm" | "webhost manager" | "web host manager" => "WHM",
+        "plesk" | "plesk panel" | "parallels plesk panel" => "Plesk",
+        "directadmin" | "direct admin" => "DirectAdmin",
+        "webmin" => "Webmin",
+        "virtualmin" => "Virtualmin",
+        "cockpit" | "cockpit project" => "Cockpit",
+        "ispconfig" | "ispconfig control panel" => "ISPConfig",
+        "hestiacp" | "hestia control panel" => "HestiaCP",
+        "cyberpanel" | "cyber panel" => "CyberPanel",
+        _ => return None,
+    })
 }
 
 pub(crate) fn inventory_product_name(name: &str) -> Option<&str> {
@@ -107,8 +126,10 @@ pub(crate) fn associated_port(product: &str) -> Option<u16> {
 pub(crate) fn reconcile(endpoint: &mut EndpointScan) {
     let products = std::mem::take(&mut endpoint.products);
     for mut product in products {
+        let observations = std::mem::take(&mut product.observations);
         if product.evidence.is_empty() {
             product.name = canonical_product_name(&product.name).to_owned();
+            product.observations = observations;
             endpoint.products.push(product);
             continue;
         }
@@ -121,6 +142,13 @@ pub(crate) fn reconcile(endpoint: &mut EndpointScan) {
                 product.confidence,
                 evidence,
             );
+        }
+        if let Some(existing) = endpoint.products.iter_mut().find(|existing| {
+            existing.name.eq_ignore_ascii_case(canonical_product_name(&product.name))
+        }) {
+            existing.observations.extend(observations);
+            existing.observations.sort();
+            existing.observations.dedup();
         }
     }
     let confirmed = endpoint
@@ -190,7 +218,10 @@ pub(crate) fn reconcile(endpoint: &mut EndpointScan) {
                                 1194 => "OpenVPN",
                                 1433 => "Microsoft SQL Server",
                                 1521 => "Oracle Database",
+                                2082 | 2083 => "cPanel",
+                                2086 | 2087 => "WHM",
                                 2181 => "ZooKeeper",
+                                2222 => "DirectAdmin",
                                 2375 | 2376 => "Docker",
                                 2379 | 2380 => "etcd",
                                 3306 => "MySQL",
@@ -204,8 +235,11 @@ pub(crate) fn reconcile(endpoint: &mut EndpointScan) {
                                 6379 => "Redis",
                                 6443 => "Kubernetes",
                                 7070 => "AnyDesk",
+                                8083 => "HestiaCP",
                                 8086 => "InfluxDB",
                                 8089 => "Splunk",
+                                8090 => "CyberPanel",
+                                8443 | 8880 => "Plesk",
                                 8291 => "MikroTik WinBox",
                                 8500 => "Consul",
                                 9001 => "Supervisor",
@@ -247,8 +281,13 @@ pub(crate) fn reconcile(endpoint: &mut EndpointScan) {
                 break 'inlined_record_possible_products;
             }
             endpoint.products.push(crate::ProductDetection {
+        observations: Vec::new(),
         name: canonical_product_name(name).to_owned(),
-        layer: ProductLayer::Protocol,
+        layer: if panel_product_name(name).is_some() {
+            ProductLayer::Server
+        } else {
+            ProductLayer::Protocol
+        },
         version: None,
         confidence: Confidence::Low,
         evidence: vec![if service_product.is_some() {

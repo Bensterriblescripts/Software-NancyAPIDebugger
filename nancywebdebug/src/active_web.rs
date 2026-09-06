@@ -441,7 +441,7 @@ let (response, host,): (& HttpObservation, & str,) = (response, &host,);
     if let Some((header, response)) = finding {
         let response = response.unwrap();
         return {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "http.host-header", VulnerabilityClass::HttpInfrastructure, "Host header injection", FindingSeverity::Medium, Confidence::High, CheckOutcome::Vulnerable, Some(root.to_string()), Some(format!("GET / with {header}: {host}")), vec![format!(
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "http.host-header", VulnerabilityClass::HttpInfrastructure, "Host header injection", Confidence::High, CheckOutcome::Vulnerable, Some(root.to_string()), Some(format!("GET / with {header}: {host}")), vec![format!(
                 "HTTP {} response incorporated the supplied host into an absolute URL or redirect",
                 response.status
             )], None,);
@@ -472,7 +472,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -494,7 +493,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Option < String >, String,) = (context, "http.host-header", VulnerabilityClass::HttpInfrastructure, "Host header injection", Some(root.to_string()), errors.join("; "),);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -522,7 +521,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -538,7 +536,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 };
     }
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "http.host-header", VulnerabilityClass::HttpInfrastructure, "Host header injection", FindingSeverity::Medium, Confidence::Medium, CheckOutcome::NotObserved, Some(root.to_string()), Some("GET / with alternate Host and X-Forwarded-Host values".to_owned()), Vec::new(), errors.first().cloned(),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "http.host-header", VulnerabilityClass::HttpInfrastructure, "Host header injection", Confidence::Medium, CheckOutcome::NotObserved, Some(root.to_string()), Some("GET / with alternate Host and X-Forwarded-Host values".to_owned()), Vec::new(), errors.first().cloned(),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -566,7 +564,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -846,7 +843,7 @@ let (baseline, response,): (& str, & str,) = (&baseline_text, &response_text,);
     }
     let xss_check = if let Some((url, parameter, status)) = xss {
         {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "client.reflected-markup", VulnerabilityClass::ClientSide, "Unencoded reflected markup", FindingSeverity::Medium, Confidence::Medium, CheckOutcome::Potential, Some(url.to_string()), Some(format!("GET with a benign markup probe in '{parameter}'")), vec![format!(
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "client.reflected-markup", VulnerabilityClass::ClientSide, "Unencoded reflected markup", Confidence::Medium, CheckOutcome::Potential, Some(url.to_string()), Some(format!("GET with a benign markup probe in '{parameter}'")), vec![format!(
                 "HTTP {status} reflected the exact custom-element probe without HTML encoding"
             )], Some("Browser execution context was not established, so this is not a confirmed XSS finding".to_owned()),);
 {
@@ -876,7 +873,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -890,7 +886,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 }
     } else {
         {
-let (context, check_id, class, title, severity, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, usize, Option < String >,) = (context, "client.reflected-markup", VulnerabilityClass::ClientSide, "Unencoded reflected markup", FindingSeverity::Medium, checked, errors.first().cloned(),);
+let (context, check_id, class, title, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, usize, Option < String >,) = (context, "client.reflected-markup", VulnerabilityClass::ClientSide, "Unencoded reflected markup", checked, errors.first().cloned(),);
 let inlined_result: SecurityCheckResult = {
 'inlined_observed_or_inconclusive: {
 
@@ -899,7 +895,7 @@ let inlined_result: SecurityCheckResult = {
 let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Option < String >, String,) = (context, check_id, class, title, None, error.unwrap_or_else(|| "No probe could be completed".to_owned()),);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -927,7 +923,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -943,7 +938,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 });
     }
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, severity, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -971,7 +966,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -991,7 +985,7 @@ inlined_result
     };
     let sql_check = if let Some((url, parameter, status, marker)) = sql {
         {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "injection.sql-error", VulnerabilityClass::Injection, "SQL error disclosure after input mutation", FindingSeverity::High, Confidence::Medium, CheckOutcome::Potential, Some(url.to_string()), Some(format!("GET with a quote-bearing marker in '{parameter}'")), vec![format!(
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "injection.sql-error", VulnerabilityClass::Injection, "SQL error disclosure after input mutation", Confidence::Medium, CheckOutcome::Potential, Some(url.to_string()), Some(format!("GET with a quote-bearing marker in '{parameter}'")), vec![format!(
                 "HTTP {status} introduced the database error signature '{marker}'"
             )], Some("An error differential indicates unsafe input handling but does not prove query control".to_owned()),);
 {
@@ -1021,7 +1015,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -1035,7 +1028,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 }
     } else {
         {
-let (context, check_id, class, title, severity, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, usize, Option < String >,) = (context, "injection.sql-error", VulnerabilityClass::Injection, "SQL error disclosure after input mutation", FindingSeverity::High, checked, errors.first().cloned(),);
+let (context, check_id, class, title, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, usize, Option < String >,) = (context, "injection.sql-error", VulnerabilityClass::Injection, "SQL error disclosure after input mutation", checked, errors.first().cloned(),);
 let inlined_result: SecurityCheckResult = {
 'inlined_observed_or_inconclusive: {
 
@@ -1044,7 +1037,7 @@ let inlined_result: SecurityCheckResult = {
 let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Option < String >, String,) = (context, check_id, class, title, None, error.unwrap_or_else(|| "No probe could be completed".to_owned()),);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -1072,7 +1065,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -1088,7 +1080,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 });
     }
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, severity, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -1116,7 +1108,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -1281,7 +1272,7 @@ let (response, host,): (& HttpObservation, & str,) = (&response, &format!("nancy
 }
 } => {
                     return {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "client.open-redirect", VulnerabilityClass::ClientSide, "Open redirect", FindingSeverity::Medium, Confidence::High, CheckOutcome::Vulnerable, Some(mutated.to_string()), Some(format!("GET with an external URL in '{name}'")), vec![format!(
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "client.open-redirect", VulnerabilityClass::ClientSide, "Open redirect", Confidence::High, CheckOutcome::Vulnerable, Some(mutated.to_string()), Some(format!("GET with an external URL in '{name}'")), vec![format!(
                             "HTTP {} redirected to the supplied external .invalid host",
                             response.status
                         )], None,);
@@ -1312,7 +1303,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -1342,7 +1332,7 @@ let (context, check_id, class, title, reason,): (ProbeContext < '_ >, & str, Vul
 let inlined_result: SecurityCheckResult = {
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Skipped, None, None, Vec::new(), Some(reason.to_owned()),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Skipped, None, None, Vec::new(), Some(reason.to_owned()),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -1370,7 +1360,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -1388,7 +1377,7 @@ inlined_result
 };
     }
     {
-let (context, check_id, class, title, severity, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, usize, Option < String >,) = (context, "client.open-redirect", VulnerabilityClass::ClientSide, "Open redirect", FindingSeverity::Medium, attempted, last_error,);
+let (context, check_id, class, title, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, usize, Option < String >,) = (context, "client.open-redirect", VulnerabilityClass::ClientSide, "Open redirect", attempted, last_error,);
 let inlined_result: SecurityCheckResult = {
 'inlined_observed_or_inconclusive: {
 
@@ -1397,7 +1386,7 @@ let inlined_result: SecurityCheckResult = {
 let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Option < String >, String,) = (context, check_id, class, title, None, error.unwrap_or_else(|| "No probe could be completed".to_owned()),);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -1425,7 +1414,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -1441,7 +1429,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 });
     }
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, severity, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -1469,7 +1457,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -1688,7 +1675,7 @@ let (baseline, response, token,): (& HttpObservation, & HttpObservation, & str,)
 } =>
                 {
                     return {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "server-side.ssrf-loopback", VulnerabilityClass::ServerSideRequestHandling, "Possible server-side URL fetch", FindingSeverity::High, Confidence::Medium, CheckOutcome::Potential, Some(mutated.to_string()), Some(format!("GET with a loopback URL in '{name}'")), vec![format!(
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "server-side.ssrf-loopback", VulnerabilityClass::ServerSideRequestHandling, "Possible server-side URL fetch", Confidence::Medium, CheckOutcome::Potential, Some(mutated.to_string()), Some(format!("GET with a loopback URL in '{name}'")), vec![format!(
                             "HTTP {} introduced a loopback connection-error signature",
                             response.status
                         )], Some("The bounded loopback probe did not access a listening internal service; confirm with an authorized callback endpoint".to_owned()),);
@@ -1719,7 +1706,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -1749,7 +1735,7 @@ let (context, check_id, class, title, reason,): (ProbeContext < '_ >, & str, Vul
 let inlined_result: SecurityCheckResult = {
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Skipped, None, None, Vec::new(), Some(reason.to_owned()),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Skipped, None, None, Vec::new(), Some(reason.to_owned()),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -1777,7 +1763,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -1795,7 +1780,7 @@ inlined_result
 };
     }
     {
-let (context, check_id, class, title, severity, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, usize, Option < String >,) = (context, "server-side.ssrf-loopback", VulnerabilityClass::ServerSideRequestHandling, "Possible server-side URL fetch", FindingSeverity::High, attempted, last_error,);
+let (context, check_id, class, title, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, usize, Option < String >,) = (context, "server-side.ssrf-loopback", VulnerabilityClass::ServerSideRequestHandling, "Possible server-side URL fetch", attempted, last_error,);
 let inlined_result: SecurityCheckResult = {
 'inlined_observed_or_inconclusive: {
 
@@ -1804,7 +1789,7 @@ let inlined_result: SecurityCheckResult = {
 let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Option < String >, String,) = (context, check_id, class, title, None, error.unwrap_or_else(|| "No probe could be completed".to_owned()),);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -1832,7 +1817,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -1848,7 +1832,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 });
     }
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, severity, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -1876,7 +1860,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -1907,7 +1890,7 @@ let (context, check_id, class, title, reason,): (ProbeContext < '_ >, & str, Vul
 let inlined_result: SecurityCheckResult = {
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Skipped, None, None, Vec::new(), Some(reason.to_owned()),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Skipped, None, None, Vec::new(), Some(reason.to_owned()),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -1935,7 +1918,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2019,7 +2001,7 @@ let (url,): (& Url,) = (url,);
     match head {
         Ok(response) if (200..300).contains(&response.status) => {
             return {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "access-control.route-bypass", VulnerabilityClass::AccessControl, "Protected-route method or rewrite bypass", FindingSeverity::High, Confidence::Medium, CheckOutcome::Potential, Some(protected.to_string()), Some(format!("HEAD {}", url_path(protected))), vec![format!(
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "access-control.route-bypass", VulnerabilityClass::AccessControl, "Protected-route method or rewrite bypass", Confidence::Medium, CheckOutcome::Potential, Some(protected.to_string()), Some(format!("HEAD {}", url_path(protected))), vec![format!(
                     "GET was recorded as HTTP {status}, while HEAD returned HTTP {}",
                     response.status
                 )], Some(
@@ -2053,7 +2035,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2152,7 +2133,7 @@ let (left, right,): (& HttpObservation, & HttpObservation,) = (baseline, &respon
 }) =>
             {
                 return {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "access-control.route-bypass", VulnerabilityClass::AccessControl, "Protected-route method or rewrite bypass", FindingSeverity::High, Confidence::Medium, CheckOutcome::Potential, Some(protected.to_string()), Some(format!("GET / with {header}: {}", url_path(protected))), vec![format!(
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "access-control.route-bypass", VulnerabilityClass::AccessControl, "Protected-route method or rewrite bypass", Confidence::Medium, CheckOutcome::Potential, Some(protected.to_string()), Some(format!("GET / with {header}: {}", url_path(protected))), vec![format!(
                         "Direct access returned HTTP {status}; the rewrite-header probe returned HTTP {} with content distinct from the root baseline",
                         response.status
                     )], Some("Verify the returned representation before treating this as an authorization bypass".to_owned()),);
@@ -2183,7 +2164,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2201,7 +2181,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         }
     }
     {
-let (context, check_id, class, title, severity, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, usize, Option < String >,) = (context, "access-control.route-bypass", VulnerabilityClass::AccessControl, "Protected-route method or rewrite bypass", FindingSeverity::High, attempted, last_error,);
+let (context, check_id, class, title, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, usize, Option < String >,) = (context, "access-control.route-bypass", VulnerabilityClass::AccessControl, "Protected-route method or rewrite bypass", attempted, last_error,);
 let inlined_result: SecurityCheckResult = {
 'inlined_observed_or_inconclusive: {
 
@@ -2210,7 +2190,7 @@ let inlined_result: SecurityCheckResult = {
 let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Option < String >, String,) = (context, check_id, class, title, None, error.unwrap_or_else(|| "No probe could be completed".to_owned()),);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -2238,7 +2218,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2254,7 +2233,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 });
     }
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, severity, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -2282,7 +2261,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2335,7 +2313,7 @@ inlined_result
 let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Option < String >, String,) = (context, "http.ambiguous-framing", VulnerabilityClass::HttpInfrastructure, "Ambiguous HTTP/1.1 framing handling", Some(root.to_string()), error,);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -2363,7 +2341,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2449,7 +2426,7 @@ let (bytes,): (& [u8],) = (&bytes,);
 } =>
         {
             {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "http.ambiguous-framing", VulnerabilityClass::HttpInfrastructure, "Ambiguous HTTP/1.1 framing handling", FindingSeverity::Medium, Confidence::Medium, CheckOutcome::Potential, Some(root.to_string()), Some("OPTIONS / with aligned Content-Length and Transfer-Encoding framing".to_owned()), vec![format!(
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "http.ambiguous-framing", VulnerabilityClass::HttpInfrastructure, "Ambiguous HTTP/1.1 framing handling", Confidence::Medium, CheckOutcome::Potential, Some(root.to_string()), Some("OPTIONS / with aligned Content-Length and Transfer-Encoding framing".to_owned()), vec![format!(
                 "The server responded in {duration_ms:.1} ms but did not close the connection after receiving both framing headers"
             )], Some("No second request was sent; confirm parser behavior across every intermediary before concluding request smuggling is possible".to_owned()),);
 {
@@ -2479,7 +2456,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2528,7 +2504,7 @@ let (bytes,): (& [u8],) = (&bytes,);
 }) =>
         {
             {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "http.ambiguous-framing", VulnerabilityClass::HttpInfrastructure, "Ambiguous HTTP/1.1 framing handling", FindingSeverity::Medium, Confidence::High, CheckOutcome::NotObserved, Some(root.to_string()), Some("OPTIONS / with aligned Content-Length and Transfer-Encoding framing".to_owned()), vec![
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "http.ambiguous-framing", VulnerabilityClass::HttpInfrastructure, "Ambiguous HTTP/1.1 framing handling", Confidence::High, CheckOutcome::NotObserved, Some(root.to_string()), Some("OPTIONS / with aligned Content-Length and Transfer-Encoding framing".to_owned()), vec![
                 "The peer closed the connection or declared Connection: close after the ambiguous request"
                     .to_owned(),
             ], None,);
@@ -2559,7 +2535,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2579,7 +2554,7 @@ let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >,
             ),);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -2607,7 +2582,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2625,7 +2599,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Option < String >, String,) = (context, "http.ambiguous-framing", VulnerabilityClass::HttpInfrastructure, "Ambiguous HTTP/1.1 framing handling", Some(root.to_string()), error,);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -2653,7 +2627,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2681,7 +2654,7 @@ async move {
 let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Option < String >, String,) = (context, "session.fixation", VulnerabilityClass::SessionAuthentication, "Session fixation", Some(root.to_string()), "Root response was unavailable".to_owned(),);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -2709,7 +2682,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2762,7 +2734,7 @@ let (context, check_id, class, title, reason,): (ProbeContext < '_ >, & str, Vul
 let inlined_result: SecurityCheckResult = {
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Skipped, None, None, Vec::new(), Some(reason.to_owned()),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Skipped, None, None, Vec::new(), Some(reason.to_owned()),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -2790,7 +2762,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2917,7 +2888,7 @@ inlined_result
                     }) =>
             {
                 return {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "session.fixation", VulnerabilityClass::SessionAuthentication, "Session fixation", FindingSeverity::High, Confidence::Medium, CheckOutcome::Potential, Some(root.to_string()), Some(format!("GET / with a caller-selected {name} cookie")), vec![format!(
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "session.fixation", VulnerabilityClass::SessionAuthentication, "Session fixation", Confidence::Medium, CheckOutcome::Potential, Some(root.to_string()), Some(format!("GET / with a caller-selected {name} cookie")), vec![format!(
                         "The response reissued the supplied marker as the value of '{name}'"
                     )], Some("Confirm that the cookie controls an authenticated session before treating fixation as exploitable".to_owned()),);
 {
@@ -2947,7 +2918,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -2965,7 +2935,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         }
     }
     {
-let (context, check_id, class, title, severity, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, usize, Option < String >,) = (context, "session.fixation", VulnerabilityClass::SessionAuthentication, "Session fixation", FindingSeverity::High, attempted, last_error,);
+let (context, check_id, class, title, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, usize, Option < String >,) = (context, "session.fixation", VulnerabilityClass::SessionAuthentication, "Session fixation", attempted, last_error,);
 let inlined_result: SecurityCheckResult = {
 'inlined_observed_or_inconclusive: {
 
@@ -2974,7 +2944,7 @@ let inlined_result: SecurityCheckResult = {
 let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Option < String >, String,) = (context, check_id, class, title, None, error.unwrap_or_else(|| "No probe could be completed".to_owned()),);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -3002,7 +2972,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -3018,7 +2987,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 });
     }
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, severity, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -3046,7 +3015,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -3084,7 +3052,7 @@ let (context, check_id, class, title, reason,): (ProbeContext < '_ >, & str, Vul
 let inlined_result: SecurityCheckResult = {
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Skipped, None, None, Vec::new(), Some(reason.to_owned()),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Skipped, None, None, Vec::new(), Some(reason.to_owned()),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -3112,7 +3080,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -3131,7 +3098,7 @@ inlined_result
     }
     if unprotected.is_empty() {
         return {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", FindingSeverity::Medium, Confidence::Low, CheckOutcome::NotObserved, None, None, vec!["All discovered state-changing forms contained a token-like control".to_owned()], None,);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", Confidence::Low, CheckOutcome::NotObserved, None, None, vec!["All discovered state-changing forms contained a token-like control".to_owned()], None,);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -3159,7 +3126,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -3174,7 +3140,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
     }
     if !matches!( context.scan.request.web_probe_level, crate::WebProbeLevel::StateChanging) {
         return {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", FindingSeverity::Medium, Confidence::Low, CheckOutcome::Potential, Some(unprotected[0].action_url.clone()), None, vec![format!(
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", Confidence::Low, CheckOutcome::Potential, Some(unprotected[0].action_url.clone()), None, vec![format!(
                 "{} state-changing form(s) had no token-like control",
                 unprotected.len()
             )], Some("No form was submitted at the non-state-changing probe level; SameSite, Origin, or Referer enforcement may still prevent CSRF".to_owned()),);
@@ -3205,7 +3171,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -3223,7 +3188,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Option < String >, String,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", Some(root.to_string()), "Root response was unavailable".to_owned(),);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -3251,7 +3216,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -3302,7 +3266,7 @@ inlined_result
 };
     let Some(cookie) = cookie else {
         return {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", FindingSeverity::Medium, Confidence::Low, CheckOutcome::Deferred, Some(unprotected[0].action_url.clone()), None, Vec::new(), Some("No cookie eligible for a cross-site form POST was observed in the anonymous session".to_owned()),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", Confidence::Low, CheckOutcome::Deferred, Some(unprotected[0].action_url.clone()), None, Vec::new(), Some("No cookie eligible for a cross-site form POST was observed in the anonymous session".to_owned()),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -3330,7 +3294,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -3534,7 +3497,7 @@ let (response,): (& HttpObservation,) = (&response,);
 }
 } => {
                 return {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", FindingSeverity::Medium, Confidence::Medium, CheckOutcome::Potential, Some(action.to_string()), Some(format!(
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", Confidence::Medium, CheckOutcome::Potential, Some(action.to_string()), Some(format!(
                         "{} with a foreign Origin and Referer using a cross-site-eligible cookie",
                         form.method
                     )), vec![format!(
@@ -3568,7 +3531,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -3587,7 +3549,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
     }
     if attempted == 0 {
         return {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", FindingSeverity::Medium, Confidence::Low, CheckOutcome::Deferred, Some(root.to_string()), None, Vec::new(), Some("Discovered forms were excluded from automated submission because they involved credentials, files, or destructive-looking actions".to_owned()),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", Confidence::Low, CheckOutcome::Deferred, Some(root.to_string()), None, Vec::new(), Some("Discovered forms were excluded from automated submission because they involved credentials, files, or destructive-looking actions".to_owned()),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -3615,7 +3577,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -3629,7 +3590,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 };
     }
     {
-let (context, check_id, class, title, severity, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, usize, Option < String >,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", FindingSeverity::Medium, attempted, last_error,);
+let (context, check_id, class, title, attempted, error,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, usize, Option < String >,) = (context, "session.csrf-form", VulnerabilityClass::SessionAuthentication, "Cross-site request forgery protection", attempted, last_error,);
 let inlined_result: SecurityCheckResult = {
 'inlined_observed_or_inconclusive: {
 
@@ -3638,7 +3599,7 @@ let inlined_result: SecurityCheckResult = {
 let (context, check_id, class, title, probe_url, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Option < String >, String,) = (context, check_id, class, title, None, error.unwrap_or_else(|| "No probe could be completed".to_owned()),);
 
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, FindingSeverity::Informational, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Low, CheckOutcome::Inconclusive, probe_url, None, Vec::new(), Some(reason),);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -3666,7 +3627,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,
@@ -3682,7 +3642,7 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
 });
     }
     {
-let (context, check_id, class, title, severity, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, FindingSeverity, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, severity, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
+let (context, check_id, class, title, confidence, outcome, probe_url, request_evidence, evidence, reason,): (ProbeContext < '_ >, & str, VulnerabilityClass, & str, Confidence, CheckOutcome, Option < String >, Option < String >, Vec < String >, Option < String >,) = (context, check_id, class, title, Confidence::Medium, CheckOutcome::NotObserved, None, None, vec![format!("{attempted} bounded probe(s) completed")], error,);
 {
 
     let interrupted = ({ let context = context; crate::exposure::endpoint_health::stopped(context.ip, context.port) })
@@ -3710,7 +3670,6 @@ let (context, check_id, class, title, severity, confidence, outcome, probe_url, 
         check_id: check_id.to_owned(),
         class,
         title: title.to_owned(),
-        severity,
         confidence,
         outcome,
         probe_url,

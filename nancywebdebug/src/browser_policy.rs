@@ -640,7 +640,7 @@ pub(super) fn csp_nonces(response: &HttpObservation) -> Vec<Vec<u8>> {
     .collect()
 }
 
-fn is_html(response: &HttpObservation) -> bool {
+pub(super) fn is_html(response: &HttpObservation) -> bool {
     if ({
         let (response, name): (&crate::HttpObservation, &str) = (response, "content-type");
         response
@@ -711,6 +711,8 @@ fn safe_url(value: &str) -> String {
     let Ok(mut url) = url::Url::parse(value) else {
         return value.to_owned();
     };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
     url.set_query(None);
     url.set_fragment(None);
     url.to_string()

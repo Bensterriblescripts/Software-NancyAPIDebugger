@@ -1,3 +1,4 @@
+use super::technology_evidence;
 use super::crawl::hostname_in_scope;
 use super::fingerprints::CapturedScriptResponse;
 use super::{
@@ -550,7 +551,7 @@ pub(super) async fn analyze(
                     let retrieval_error = fetched.error.or_else(|| {
                         (!(200..300).contains(&status)).then(|| format!("HTTP {status} {reason}"))
                     });
-                    let libraries = if retrieval_error.is_none() {
+                    let mut libraries = if retrieval_error.is_none() {
                         {
                             let (final_url, source_url, body, truncated, catalog): (
                                 Option<&Url>,
@@ -851,6 +852,7 @@ inlined_result
                                                             )
                                                             .then(|| name.clone()),
                                                             name,
+                                                            observations: vec![{ let mut record = technology_evidence::observation(&evidence, url.as_str()); record.extracted_version = version.as_deref().map(technology_evidence::safe_value); record }],
                                                             installed_version: version,
                                                             latest_version: None,
                                                             status:
@@ -891,6 +893,9 @@ inlined_result
                                                     existing.npm_package = incoming.npm_package;
                                                 }
                                                 existing.evidence.extend(incoming.evidence);
+                                                existing.observations.extend(incoming.observations);
+                                                existing.observations.sort();
+                                                existing.observations.dedup();
                                                 existing.evidence.sort();
                                                 existing.evidence.dedup();
                                             } else {
@@ -965,7 +970,7 @@ inlined_result
                                             } {
                                                 matches.push((
                                                     version,
-                                                    "RetireJS URI extractor".to_owned(),
+                                                    script_match_evidence("RetireJS URI extractor", uri, regex.find(uri).map(|matched| matched.range())),
                                                 ));
                                             }
                                         }
@@ -1034,7 +1039,7 @@ inlined_result
                                             } {
                                                 matches.push((
                                                     version,
-                                                    "RetireJS filename extractor".to_owned(),
+                                                    technology_evidence::observation("RetireJS filename extractor", filename),
                                                 ));
                                             }
                                         }
@@ -1098,7 +1103,7 @@ inlined_result
                                         } {
                                             matches.push((
                                                 version,
-                                                "RetireJS content extractor".to_owned(),
+                                                script_match_evidence("RetireJS content extractor", &content, regex.find(&content).map(|matched| matched.range())),
                                             ));
                                         }
                                     }
@@ -1140,7 +1145,7 @@ inlined_result
                                             {
                                                 matches.push((
                                                     version,
-                                                    "RetireJS replacement extractor".to_owned(),
+                                                    script_match_evidence("RetireJS replacement extractor", &content, captures.get(0).map(|matched| matched.range())),
                                                 ));
                                             }
                                         }
@@ -1152,7 +1157,7 @@ inlined_result
                                     {
                                         matches.push((
                                             version,
-                                            "RetireJS SHA-1 hash extractor".to_owned(),
+                                            technology_evidence::observation("RetireJS SHA-1 hash extractor", sha1.as_deref().unwrap_or_default()),
                                         ));
                                     }
                                     for (version, evidence) in matches {
@@ -1165,10 +1170,11 @@ inlined_result
                                                 JavaScriptLibrary {
                                                     name: entry.name.clone(),
                                                     npm_package: entry.npm_package.clone(),
+                                                    observations: vec![{ let mut record = evidence.clone(); record.extracted_version = Some(technology_evidence::safe_value(&version)); record }],
                                                     installed_version: Some(version),
                                                     latest_version: None,
                                                     status: TechnologyVersionStatus::Unknown,
-                                                    evidence: vec![evidence],
+                                                    evidence: vec![evidence.match_source],
                                                     check_error: None,
                                                 },
                                             );
@@ -1193,6 +1199,9 @@ inlined_result
                                                     existing.npm_package = incoming.npm_package;
                                                 }
                                                 existing.evidence.extend(incoming.evidence);
+                                                existing.observations.extend(incoming.observations);
+                                                existing.observations.sort();
+                                                existing.observations.dedup();
                                                 existing.evidence.sort();
                                                 existing.evidence.dedup();
                                             } else {
@@ -1213,6 +1222,11 @@ inlined_result
                     } else {
                         Vec::new()
                     };
+                    for library in &mut libraries {
+                        for record in &mut library.observations {
+                            technology_evidence::locate(record, &response.url, None, Some(&response.method), Some(response.status), response.body_truncated);
+                        }
+                    }
                     (
                         JavaScriptSource {
                             source_url: source_url.to_owned(),
@@ -1691,9 +1705,14 @@ inlined_result
     }
     for (attachment_index, (endpoint_index, source)) in source_locations.into_iter().enumerate() {
         if let Some(report) = source_cache.get(&source) {
-            endpoints[endpoint_index]
-                .javascript_sources
-                .push(report.clone());
+            let endpoint = &mut endpoints[endpoint_index];
+            let mut report = report.clone();
+            for library in &mut report.libraries {
+                for record in &mut library.observations {
+                    record.endpoint = Some(std::net::SocketAddr::new(endpoint.ip, endpoint.port).to_string());
+                }
+            }
+            endpoint.javascript_sources.push(report);
         }
         if let Some(captured) = captured_responses
             .iter_mut()
@@ -2095,4 +2114,14 @@ impl EnrichmentState {
         self.remaining_bytes = self.remaining_bytes.saturating_sub(fetched.captured_bytes);
         self.metadata.insert(url, fetched);
     }
+}
+
+fn script_match_evidence(source: &str, text: &str, matched: Option<std::ops::Range<usize>>) -> super::TechnologyEvidence {
+    let Some(matched) = matched else {
+        return super::TechnologyEvidence { match_source: source.to_owned(), ..Default::default() };
+    };
+    let (value, shortened) = technology_evidence::excerpt(text, matched);
+    let mut record = technology_evidence::observation(source, &value);
+    record.excerpt_shortened = shortened;
+    record
 }

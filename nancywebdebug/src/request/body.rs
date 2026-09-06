@@ -1,5 +1,6 @@
 use crate::diagnostics::{
-    DiagnosticProgress, DiagnosticTrace, MAX_CAPTURE_BYTES, StageKind, StageStatus, TraceOutcome,
+    DiagnosticProgress, DiagnosticTrace, FingerprintStatus, MAX_CAPTURE_BYTES, StageKind,
+    StageStatus, TraceError, TraceOutcome,
 };
 use bytes::Bytes;
 use encoding_rs::{CoderResult, Encoding};
@@ -227,7 +228,6 @@ pub(super) async fn read_hyper_body(
 }
 
 pub(super) fn finish_body(mut trace: DiagnosticTrace, started: Instant) -> DiagnosticTrace {
-    decode_body(&mut trace);
     let detail = format!(
         "Raw: {}; decoded: {}",
         trace.body.raw_capture_status(),
@@ -246,7 +246,7 @@ pub(super) fn finish_body(mut trace: DiagnosticTrace, started: Instant) -> Diagn
     trace
 }
 
-pub(super) fn decode_body(trace: &mut DiagnosticTrace) {
+pub(super) fn decode_body(trace: &mut DiagnosticTrace, cancel: &CancellationToken) {
     trace.body.decoded = Arc::from("");
     trace.body.decoded_is_text = false;
     let (decoded_bytes, content_truncated, content_error) = {
@@ -277,6 +277,9 @@ pub(super) fn decode_body(trace: &mut DiagnosticTrace) {
                                         };
                                         let mut buffer = [0_u8; 64 * 1024];
                                         loop {
+                                            if cancel.is_cancelled() {
+                                                return;
+                                            }
                                             match reader.read(&mut buffer) {
                                                 Ok(0) => {
                                                     break 'inlined_read_decoded_bounded (
@@ -321,6 +324,9 @@ pub(super) fn decode_body(trace: &mut DiagnosticTrace) {
                                         };
                                         let mut buffer = [0_u8; 64 * 1024];
                                         loop {
+                                            if cancel.is_cancelled() {
+                                                return;
+                                            }
                                             match reader.read(&mut buffer) {
                                                 Ok(0) => {
                                                     break 'inlined_read_decoded_bounded (
@@ -365,6 +371,9 @@ pub(super) fn decode_body(trace: &mut DiagnosticTrace) {
                                         };
                                         let mut buffer = [0_u8; 64 * 1024];
                                         loop {
+                                            if cancel.is_cancelled() {
+                                                return;
+                                            }
                                             match reader.read(&mut buffer) {
                                                 Ok(0) => {
                                                     break 'inlined_read_decoded_bounded (
@@ -409,6 +418,9 @@ pub(super) fn decode_body(trace: &mut DiagnosticTrace) {
                                                     };
                                                     let mut buffer = [0_u8; 64 * 1024];
                                                     loop {
+                                                        if cancel.is_cancelled() {
+                                                            return;
+                                                        }
                                                         match reader.read(&mut buffer) {
             Ok(0) => break 'inlined_read_decoded_bounded (capture.bytes, capture.truncated, None),
             Ok(length) if capture.append(&buffer[..length]) => {
@@ -447,6 +459,9 @@ pub(super) fn decode_body(trace: &mut DiagnosticTrace) {
                                 );
                             }
                         };
+                    if cancel.is_cancelled() {
+                        return;
+                    }
                     truncated |= output_truncated;
                     if let Some(error) = error {
                         break 'inlined_decode_content_encoding (
@@ -536,11 +551,19 @@ pub(super) fn decode_body(trace: &mut DiagnosticTrace) {
                 let mut offset = 0;
                 let mut had_errors = false;
                 loop {
-                    let (result, read, errors) =
-                        decoder.decode_to_string(&bytes[offset..], &mut output, true);
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    let end = (offset + 64 * 1024).min(bytes.len());
+                    let (result, read, errors) = decoder.decode_to_string(
+                        &bytes[offset..end],
+                        &mut output,
+                        end == bytes.len(),
+                    );
                     offset += read;
                     had_errors |= errors;
                     match result {
+                        CoderResult::InputEmpty if offset < bytes.len() => continue,
                         CoderResult::InputEmpty => {
                             break 'inlined_decode_text_bounded (output, false, had_errors);
                         }
@@ -576,6 +599,9 @@ pub(super) fn decode_body(trace: &mut DiagnosticTrace) {
         });
     }
     trace.body.decoded_truncated |= text_truncated;
+    if cancel.is_cancelled() {
+        return;
+    }
     let mut formatted = if text.len() <= 256 * 1024 {
         {
             let (body, content_type): (&str, Option<&str>) =
@@ -635,4 +661,74 @@ pub(super) fn decode_body(trace: &mut DiagnosticTrace) {
     }
     trace.body.decoded = Arc::from(formatted);
     trace.body.decoded_is_text = true;
+}
+
+pub(super) async fn process_trace(
+    mut trace: DiagnosticTrace,
+    cancel: &CancellationToken,
+) -> DiagnosticTrace {
+    let processing_started = std::time::Instant::now();
+    let mut input = trace.clone();
+    match crate::blocking::run(cancel, move |cancel| {
+        if input.outcome == TraceOutcome::Success || !input.body.raw.is_empty() {
+            decode_body(&mut input, cancel);
+        }
+        if !cancel.is_cancelled() {
+            super::fingerprint::analyze(&mut input);
+        }
+        input
+    })
+    .await
+    {
+        Ok(processed) => trace = processed,
+        Err(error) => {
+            let cancelled = matches!(error, crate::blocking::Error::Cancelled);
+            trace.outcome = if cancelled {
+                TraceOutcome::Cancelled
+            } else {
+                TraceOutcome::Failed
+            };
+            trace.complete = true;
+            trace.error = Some(TraceError {
+                stage: StageKind::Body,
+                message: error.to_string(),
+            });
+            trace.fingerprint.status = if cancelled {
+                FingerprintStatus::Cancelled
+            } else {
+                FingerprintStatus::Unavailable
+            };
+            if let Some(stage) = trace
+                .stages
+                .iter_mut()
+                .find(|stage| stage.kind == StageKind::Body)
+            {
+                stage.status = if cancelled {
+                    StageStatus::Cancelled
+                } else {
+                    StageStatus::Failed
+                };
+            }
+        }
+    }
+    if let Some(stage) = trace
+        .stages
+        .iter_mut()
+        .find(|stage| stage.kind == StageKind::Body && stage.duration_ms.is_some())
+    {
+        stage.duration_ms = stage
+            .duration_ms
+            .map(|duration| duration + processing_started.elapsed().as_secs_f64() * 1000.0);
+        stage.detail = format!(
+            "{}Raw: {}; decoded: {}",
+            trace
+                .error
+                .as_ref()
+                .map(|error| format!("{}; ", error.message))
+                .unwrap_or_default(),
+            trace.body.raw_capture_status(),
+            trace.body.decoded_capture_status()
+        );
+    }
+    trace
 }

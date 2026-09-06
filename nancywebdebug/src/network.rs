@@ -70,15 +70,18 @@ impl ConnectionRateLimiter {
     }
 
     pub(crate) async fn wait(&self, cancel: &CancellationToken) -> Result<(), ()> {
-        let scheduled = {
-            let mut next = self.next.lock().await;
-            let scheduled = (*next).max(tokio::time::Instant::now());
-            *next = scheduled + self.interval;
-            scheduled
+        let mut next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(()),
+            next = self.next.lock() => next,
         };
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => Err(()),
-            _ = tokio::time::sleep_until(scheduled) => Ok(()),
+            _ = tokio::time::sleep_until(*next) => {
+                *next = tokio::time::Instant::now() + self.interval;
+                Ok(())
+            },
         }
     }
 }

@@ -191,6 +191,191 @@
         "set-cookie": "(?:^|,\\s*)ARRAffinity(?:SameSite)?=[^;]*;[^\\r\\n]*\\bdomain=\\.?[a-z0-9-]+\\.azurewebsites\\.net(?:;|$)"
       },
       "html": ["<title\\b[^>]*>\\s*Microsoft Azure App Service\\s*</title>\\;confidence:75"]
+    },
+    "cPanel": {
+      "cats": [3],
+      "html": [
+        "<title\\b[^>]*>\\s*cPanel(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*(?:[-–—|:]\\s*)?(?:Log[ -]?in|Sign in)\\s*</title>\\;confidence:75\\;version:\\1",
+        "<title\\b[^>]*>\\s*(?:Log[ -]?in|Sign in)\\s*(?:(?:to|[-–—|:])\\s*)?cPanel(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>\\;confidence:75\\;version:\\1",
+        "(?s)<title\\b[^>]*>\\s*cPanel(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>.*?<form\\b[^>]*>\\;confidence:75\\;version:\\1",
+        "<(?:img|link)\\b[^>]*(?:src|href)\\s*=\\s*[\"\\'][^\"\\']*/(?:unprotected/)?cpanel[^/\"\\']*/images/cpanel-logo\\.(?:svg|png)[\"\\']\\;confidence:75"
+      ],
+      "meta": {
+        "generator": [
+          "^cPanel(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*$\\;version:\\1"
+        ]
+      },
+      "cookies": {
+        "cpsession": ""
+      },
+      "headers": {
+        "www-authenticate": "\\bBasic\\s+realm=\"cPanel(?: Server)?\""
+      }
+    },
+    "WHM": {
+      "cats": [3],
+      "html": [
+        "<title\\b[^>]*>\\s*(?:WHM|WebHost Manager)(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*(?:[-–—|:]\\s*)?(?:Log[ -]?in|Sign in)\\s*</title>\\;confidence:75\\;version:\\1",
+        "<title\\b[^>]*>\\s*(?:Log[ -]?in|Sign in)\\s*(?:(?:to|[-–—|:])\\s*)?(?:WHM|WebHost Manager)(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>\\;confidence:75\\;version:\\1",
+        "(?s)<title\\b[^>]*>\\s*(?:WHM|WebHost Manager)(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>.*?<form\\b[^>]*>\\;confidence:75\\;version:\\1",
+        "<(?:img|link)\\b[^>]*(?:src|href)\\s*=\\s*[\"\\'][^\"\\']*/(?:unprotected/)?cpanel[^/\"\\']*/images/whm-logo(?:_white)?\\.(?:svg|png)[\"\\']\\;confidence:75"
+      ],
+      "meta": {
+        "generator": [
+          "^(?:WHM|WebHost Manager)(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*$\\;version:\\1"
+        ]
+      },
+      "cookies": {
+        "whostmgrsession": ""
+      },
+      "headers": {
+        "www-authenticate": "\\bBasic\\s+realm=\"(?:WHM|WebHost Manager)(?: Server)?\""
+      }
+    },
+    "Plesk": {
+      "cats": [3],
+      "html": [
+        "<script\\b[^>]*\\bsrc\\s*=\\s*[\"'][^\"']*/(?:javascript/)?common\\.js\\?plesk(?:=|&|[\"'])",
+        "<title\\b[^>]*>\\s*Plesk(?: (?:Obsidian|Onyx))?(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*(?:[-–—|:]\\s*)?(?:Log[ -]?in|Sign in)\\s*</title>\\;confidence:75\\;version:\\1",
+        "<title\\b[^>]*>\\s*(?:Log[ -]?in|Sign in)\\s*(?:(?:to|[-–—|:])\\s*)?Plesk(?: (?:Obsidian|Onyx))?(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>\\;confidence:75\\;version:\\1",
+        "(?s)<title\\b[^>]*>\\s*Plesk(?: (?:Obsidian|Onyx))?(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>.*?<form\\b[^>]*>\\;confidence:75\\;version:\\1"
+      ],
+      "meta": {
+        "generator": [
+          "^Plesk(?: (?:Obsidian|Onyx))?(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*$\\;version:\\1"
+        ],
+        "plesk-build": [
+          "^([0-9]+(?:\\.[0-9]+)+)(?:\\s|$)\\;version:\\1"
+        ]
+      },
+      "headers": {
+        "x-powered-by": "^Plesk(?:Lin|Win)(?:\\s|$)",
+        "x-powered-by-plesk": "^Plesk(?:\\s+([0-9]+(?:\\.[0-9]+)+))?\\s*$\\;version:\\1",
+        "server": "^sw-cp-server(?:/[^\\s]+)?\\s*$"
+      },
+      "cookies": {
+        "PLESKSESSID": ""
+      },
+      "scriptSrc": [
+        "/(?:javascript/)?common\\.js\\?plesk(?:=|&|$)"
+      ]
+    },
+    "DirectAdmin": {
+      "cats": [3],
+      "html": [
+        "<title\\b[^>]*>\\s*DirectAdmin(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*(?:[-–—|:]\\s*)?(?:Log[ -]?in|Sign in)\\s*</title>\\;confidence:75\\;version:\\1",
+        "<title\\b[^>]*>\\s*(?:Log[ -]?in|Sign in)\\s*(?:(?:to|[-–—|:])\\s*)?DirectAdmin(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>\\;confidence:75\\;version:\\1",
+        "(?s)<title\\b[^>]*>\\s*DirectAdmin(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>.*?<form\\b[^>]*>\\;confidence:75\\;version:\\1",
+        "<form\\b[^>]*\\baction\\s*=\\s*[\"\\'](?:https?://[^/\"\\']+)?/CMD_LOGIN(?:[?][^\"\\']*)?[\"\\']"
+      ],
+      "meta": {
+        "generator": [
+          "^DirectAdmin(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*$\\;version:\\1"
+        ]
+      },
+      "headers": {
+        "server": "^DirectAdmin(?: Daemon)?(?:[ /]+v?([0-9]+(?:\\.[0-9]+)+))?\\s*$\\;version:\\1",
+        "www-authenticate": "\\bBasic\\s+realm=\"DirectAdmin(?: Server)?\""
+      }
+    },
+    "Webmin": {
+      "cats": [3],
+      "html": [
+        "<title\\b[^>]*>\\s*Webmin(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*(?:[-–—|:]\\s*)?(?:Log[ -]?in|Sign in)\\s*</title>\\;confidence:75\\;version:\\1",
+        "<title\\b[^>]*>\\s*(?:Log[ -]?in|Sign in)\\s*(?:(?:to|[-–—|:])\\s*)?Webmin(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>\\;confidence:75\\;version:\\1",
+        "(?s)<title\\b[^>]*>\\s*Webmin(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>.*?<form\\b[^>]*>\\;confidence:75\\;version:\\1",
+        "<img\\b[^>]*\\bsrc\\s*=\\s*[\"\\'][^\"\\']*/(?:images/)?webmin(?:-logo|_logo)?\\.(?:svg|png|gif)[\"\\']\\;confidence:75"
+      ],
+      "meta": {
+        "generator": [
+          "^Webmin(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*$\\;version:\\1"
+        ]
+      },
+      "headers": {
+        "www-authenticate": "\\bBasic\\s+realm=\"Webmin(?: Server)?\""
+      }
+    },
+    "Virtualmin": {
+      "cats": [3],
+      "html": [
+        "<title\\b[^>]*>\\s*Virtualmin(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*(?:[-–—|:]\\s*)?(?:Log[ -]?in|Sign in)\\s*</title>\\;confidence:75\\;version:\\1",
+        "<title\\b[^>]*>\\s*(?:Log[ -]?in|Sign in)\\s*(?:(?:to|[-–—|:])\\s*)?Virtualmin(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>\\;confidence:75\\;version:\\1",
+        "(?s)<title\\b[^>]*>\\s*Virtualmin(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>.*?<form\\b[^>]*>\\;confidence:75\\;version:\\1",
+        "<img\\b[^>]*\\bsrc\\s*=\\s*[\"\\'][^\"\\']*/(?:images/)?virtualmin(?:-logo|_logo)?\\.(?:svg|png|gif)[\"\\']\\;confidence:75"
+      ],
+      "meta": {
+        "generator": [
+          "^Virtualmin(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*$\\;version:\\1"
+        ]
+      },
+      "headers": {
+        "www-authenticate": "\\bBasic\\s+realm=\"Virtualmin(?: Server)?\""
+      }
+    },
+    "Cockpit": {
+      "cats": [3],
+      "html": [
+        "<title\\b[^>]*>\\s*Cockpit(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*(?:[-–—|:]\\s*)?(?:Log[ -]?in|Sign in)\\s*</title>\\;confidence:75\\;version:\\1",
+        "<title\\b[^>]*>\\s*(?:Log[ -]?in|Sign in)\\s*(?:(?:to|[-–—|:])\\s*)?Cockpit(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>\\;confidence:75\\;version:\\1",
+        "(?s)<title\\b[^>]*>\\s*Cockpit(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>.*?<form\\b[^>]*>\\;confidence:75\\;version:\\1",
+        "<link\\b[^>]*\\bhref\\s*=\\s*[\"\\'][^\"\\']*/cockpit/static/login\\.css(?:[?\"\\'])"
+      ],
+      "meta": {
+        "generator": [
+          "^Cockpit(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*$\\;version:\\1"
+        ]
+      },
+      "cookies": {
+        "cockpit": ""
+      },
+      "scriptSrc": [
+        "/cockpit/static/(?:login|cockpit)\\.js(?:[?]|$)"
+      ]
+    },
+    "ISPConfig": {
+      "cats": [3],
+      "html": [
+        "<title\\b[^>]*>\\s*ISPConfig(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*(?:[-–—|:]\\s*)?(?:Log[ -]?in|Sign in)\\s*</title>\\;confidence:75\\;version:\\1",
+        "<title\\b[^>]*>\\s*(?:Log[ -]?in|Sign in)\\s*(?:(?:to|[-–—|:])\\s*)?ISPConfig(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>\\;confidence:75\\;version:\\1",
+        "(?s)<title\\b[^>]*>\\s*ISPConfig(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>.*?<form\\b[^>]*>\\;confidence:75\\;version:\\1",
+        "<(?:img|link)\\b[^>]*(?:src|href)\\s*=\\s*[\"\\'][^\"\\']*/themes/[^/\"\\']+/images/(?:ispconfig[_-]?)?logo(?:[_-]ispconfig)\\.(?:svg|png)[\"\\']\\;confidence:75"
+      ],
+      "meta": {
+        "generator": [
+          "^ISPConfig(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*$\\;version:\\1"
+        ]
+      }
+    },
+    "HestiaCP": {
+      "cats": [3],
+      "html": [
+        "<title\\b[^>]*>\\s*Hestia(?:CP| Control Panel)(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*(?:[-–—|:]\\s*)?(?:Log[ -]?in|Sign in)\\s*</title>\\;confidence:75\\;version:\\1",
+        "<title\\b[^>]*>\\s*(?:Log[ -]?in|Sign in)\\s*(?:(?:to|[-–—|:])\\s*)?Hestia(?:CP| Control Panel)(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>\\;confidence:75\\;version:\\1",
+        "(?s)<title\\b[^>]*>\\s*Hestia(?:CP| Control Panel)(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>.*?<form\\b[^>]*>\\;confidence:75\\;version:\\1",
+        "(?s)<title\\b[^>]*>[^<]{1,160}\\s[—–-]\\sHestia Control Panel\\s*</title>.*?<form\\b[^>]*>\\;confidence:75"
+      ],
+      "meta": {
+        "generator": [
+          "^Hestia(?:CP| Control Panel)(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*$\\;version:\\1"
+        ]
+      },
+      "headers": {
+        "server": "^hestia-nginx(?:/[0-9.]+)?\\s*$"
+      }
+    },
+    "CyberPanel": {
+      "cats": [3],
+      "html": [
+        "<title\\b[^>]*>\\s*CyberPanel(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*(?:[-–—|:]\\s*)?(?:Log[ -]?in|Sign in)\\s*</title>\\;confidence:75\\;version:\\1",
+        "<title\\b[^>]*>\\s*(?:Log[ -]?in|Sign in)\\s*(?:(?:to|[-–—|:])\\s*)?CyberPanel(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>\\;confidence:75\\;version:\\1",
+        "(?s)<title\\b[^>]*>\\s*CyberPanel(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*</title>.*?<form\\b[^>]*>\\;confidence:75\\;version:\\1",
+        "<img\\b[^>]*\\bsrc\\s*=\\s*[\"\\'][^\"\\']*/static/(?:baseTemplate/cyber-panel-logo\\.svg|images/cyberpanel-banner-graphics\\.png)[\"\\']\\;confidence:75"
+      ],
+      "meta": {
+        "generator": [
+          "^CyberPanel(?:\\s+v?([0-9]+(?:\\.[0-9]+)*))?\\s*$\\;version:\\1"
+        ]
+      }
     }
   }
 }

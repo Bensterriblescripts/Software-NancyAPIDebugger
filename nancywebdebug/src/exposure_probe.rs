@@ -1100,8 +1100,10 @@ async move {
         return endpoint;
     }
     let negotiation_only = NEGOTIATION_ONLY_TCP_PORTS.contains(&context.port);
-    let should_probe_tls = TLS_PORTS.contains(&context.port)
-        || (endpoint.service == ServiceKind::Unknown && !negotiation_only);
+    let panel_listener_protocol = context.port != 2222 || endpoint.service != ServiceKind::Ssh;
+    let should_probe_tls = panel_listener_protocol
+        && (TLS_PORTS.contains(&context.port)
+            || (endpoint.service == ServiceKind::Unknown && !negotiation_only));
     if should_probe_tls {
         for version in [TlsVersion::Tls12, TlsVersion::Tls13] {
             let observation = ({
@@ -3779,6 +3781,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -3816,6 +3819,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
                     );
                     {
                         ExposureFinding {
+        details: Vec::new(),
                             title: title.to_owned(),
                             description: description.to_owned(),
                             ip: endpoint.ip,
@@ -3844,6 +3848,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -3880,6 +3885,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
                     );
                     {
                         ExposureFinding {
+        details: Vec::new(),
                             title: title.to_owned(),
                             description: description.to_owned(),
                             ip: endpoint.ip,
@@ -3893,6 +3899,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
             }
             if !errors.is_empty() && !expired && !hostname_mismatch && !not_yet_valid {
                 endpoint.findings.push(ExposureFinding {
+        details: Vec::new(),
             title: "Invalid TLS certificate".to_owned(),
             description: "Normal certificate validation failed; further inspection used a clearly marked permissive scan-only connection".to_owned(),
             ip: endpoint.ip,
@@ -3918,6 +3925,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -3961,6 +3969,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
                         );
                         {
                             ExposureFinding {
+        details: Vec::new(),
                                 title: title.to_owned(),
                                 description: description.to_owned(),
                                 ip: endpoint.ip,
@@ -3981,6 +3990,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -4015,6 +4025,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
                         );
                         {
                             ExposureFinding {
+        details: Vec::new(),
                                 title: title.to_owned(),
                                 description: description.to_owned(),
                                 ip: endpoint.ip,
@@ -4040,6 +4051,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -4062,6 +4074,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
     let unknown_before_http =
         endpoint.service == ServiceKind::Unknown || endpoint.service == ServiceKind::Tls;
     if !negotiation_only
+        && panel_listener_protocol
         && (HTTPS_PORTS.contains(&context.port)
             || tls_http
             || (unknown_before_http && endpoint.tls.iter().any(|v| v.supported)))
@@ -4180,6 +4193,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -4209,6 +4223,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -4223,20 +4238,14 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 });
         }
         if let Some(hsts) = super::browser_policy::hsts_assessment(root, &final_scheme) {
-            let (title, severity, outcome, evidence) = match hsts.issue {
+            let (title, outcome, evidence) = match hsts.issue {
                 Some(issue) => (
                     issue.title.to_owned(),
-                    if issue.title == "Weak HSTS max-age" {
-                        FindingSeverity::Low
-                    } else {
-                        FindingSeverity::Medium
-                    },
                     CheckOutcome::Vulnerable,
                     vec![issue.evidence],
                 ),
                 None => (
                     "HSTS policy weakness".to_owned(),
-                    FindingSeverity::Informational,
                     CheckOutcome::NotObserved,
                     vec![format!(
                         "HSTS max-age is {} seconds",
@@ -4250,7 +4259,6 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
                 check_id: "tls.hsts.policy".to_owned(),
                 class: VulnerabilityClass::Tls,
                 title,
-                severity,
                 confidence: Confidence::High,
                 outcome,
                 probe_url: Some(root.url.clone()),
@@ -4264,7 +4272,6 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
                 check_id: "tls.hsts.include-subdomains".to_owned(),
                 class: VulnerabilityClass::Tls,
                 title: "HSTS includeSubDomains hardening".to_owned(),
-                severity: FindingSeverity::Informational,
                 confidence: Confidence::High,
                 outcome: CheckOutcome::NotObserved,
                 probe_url: Some(root.url.clone()),
@@ -4286,7 +4293,6 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
                 check_id: "tls.hsts.preload-eligibility".to_owned(),
                 class: VulnerabilityClass::Tls,
                 title: "HSTS preload eligibility".to_owned(),
-                severity: FindingSeverity::Informational,
                 confidence: Confidence::Medium,
                 outcome: CheckOutcome::NotObserved,
                 probe_url: Some(root.url.clone()),
@@ -4336,7 +4342,7 @@ async move {
     }
     let scheme = base.scheme().to_owned();
     let web_context = ProbeContext { port: port, ..(context) };
-    for path in ({
+    let asset_paths = ({
 let (root, base,): (& HttpObservation, & Url,) = (root, &base,);
 let inlined_result: Vec < String > = {
 
@@ -4397,67 +4403,33 @@ inlined_result
 })
         .into_iter()
         .take(MAX_WEB_ASSET_REQUESTS)
-    {
-        if { let context = context; context.scan.cancel.is_cancelled() || crate::exposure::endpoint_health::stopped(context.ip, context.port) } {
-            return;
-        }
-        let chain = request_http_chain(
-            web_context,
-            &scheme,
-            "GET",
-            &path,
-            &[],
-            MAX_HTTP_BODY_BYTES,
-            cookie_jar,
-        )
-        .await
-        .unwrap_or_default();
+        .collect();
+    for (_, chain) in independent_http_chains(web_context, &scheme, asset_paths, cookie_jar).await {
         endpoint.http.extend(chain);
     }
 
     let mut requested = HashSet::new();
     let mut discovery_count = 0usize;
     let baselines = baseline.into_iter().collect::<Vec<_>>();
-    for path in [
-        "/login/index.php",
-        "/wp-json/",
-        "/wp-json/wc/store/v1/",
-        "/rest/V1/store/storeConfigs",
-        "/cart.js",
-        "/api/storefront/store-context",
-        "/Security/login",
-        "/index.php?route=account/login",
-        "/products",
-        "/cart",
-        "/checkout",
+    for group in [
+        &["/login/index.php", "/wp-json/"][..],
+        &["/wp-json/wc/store/v1/", "/rest/V1/store/storeConfigs", "/cart.js",
+            "/api/storefront/store-context", "/Security/login", "/index.php?route=account/login",
+            "/products", "/cart", "/checkout"][..],
     ] {
-        ({
-let (endpoint, context, scheme, path, requested, count, cookie_jar,): (& mut EndpointScan, ProbeContext < '_ >, & str, & str, & mut HashSet < String >, & mut usize, Option < & Mutex < EndpointCookieJar > >,) = (endpoint, web_context, &scheme, path, &mut requested, &mut discovery_count, cookie_jar,);
-async move {
-
-    if ({ let context = context; context.scan.cancel.is_cancelled() || crate::exposure::endpoint_health::stopped(context.ip, context.port) })
-        || *count >= MAX_WEB_DISCOVERY_REQUESTS
-        || !requested.insert(path.to_owned())
-    {
-        return;
-    }
-    *count += 1;
-    let chain = request_http_chain(
-        context,
-        scheme,
-        "GET",
-        path,
-        &[],
-        MAX_HTTP_BODY_BYTES,
-        cookie_jar,
-    )
-    .await
-    .unwrap_or_default();
-    endpoint.http.extend(chain);
-
-}
-})
-        .await;
+        let mut paths = Vec::new();
+        for path in group {
+            if discovery_count >= MAX_WEB_DISCOVERY_REQUESTS || context.scan.cancel.is_cancelled()
+                || endpoint_health::stopped(context.ip, context.port) {
+                break;
+            }
+            if requested.insert((*path).to_owned()) {
+                discovery_count += 1;
+                paths.push((*path).to_owned());
+            }
+        }
+        for (path, chain) in independent_http_chains(web_context, &scheme, paths, cookie_jar).await {
+            endpoint.http.extend(chain);
         if path == "/wp-json/"
             && !endpoint.http.iter().any(|response| {
                 Url::parse(&response.url).is_ok_and(|url| same_origin(&base, &url))
@@ -4495,6 +4467,7 @@ async move {
         }
     }
 
+    }
     let hints = {
 let (responses,): (_,) = (endpoint.http.iter().filter(|response| {
         Url::parse(&response.url).is_ok_and(|url| same_origin(&base, &url))
@@ -4605,37 +4578,19 @@ inlined_result
             "/index.php?route=checkout/checkout",
         ]);
     }
+    let mut paths = Vec::new();
     for path in targeted {
-        if discovery_count >= MAX_WEB_DISCOVERY_REQUESTS || ({ let context = context; context.scan.cancel.is_cancelled() || crate::exposure::endpoint_health::stopped(context.ip, context.port) }) {
+        if discovery_count >= MAX_WEB_DISCOVERY_REQUESTS || context.scan.cancel.is_cancelled()
+            || endpoint_health::stopped(context.ip, context.port) {
             break;
         }
-        ({
-let (endpoint, context, scheme, path, requested, count, cookie_jar,): (& mut EndpointScan, ProbeContext < '_ >, & str, & str, & mut HashSet < String >, & mut usize, Option < & Mutex < EndpointCookieJar > >,) = (endpoint, web_context, &scheme, path, &mut requested, &mut discovery_count, cookie_jar,);
-async move {
-
-    if ({ let context = context; context.scan.cancel.is_cancelled() || crate::exposure::endpoint_health::stopped(context.ip, context.port) })
-        || *count >= MAX_WEB_DISCOVERY_REQUESTS
-        || !requested.insert(path.to_owned())
-    {
-        return;
+        if requested.insert(path.to_owned()) {
+            discovery_count += 1;
+            paths.push(path.to_owned());
+        }
     }
-    *count += 1;
-    let chain = request_http_chain(
-        context,
-        scheme,
-        "GET",
-        path,
-        &[],
-        MAX_HTTP_BODY_BYTES,
-        cookie_jar,
-    )
-    .await
-    .unwrap_or_default();
-    endpoint.http.extend(chain);
-
-}
-})
-        .await;
+    for (_, chain) in independent_http_chains(web_context, &scheme, paths, cookie_jar).await {
+        endpoint.http.extend(chain);
     }
 
 }
@@ -4677,6 +4632,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -4765,6 +4721,15 @@ inlined_result
         let cap = 96usize.min(context.scan.request.crawl_max_urls);
         probes.extend(security_operations_exposure_probes().into_iter().take(cap));
     }
+    let mut seen = HashSet::new();
+    probes.retain(|probe| (probe.tier != ProbeTier::SecurityOperations || context.scan.request.security_operations)
+        && seen.insert(probe.path.clone()));
+    let chains = independent_http_chains(context, scheme, probes.iter().map(|probe| probe.path.clone()).collect(), cookie_jar).await;
+    if context.scan.cancel.is_cancelled() || endpoint_health::stopped(context.ip, context.port) {
+        endpoint.http.extend(chains.into_iter().flat_map(|(_, chain)| chain));
+        return;
+    }
+    let mut chains = chains.into_iter().collect::<HashMap<_, _>>();
     let mut git_oid = None;
     let mut git_ref = None;
     for probe in probes {
@@ -4775,17 +4740,7 @@ inlined_result
         {
             continue;
         }
-        let chain = request_http_chain(
-            context,
-            scheme,
-            "GET",
-            &probe.path,
-            &[],
-            MAX_HTTP_BODY_BYTES,
-            cookie_jar,
-        )
-        .await
-        .unwrap_or_default();
+        let chain = chains.remove(&probe.path).unwrap_or_default();
         if let Some(response) = chain.last() {
             if matches!(response.status, 401 | 403) || ({
 let (chain,): (& [HttpObservation],) = (&chain,);
@@ -5315,6 +5270,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -5350,6 +5306,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -5489,6 +5446,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -5570,6 +5528,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -5912,6 +5871,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -5955,6 +5915,14 @@ let (chain,): (& [HttpObservation],) = (&chain,);
 let (endpoint, scheme, context, cookie_jar,): (& mut EndpointScan, & str, ProbeContext < '_ >, Option < & Mutex < EndpointCookieJar > >,) = (endpoint, scheme, context, cookie_jar,);
 async move {
 
+    let mut fingerprint_chains = if cookie_jar.is_none() {
+        let paths = MANAGEMENT_PRODUCT_PROBES.iter()
+            .filter(|probe| !endpoint.http.iter().any(|response| management_fingerprint(probe.kind, response)))
+            .map(|probe| probe.fingerprint_path.to_owned()).collect();
+        independent_http_chains(context, scheme, paths, None).await.into_iter().collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
     for probe in MANAGEMENT_PRODUCT_PROBES {
         if { let context = context; context.scan.cancel.is_cancelled() || crate::exposure::endpoint_health::stopped(context.ip, context.port) } {
             return;
@@ -5967,7 +5935,11 @@ async move {
         let fingerprint = if let Some(response) = existing {
             Some(response.clone())
         } else {
-            fingerprint_chain = request_http_chain(
+            fingerprint_chain = if let Some(chain) = fingerprint_chains.remove(probe.fingerprint_path) {
+                chain
+            } else if cookie_jar.is_none() {
+                Vec::new()
+            } else { request_http_chain(
                 context,
                 scheme,
                 "GET",
@@ -5977,7 +5949,7 @@ async move {
                 cookie_jar,
             )
             .await
-            .unwrap_or_default();
+            .unwrap_or_default() };
             fingerprint_chain
                 .iter()
                 .find(|response| management_fingerprint(probe.kind, response))
@@ -6114,6 +6086,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -6158,6 +6131,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -6176,6 +6150,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 }).await;
     }
     if !negotiation_only
+        && panel_listener_protocol
         && endpoint.http.is_empty()
         && (HTTP_PORTS.contains(&context.port)
             || endpoint.service == ServiceKind::Unknown
@@ -6295,6 +6270,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -6324,6 +6300,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -6338,20 +6315,14 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 });
         }
         if let Some(hsts) = super::browser_policy::hsts_assessment(root, &final_scheme) {
-            let (title, severity, outcome, evidence) = match hsts.issue {
+            let (title, outcome, evidence) = match hsts.issue {
                 Some(issue) => (
                     issue.title.to_owned(),
-                    if issue.title == "Weak HSTS max-age" {
-                        FindingSeverity::Low
-                    } else {
-                        FindingSeverity::Medium
-                    },
                     CheckOutcome::Vulnerable,
                     vec![issue.evidence],
                 ),
                 None => (
                     "HSTS policy weakness".to_owned(),
-                    FindingSeverity::Informational,
                     CheckOutcome::NotObserved,
                     vec![format!(
                         "HSTS max-age is {} seconds",
@@ -6365,7 +6336,6 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
                 check_id: "tls.hsts.policy".to_owned(),
                 class: VulnerabilityClass::Tls,
                 title,
-                severity,
                 confidence: Confidence::High,
                 outcome,
                 probe_url: Some(root.url.clone()),
@@ -6379,7 +6349,6 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
                 check_id: "tls.hsts.include-subdomains".to_owned(),
                 class: VulnerabilityClass::Tls,
                 title: "HSTS includeSubDomains hardening".to_owned(),
-                severity: FindingSeverity::Informational,
                 confidence: Confidence::High,
                 outcome: CheckOutcome::NotObserved,
                 probe_url: Some(root.url.clone()),
@@ -6401,7 +6370,6 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
                 check_id: "tls.hsts.preload-eligibility".to_owned(),
                 class: VulnerabilityClass::Tls,
                 title: "HSTS preload eligibility".to_owned(),
-                severity: FindingSeverity::Informational,
                 confidence: Confidence::Medium,
                 outcome: CheckOutcome::NotObserved,
                 probe_url: Some(root.url.clone()),
@@ -6451,7 +6419,7 @@ async move {
     }
     let scheme = base.scheme().to_owned();
     let web_context = ProbeContext { port: port, ..(context) };
-    for path in ({
+    let asset_paths = ({
 let (root, base,): (& HttpObservation, & Url,) = (root, &base,);
 let inlined_result: Vec < String > = {
 
@@ -6512,67 +6480,33 @@ inlined_result
 })
         .into_iter()
         .take(MAX_WEB_ASSET_REQUESTS)
-    {
-        if { let context = context; context.scan.cancel.is_cancelled() || crate::exposure::endpoint_health::stopped(context.ip, context.port) } {
-            return;
-        }
-        let chain = request_http_chain(
-            web_context,
-            &scheme,
-            "GET",
-            &path,
-            &[],
-            MAX_HTTP_BODY_BYTES,
-            cookie_jar,
-        )
-        .await
-        .unwrap_or_default();
+        .collect();
+    for (_, chain) in independent_http_chains(web_context, &scheme, asset_paths, cookie_jar).await {
         endpoint.http.extend(chain);
     }
 
     let mut requested = HashSet::new();
     let mut discovery_count = 0usize;
     let baselines = baseline.into_iter().collect::<Vec<_>>();
-    for path in [
-        "/login/index.php",
-        "/wp-json/",
-        "/wp-json/wc/store/v1/",
-        "/rest/V1/store/storeConfigs",
-        "/cart.js",
-        "/api/storefront/store-context",
-        "/Security/login",
-        "/index.php?route=account/login",
-        "/products",
-        "/cart",
-        "/checkout",
+    for group in [
+        &["/login/index.php", "/wp-json/"][..],
+        &["/wp-json/wc/store/v1/", "/rest/V1/store/storeConfigs", "/cart.js",
+            "/api/storefront/store-context", "/Security/login", "/index.php?route=account/login",
+            "/products", "/cart", "/checkout"][..],
     ] {
-        ({
-let (endpoint, context, scheme, path, requested, count, cookie_jar,): (& mut EndpointScan, ProbeContext < '_ >, & str, & str, & mut HashSet < String >, & mut usize, Option < & Mutex < EndpointCookieJar > >,) = (endpoint, web_context, &scheme, path, &mut requested, &mut discovery_count, cookie_jar,);
-async move {
-
-    if ({ let context = context; context.scan.cancel.is_cancelled() || crate::exposure::endpoint_health::stopped(context.ip, context.port) })
-        || *count >= MAX_WEB_DISCOVERY_REQUESTS
-        || !requested.insert(path.to_owned())
-    {
-        return;
-    }
-    *count += 1;
-    let chain = request_http_chain(
-        context,
-        scheme,
-        "GET",
-        path,
-        &[],
-        MAX_HTTP_BODY_BYTES,
-        cookie_jar,
-    )
-    .await
-    .unwrap_or_default();
-    endpoint.http.extend(chain);
-
-}
-})
-        .await;
+        let mut paths = Vec::new();
+        for path in group {
+            if discovery_count >= MAX_WEB_DISCOVERY_REQUESTS || context.scan.cancel.is_cancelled()
+                || endpoint_health::stopped(context.ip, context.port) {
+                break;
+            }
+            if requested.insert((*path).to_owned()) {
+                discovery_count += 1;
+                paths.push((*path).to_owned());
+            }
+        }
+        for (path, chain) in independent_http_chains(web_context, &scheme, paths, cookie_jar).await {
+            endpoint.http.extend(chain);
         if path == "/wp-json/"
             && !endpoint.http.iter().any(|response| {
                 Url::parse(&response.url).is_ok_and(|url| same_origin(&base, &url))
@@ -6610,6 +6544,7 @@ async move {
         }
     }
 
+    }
     let hints = {
 let (responses,): (_,) = (endpoint.http.iter().filter(|response| {
         Url::parse(&response.url).is_ok_and(|url| same_origin(&base, &url))
@@ -6720,37 +6655,19 @@ inlined_result
             "/index.php?route=checkout/checkout",
         ]);
     }
+    let mut paths = Vec::new();
     for path in targeted {
-        if discovery_count >= MAX_WEB_DISCOVERY_REQUESTS || ({ let context = context; context.scan.cancel.is_cancelled() || crate::exposure::endpoint_health::stopped(context.ip, context.port) }) {
+        if discovery_count >= MAX_WEB_DISCOVERY_REQUESTS || context.scan.cancel.is_cancelled()
+            || endpoint_health::stopped(context.ip, context.port) {
             break;
         }
-        ({
-let (endpoint, context, scheme, path, requested, count, cookie_jar,): (& mut EndpointScan, ProbeContext < '_ >, & str, & str, & mut HashSet < String >, & mut usize, Option < & Mutex < EndpointCookieJar > >,) = (endpoint, web_context, &scheme, path, &mut requested, &mut discovery_count, cookie_jar,);
-async move {
-
-    if ({ let context = context; context.scan.cancel.is_cancelled() || crate::exposure::endpoint_health::stopped(context.ip, context.port) })
-        || *count >= MAX_WEB_DISCOVERY_REQUESTS
-        || !requested.insert(path.to_owned())
-    {
-        return;
+        if requested.insert(path.to_owned()) {
+            discovery_count += 1;
+            paths.push(path.to_owned());
+        }
     }
-    *count += 1;
-    let chain = request_http_chain(
-        context,
-        scheme,
-        "GET",
-        path,
-        &[],
-        MAX_HTTP_BODY_BYTES,
-        cookie_jar,
-    )
-    .await
-    .unwrap_or_default();
-    endpoint.http.extend(chain);
-
-}
-})
-        .await;
+    for (_, chain) in independent_http_chains(web_context, &scheme, paths, cookie_jar).await {
+        endpoint.http.extend(chain);
     }
 
 }
@@ -6792,6 +6709,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -6880,6 +6798,15 @@ inlined_result
         let cap = 96usize.min(context.scan.request.crawl_max_urls);
         probes.extend(security_operations_exposure_probes().into_iter().take(cap));
     }
+    let mut seen = HashSet::new();
+    probes.retain(|probe| (probe.tier != ProbeTier::SecurityOperations || context.scan.request.security_operations)
+        && seen.insert(probe.path.clone()));
+    let chains = independent_http_chains(context, scheme, probes.iter().map(|probe| probe.path.clone()).collect(), cookie_jar).await;
+    if context.scan.cancel.is_cancelled() || endpoint_health::stopped(context.ip, context.port) {
+        endpoint.http.extend(chains.into_iter().flat_map(|(_, chain)| chain));
+        return;
+    }
+    let mut chains = chains.into_iter().collect::<HashMap<_, _>>();
     let mut git_oid = None;
     let mut git_ref = None;
     for probe in probes {
@@ -6890,17 +6817,7 @@ inlined_result
         {
             continue;
         }
-        let chain = request_http_chain(
-            context,
-            scheme,
-            "GET",
-            &probe.path,
-            &[],
-            MAX_HTTP_BODY_BYTES,
-            cookie_jar,
-        )
-        .await
-        .unwrap_or_default();
+        let chain = chains.remove(&probe.path).unwrap_or_default();
         if let Some(response) = chain.last() {
             if matches!(response.status, 401 | 403) || ({
 let (chain,): (& [HttpObservation],) = (&chain,);
@@ -7430,6 +7347,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -7465,6 +7383,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -7604,6 +7523,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -7685,6 +7605,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -8027,6 +7948,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -8070,6 +7992,14 @@ let (chain,): (& [HttpObservation],) = (&chain,);
 let (endpoint, scheme, context, cookie_jar,): (& mut EndpointScan, & str, ProbeContext < '_ >, Option < & Mutex < EndpointCookieJar > >,) = (endpoint, scheme, context, cookie_jar,);
 async move {
 
+    let mut fingerprint_chains = if cookie_jar.is_none() {
+        let paths = MANAGEMENT_PRODUCT_PROBES.iter()
+            .filter(|probe| !endpoint.http.iter().any(|response| management_fingerprint(probe.kind, response)))
+            .map(|probe| probe.fingerprint_path.to_owned()).collect();
+        independent_http_chains(context, scheme, paths, None).await.into_iter().collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
     for probe in MANAGEMENT_PRODUCT_PROBES {
         if { let context = context; context.scan.cancel.is_cancelled() || crate::exposure::endpoint_health::stopped(context.ip, context.port) } {
             return;
@@ -8082,7 +8012,11 @@ async move {
         let fingerprint = if let Some(response) = existing {
             Some(response.clone())
         } else {
-            fingerprint_chain = request_http_chain(
+            fingerprint_chain = if let Some(chain) = fingerprint_chains.remove(probe.fingerprint_path) {
+                chain
+            } else if cookie_jar.is_none() {
+                Vec::new()
+            } else { request_http_chain(
                 context,
                 scheme,
                 "GET",
@@ -8092,7 +8026,7 @@ async move {
                 cookie_jar,
             )
             .await
-            .unwrap_or_default();
+            .unwrap_or_default() };
             fingerprint_chain
                 .iter()
                 .find(|response| management_fingerprint(probe.kind, response))
@@ -8229,6 +8163,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -8273,6 +8208,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -8291,9 +8227,21 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 }).await;
     }
     product_identification::probe(&mut endpoint, context).await;
-    apply_product_rules(&mut endpoint);
-    crate::product_catalog::reconcile(&mut endpoint);
-    record_observed_web_surfaces(&mut endpoint);
+    if !context.scan.cancel.is_cancelled() {
+        let mut input = endpoint.clone();
+        match crate::blocking::run(context.scan.cancel, move |cancel| {
+            apply_product_rules(&mut input, cancel);
+            if !cancel.is_cancelled() {
+                crate::product_catalog::reconcile(&mut input);
+                record_observed_web_surfaces(&mut input);
+            }
+            input
+        }).await {
+            Ok(processed) => endpoint = processed,
+            Err(crate::blocking::Error::Cancelled) => {}
+            Err(error) => endpoint.evidence.push(error.to_string()),
+        }
+    }
     ({
         let (endpoint,): (&mut EndpointScan,) = (&mut endpoint,);
 
@@ -8342,14 +8290,20 @@ pub(crate) fn add_product(
     evidence: String,
 ) {
     let name = crate::product_catalog::canonical_product_name(name);
+    let mut record = super::technology_evidence::observation("Supporting product detection", &evidence);
+    record.endpoint = Some(std::net::SocketAddr::new(endpoint.ip, endpoint.port).to_string());
+    record.extracted_version = version.as_deref().map(super::technology_evidence::safe_value);
+    record.supporting_detection = Some(name.to_owned());
     if let Some(product) = endpoint.products.iter_mut().find(|product| {
         crate::product_catalog::canonical_product_name(&product.name).eq_ignore_ascii_case(name)
     }) {
+        if !product.observations.contains(&record) { product.observations.push(record); }
         product.name = name.to_owned();
-        if confidence > product.confidence {
+        if version.is_some() && (confidence > product.confidence || product.version.is_none()) {
             product.version = version;
-        } else if confidence == product.confidence && product.version.is_none() {
-            product.version = version;
+        }
+        if crate::product_catalog::panel_product_name(name).is_some() {
+            product.layer = ProductLayer::Server;
         }
         product.confidence = product.confidence.max(confidence);
         if !product.evidence.contains(&evidence) {
@@ -8357,6 +8311,7 @@ pub(crate) fn add_product(
         }
     } else {
         endpoint.products.push(ProductDetection {
+            observations: vec![record],
             name: name.to_owned(),
             layer,
             version,
@@ -9298,6 +9253,7 @@ fn add_cors_sample_findings(endpoint: &mut EndpointScan, samples: &[CorsSample],
                 );
                 {
                     ExposureFinding {
+        details: Vec::new(),
                         title: title.to_owned(),
                         description: description.to_owned(),
                         ip: endpoint.ip,
@@ -9323,6 +9279,7 @@ fn add_cors_sample_findings(endpoint: &mut EndpointScan, samples: &[CorsSample],
                     );
                     {
                         ExposureFinding {
+        details: Vec::new(),
                             title: title.to_owned(),
                             description: description.to_owned(),
                             ip: endpoint.ip,
@@ -9351,6 +9308,7 @@ fn add_cors_sample_findings(endpoint: &mut EndpointScan, samples: &[CorsSample],
                 );
                 {
                     ExposureFinding {
+        details: Vec::new(),
                         title: title.to_owned(),
                         description: description.to_owned(),
                         ip: endpoint.ip,
@@ -9376,6 +9334,7 @@ fn add_cors_sample_findings(endpoint: &mut EndpointScan, samples: &[CorsSample],
                     );
                     {
                         ExposureFinding {
+        details: Vec::new(),
                             title: title.to_owned(),
                             description: description.to_owned(),
                             ip: endpoint.ip,
@@ -9404,6 +9363,7 @@ fn add_cors_sample_findings(endpoint: &mut EndpointScan, samples: &[CorsSample],
                 );
                 {
                     ExposureFinding {
+        details: Vec::new(),
                         title: title.to_owned(),
                         description: description.to_owned(),
                         ip: endpoint.ip,
@@ -9424,6 +9384,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -9475,6 +9436,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
                     );
                     {
                         ExposureFinding {
+        details: Vec::new(),
                             title: title.to_owned(),
                             description: description.to_owned(),
                             ip: endpoint.ip,
@@ -9647,6 +9609,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -9772,6 +9735,7 @@ let (endpoint, title, description, evidence,): (& EndpointScan, & str, & str, Ve
 {
 
     ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: endpoint.ip,
@@ -9928,6 +9892,65 @@ pub(super) fn looks_like_soft_404(
         .filter(|(left, right)| left == right)
         .count();
     common * 100 / max_len >= 95
+}
+
+async fn independent_http_chains(
+    context: ProbeContext<'_>,
+    scheme: &str,
+    paths: Vec<String>,
+    cookie_jar: Option<&Mutex<EndpointCookieJar>>,
+) -> Vec<(String, Vec<HttpObservation>)> {
+    let mut seen = HashSet::new();
+    let paths = paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect::<Vec<_>>();
+    let concurrency = if cookie_jar.is_some() {
+        1
+    } else {
+        context.scan.request.concurrency.clamp(1, 4)
+    };
+    let requests = futures_util::stream::iter(paths.into_iter().enumerate())
+        .map(|(index, path)| async move {
+            let request = request_http_chain(
+                context,
+                scheme,
+                "GET",
+                &path,
+                &[],
+                MAX_HTTP_BODY_BYTES,
+                cookie_jar,
+            );
+            let chain = if cookie_jar.is_some() {
+                request.await
+            } else {
+                endpoint_health::independent(request).await
+            }
+            .unwrap_or_default();
+            (index, path, chain)
+        })
+        .buffer_unordered(concurrency);
+    tokio::pin!(requests);
+    let mut results = Vec::new();
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = context.scan.cancel.cancelled() => break,
+            result = requests.next() => result,
+        };
+        let Some(result) = result else {
+            break;
+        };
+        results.push(result);
+        if endpoint_health::stopped(context.ip, context.port) {
+            break;
+        }
+    }
+    results.sort_by_key(|(index, _, _)| *index);
+    results
+        .into_iter()
+        .map(|(_, path, chain)| (path, chain))
+        .collect()
 }
 
 async fn request_http_chain(
@@ -10338,189 +10361,203 @@ async fn http_exchange_bytes(
             }
         })
         .await?;
-        let mut response = ({
-            let (method, bytes, body_limit, mut framing): (&str, Vec<u8>, usize, ResponseFraming) =
-                (method, bytes, body_limit, framing);
-            let inlined_result: Result<HttpObservation, String> = {
-                'inlined_parse_http_response: {
-                    let header_end = match ({
-                        let (bytes,): (&[u8],) = (&bytes,);
-                        let inlined_result: Option<usize> = {
-                            bytes
-                                .windows(4)
-                                .position(|window| window == b"\r\n\r\n")
-                                .map(|index| index + 4)
-                                .or_else(|| {
-                                    bytes
-                                        .windows(2)
-                                        .position(|window| window == b"\n\n")
-                                        .map(|index| index + 2)
-                                })
-                        };
-                        inlined_result
-                    })
-                    .ok_or_else(|| "Incomplete HTTP headers".to_owned())
-                    {
-                        Ok(value) => value,
-                        Err(error) => {
-                            break 'inlined_parse_http_response Err(::core::convert::From::from(
-                                error,
-                            ));
-                        }
-                    };
-                    let header_text = String::from_utf8_lossy(&bytes[..header_end]);
-                    let mut lines = header_text.lines();
-                    let status_line = match lines
-                        .next()
-                        .ok_or_else(|| "Missing HTTP status line".to_owned())
-                    {
-                        Ok(value) => value,
-                        Err(error) => {
-                            break 'inlined_parse_http_response Err(::core::convert::From::from(
-                                error,
-                            ));
-                        }
-                    };
-                    let mut status_parts = status_line.trim_end_matches('\r').splitn(3, ' ');
-                    let protocol = status_parts.next().unwrap_or_default();
-                    if !protocol.starts_with("HTTP/") {
-                        break 'inlined_parse_http_response Err(
-                            "Response does not contain an HTTP status line".to_owned(),
-                        );
-                    }
-                    let status = match match status_parts
-                        .next()
-                        .ok_or_else(|| "HTTP status code is missing".to_owned())
-                    {
-                        Ok(value) => value,
-                        Err(error) => {
-                            break 'inlined_parse_http_response Err(::core::convert::From::from(
-                                error,
-                            ));
-                        }
-                    }
-                    .parse::<u16>()
-                    .map_err(|_| "HTTP status code is invalid".to_owned())
-                    {
-                        Ok(value) => value,
-                        Err(error) => {
-                            break 'inlined_parse_http_response Err(::core::convert::From::from(
-                                error,
-                            ));
-                        }
-                    };
-                    let reason = status_parts.next().unwrap_or_default().trim().to_owned();
-                    let headers = lines
-                        .filter_map(|line| line.trim_end_matches('\r').split_once(':'))
-                        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
-                        .collect::<Vec<_>>();
-                    let mut body = if method.eq_ignore_ascii_case("HEAD") {
-                        Vec::new()
-                    } else {
-                        bytes[header_end..].to_vec()
-                    };
-                    framing.transfer_chunked = headers.iter().any(|(name, value)| {
-                        name.eq_ignore_ascii_case("transfer-encoding")
-                            && value.to_ascii_lowercase().contains("chunked")
-                    });
-                    if framing.transfer_chunked
-                        && let Some((decoded, chunks, complete)) = ({
-                            let (bytes, body_limit): (&[u8], usize) = (&body, body_limit);
-                            {
-                                'inlined_decode_chunked: {
-                                    let mut position = 0usize;
-                                    let mut output = Vec::new();
-                                    let mut chunks = 0usize;
-                                    loop {
-                                        if position >= bytes.len() {
-                                            break 'inlined_decode_chunked (chunks > 0)
-                                                .then_some((output, chunks, false));
-                                        }
-                                        let Some(line_end) = bytes[position..]
+        let method = method.to_owned();
+        let mut response = crate::blocking::run(context.scan.cancel, move |cancel| {
+            let method = method.as_str();
+            {
+                let (method, bytes, body_limit, mut framing): (
+                    &str,
+                    Vec<u8>,
+                    usize,
+                    ResponseFraming,
+                ) = (method, bytes, body_limit, framing);
+                let inlined_result: Result<HttpObservation, String> = {
+                    'inlined_parse_http_response: {
+                        let header_end = match ({
+                            let (bytes,): (&[u8],) = (&bytes,);
+                            let inlined_result: Option<usize> = {
+                                bytes
+                                    .windows(4)
+                                    .position(|window| window == b"\r\n\r\n")
+                                    .map(|index| index + 4)
+                                    .or_else(|| {
+                                        bytes
                                             .windows(2)
-                                            .position(|window| window == b"\r\n")
-                                            .map(|line_end| line_end + position)
-                                        else {
-                                            break 'inlined_decode_chunked (chunks > 0)
-                                                .then_some((output, chunks, false));
-                                        };
-                                        let size_text =
-                                            match std::str::from_utf8(&bytes[position..line_end])
-                                                .ok()
+                                            .position(|window| window == b"\n\n")
+                                            .map(|index| index + 2)
+                                    })
+                            };
+                            inlined_result
+                        })
+                        .ok_or_else(|| "Incomplete HTTP headers".to_owned())
+                        {
+                            Ok(value) => value,
+                            Err(error) => {
+                                break 'inlined_parse_http_response Err(
+                                    ::core::convert::From::from(error),
+                                );
+                            }
+                        };
+                        let header_text = String::from_utf8_lossy(&bytes[..header_end]);
+                        let mut lines = header_text.lines();
+                        let status_line = match lines
+                            .next()
+                            .ok_or_else(|| "Missing HTTP status line".to_owned())
+                        {
+                            Ok(value) => value,
+                            Err(error) => {
+                                break 'inlined_parse_http_response Err(
+                                    ::core::convert::From::from(error),
+                                );
+                            }
+                        };
+                        let mut status_parts = status_line.trim_end_matches('\r').splitn(3, ' ');
+                        let protocol = status_parts.next().unwrap_or_default();
+                        if !protocol.starts_with("HTTP/") {
+                            break 'inlined_parse_http_response Err(
+                                "Response does not contain an HTTP status line".to_owned(),
+                            );
+                        }
+                        let status = match match status_parts
+                            .next()
+                            .ok_or_else(|| "HTTP status code is missing".to_owned())
+                        {
+                            Ok(value) => value,
+                            Err(error) => {
+                                break 'inlined_parse_http_response Err(
+                                    ::core::convert::From::from(error),
+                                );
+                            }
+                        }
+                        .parse::<u16>()
+                        .map_err(|_| "HTTP status code is invalid".to_owned())
+                        {
+                            Ok(value) => value,
+                            Err(error) => {
+                                break 'inlined_parse_http_response Err(
+                                    ::core::convert::From::from(error),
+                                );
+                            }
+                        };
+                        let reason = status_parts.next().unwrap_or_default().trim().to_owned();
+                        let headers = lines
+                            .filter_map(|line| line.trim_end_matches('\r').split_once(':'))
+                            .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+                            .collect::<Vec<_>>();
+                        let mut body = if method.eq_ignore_ascii_case("HEAD") {
+                            Vec::new()
+                        } else {
+                            bytes[header_end..].to_vec()
+                        };
+                        framing.transfer_chunked = headers.iter().any(|(name, value)| {
+                            name.eq_ignore_ascii_case("transfer-encoding")
+                                && value.to_ascii_lowercase().contains("chunked")
+                        });
+                        if framing.transfer_chunked
+                            && let Some((decoded, chunks, complete)) = ({
+                                let (bytes, body_limit): (&[u8], usize) = (&body, body_limit);
+                                {
+                                    'inlined_decode_chunked: {
+                                        let mut position = 0usize;
+                                        let mut output = Vec::new();
+                                        let mut chunks = 0usize;
+                                        loop {
+                                            if cancel.is_cancelled() {
+                                                return Err("Scan cancelled".to_owned());
+                                            }
+                                            if position >= bytes.len() {
+                                                break 'inlined_decode_chunked (chunks > 0)
+                                                    .then_some((output, chunks, false));
+                                            }
+                                            let Some(line_end) = bytes[position..]
+                                                .windows(2)
+                                                .position(|window| window == b"\r\n")
+                                                .map(|line_end| line_end + position)
+                                            else {
+                                                break 'inlined_decode_chunked (chunks > 0)
+                                                    .then_some((output, chunks, false));
+                                            };
+                                            let size_text = match std::str::from_utf8(
+                                                &bytes[position..line_end],
+                                            )
+                                            .ok()
                                             {
                                                 Some(value) => value,
                                                 None => break 'inlined_decode_chunked None,
                                             };
-                                        let size = match usize::from_str_radix(
-                                            match size_text.split(';').next() {
+                                            let size = match usize::from_str_radix(
+                                                match size_text.split(';').next() {
+                                                    Some(value) => value,
+                                                    None => break 'inlined_decode_chunked None,
+                                                }
+                                                .trim(),
+                                                16,
+                                            )
+                                            .ok()
+                                            {
                                                 Some(value) => value,
                                                 None => break 'inlined_decode_chunked None,
+                                            };
+                                            position = line_end + 2;
+                                            if size == 0 {
+                                                break 'inlined_decode_chunked Some((
+                                                    output, chunks, true,
+                                                ));
                                             }
-                                            .trim(),
-                                            16,
-                                        )
-                                        .ok()
-                                        {
-                                            Some(value) => value,
-                                            None => break 'inlined_decode_chunked None,
-                                        };
-                                        position = line_end + 2;
-                                        if size == 0 {
-                                            break 'inlined_decode_chunked Some((
-                                                output, chunks, true,
-                                            ));
+                                            let end = match position.checked_add(size) {
+                                                Some(value) => value,
+                                                None => break 'inlined_decode_chunked None,
+                                            };
+                                            if end + 2 > bytes.len() {
+                                                break 'inlined_decode_chunked (chunks > 0)
+                                                    .then_some((output, chunks, false));
+                                            }
+                                            output.extend_from_slice(&bytes[position..end]);
+                                            chunks += 1;
+                                            if output.len() > body_limit {
+                                                break 'inlined_decode_chunked Some((
+                                                    output, chunks, false,
+                                                ));
+                                            }
+                                            position = end + 2;
                                         }
-                                        let end = match position.checked_add(size) {
-                                            Some(value) => value,
-                                            None => break 'inlined_decode_chunked None,
-                                        };
-                                        if end + 2 > bytes.len() {
-                                            break 'inlined_decode_chunked (chunks > 0)
-                                                .then_some((output, chunks, false));
-                                        }
-                                        output.extend_from_slice(&bytes[position..end]);
-                                        chunks += 1;
-                                        if output.len() > body_limit {
-                                            break 'inlined_decode_chunked Some((
-                                                output, chunks, false,
-                                            ));
-                                        }
-                                        position = end + 2;
                                     }
                                 }
-                            }
+                            })
+                        {
+                            body = decoded;
+                            framing.decoded_chunks = chunks;
+                            framing.completed |= complete;
+                        }
+                        let body_truncated = body.len() > body_limit;
+                        body.truncate(body_limit);
+                        let redirect_location = if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                            headers
+                                .iter()
+                                .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+                                .map(|(_, value)| value.clone())
+                        } else {
+                            None
+                        };
+                        Ok(HttpObservation {
+                            method: method.to_owned(),
+                            url: String::new(),
+                            status,
+                            reason,
+                            headers,
+                            body,
+                            body_truncated,
+                            redirect_location,
+                            duration_ms: 0.0,
+                            framing,
                         })
-                    {
-                        body = decoded;
-                        framing.decoded_chunks = chunks;
-                        framing.completed |= complete;
                     }
-                    let body_truncated = body.len() > body_limit;
-                    body.truncate(body_limit);
-                    let redirect_location = if matches!(status, 301 | 302 | 303 | 307 | 308) {
-                        headers
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
-                            .map(|(_, value)| value.clone())
-                    } else {
-                        None
-                    };
-                    Ok(HttpObservation {
-                        method: method.to_owned(),
-                        url: String::new(),
-                        status,
-                        reason,
-                        headers,
-                        body,
-                        body_truncated,
-                        redirect_location,
-                        duration_ms: 0.0,
-                        framing,
-                    })
-                }
-            };
-            inlined_result
-        })?;
+                };
+                inlined_result
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())??;
         response.duration_ms = started.elapsed().as_secs_f64() * 1_000.0;
         Ok(response)
     };

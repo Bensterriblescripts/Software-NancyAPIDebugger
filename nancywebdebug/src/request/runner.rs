@@ -10,7 +10,6 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::dns::{finish_interrupted_dns_attempt, resolve_host, resolve_host_exhaustive};
-use super::fingerprint;
 use super::http::{self, add_automatic_headers, parse_request_headers};
 use super::http3;
 use super::stages::*;
@@ -333,7 +332,7 @@ async move {
         }
         Err(WaitError::TimedOut) => {
             finish_interrupted_dns_attempt(&mut trace.dns, dns_started, "DNS stage timed out");
-            if public_only || trace.dns.addresses.is_empty() {
+            if trace.dns.addresses.is_empty() {
                 return fail_trace(
                     trace,
                     StageKind::Dns,
@@ -375,7 +374,7 @@ async move {
                 StageKind::Dns,
                 StageStatus::Failed,
                 dns_started,
-                "DNS returned no A or AAAA addresses".to_owned(),
+                "No usable A or AAAA addresses; see DNS lookup outcomes for confirmed absence or collection failures".to_owned(),
             );
         }
         if public_only {
@@ -396,9 +395,9 @@ async move {
     } else {
         format!("{} public address(es)", addresses.len())
     };
-    if inventory_timed_out {
+    if inventory_timed_out || !trace.dns.incomplete_record_types.is_empty() {
         dns_detail.push_str(&format!(
-            "; record inventory incomplete ({} query type(s) unfinished)",
+            "; record inventory incomplete ({} query type(s) failed or unfinished)",
             trace.dns.incomplete_record_types.len()
         ));
     }
@@ -440,6 +439,7 @@ async move {
 }
 })
         .await;
+        trace = super::body::process_trace(trace, &cancel).await;
         let next_request = {
             let (trace, visited_urls, redirects_followed): (
                 &mut DiagnosticTrace,
@@ -553,7 +553,6 @@ async move {
                 }
             }
         };
-        fingerprint::analyze(&mut trace);
         if let Some(progress) = &progress {
             let _ = progress.send(DiagnosticProgress::HttpHopCompleted(trace.clone()));
         }

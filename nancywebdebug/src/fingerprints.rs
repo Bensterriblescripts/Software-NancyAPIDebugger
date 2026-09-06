@@ -1,3 +1,5 @@
+use super::technology_evidence;
+use super::TechnologyEvidence;
 use super::javascript;
 use super::technology::CapturedTechnologyResource;
 use super::{
@@ -125,6 +127,7 @@ struct RawCategory {
 }
 
 struct Catalog {
+    bundled: bool,
     technologies: Vec<Technology>,
     lookup: HashMap<String, usize>,
     headers: HashMap<String, Vec<CompiledPattern>>,
@@ -216,6 +219,7 @@ struct HtmlSink(RefCell<HtmlState>);
 
 #[derive(Default)]
 struct AccumulatedDetection {
+    panel_evidence_urls: BTreeSet<String>,
     name: String,
     categories: BTreeSet<String>,
     version: Option<String>,
@@ -225,9 +229,11 @@ struct AccumulatedDetection {
     signal_scores: HashMap<String, u16>,
     evidence_urls: BTreeSet<String>,
     evidence: BTreeSet<String>,
+    observations: BTreeSet<TechnologyEvidence>,
 }
 
 struct MatchContext<'a> {
+    observation: TechnologyEvidence,
     key: &'a str,
     label: &'a str,
     url: &'a str,
@@ -644,11 +650,16 @@ fn compile_catalog(
     let mut technologies = Vec::with_capacity(raw.apps.len());
     let mut sources = Vec::with_capacity(raw.apps.len());
     for (name, fingerprint) in raw.apps {
-        let technology_categories = fingerprint
+        let panel_name = crate::product_catalog::panel_product_name(&name);
+        let mut technology_categories = fingerprint
             .cats
             .iter()
             .filter_map(|id| categories.get(id).cloned())
             .collect::<Vec<_>>();
+        if panel_name.is_some() {
+            technology_categories = vec!["Web servers".to_owned()];
+        }
+        let name = panel_name.unwrap_or(&name).to_owned();
         let implies = fingerprint
             .implies
             .iter()
@@ -671,6 +682,9 @@ fn compile_catalog(
                                 .and_then(|value| value.parse::<u16>().ok())
                                 .map(|value| value.clamp(1, 100))
                         });
+                        let target = crate::product_catalog::panel_product_name(&target)
+                            .unwrap_or(&target)
+                            .to_ascii_lowercase();
                         Some(Implication { target, confidence })
                     }
                 }
@@ -920,6 +934,7 @@ fn compile_catalog(
         ));
     }
     Ok(Catalog {
+        bundled: false,
         technologies,
         lookup,
         headers,
@@ -950,6 +965,38 @@ fn compile_batch(patterns: Vec<CompiledPattern>, bank: &mut MatcherBank) {
             compile_batch(right, bank);
         }
         Err(_) => bank.individual.extend(patterns),
+    }
+}
+
+pub(super) async fn detect_async(
+    endpoints: &mut Vec<EndpointScan>,
+    resources: &[CapturedTechnologyResource],
+    scripts: &[CapturedScriptResponse],
+    cancel: &CancellationToken,
+    progress: &Option<Sender<ExposureScanProgress>>,
+) -> Vec<String> {
+    if cancel.is_cancelled() {
+        return Vec::new();
+    }
+    let mut input = endpoints.clone();
+    let resources = resources.to_vec();
+    let scripts = scripts.to_vec();
+    let progress = progress.clone();
+    match crate::blocking::run(cancel, move |cancel| {
+        let warnings = detect(&mut input, &resources, &scripts, cancel, &progress);
+        if !cancel.is_cancelled() {
+            super::reconcile_web_server_products(&mut input, cancel);
+        }
+        (input, warnings)
+    })
+    .await
+    {
+        Ok((processed, warnings)) => {
+            *endpoints = processed;
+            warnings
+        }
+        Err(crate::blocking::Error::Cancelled) => Vec::new(),
+        Err(error) => vec![error.to_string()],
     }
 }
 
@@ -1012,12 +1059,14 @@ pub(super) fn detect(
                 .into_iter()
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect();
-                compile_catalog(raw, &categories)
+                let mut catalog = compile_catalog(raw, &categories)?;
+                catalog.bundled = true;
+                Ok(catalog)
             })
         };
         inlined_result
     } {
-        Ok(catalog) => catalogs.push(catalog),
+        Ok(catalog) => catalogs.insert(0, catalog),
         Err(error) => warnings.push(error.clone()),
     }
     let mut accumulated = endpoints
@@ -1025,10 +1074,18 @@ pub(super) fn detect(
         .map(|endpoint: &EndpointScan| {
             let mut detections = HashMap::<String, AccumulatedDetection>::new();
             for product in &endpoint.products {
-                let key = product.name.to_ascii_lowercase();
+                let name = crate::product_catalog::panel_product_name(&product.name)
+                    .unwrap_or(&product.name);
+                let key = name.to_ascii_lowercase();
                 let detection = detections.entry(key).or_default();
-                detection.name = product.name.clone();
-                detection.categories.insert(product.layer.to_string());
+                detection.name = name.to_owned();
+                detection.categories.insert(
+                    if crate::product_catalog::panel_product_name(name).is_some() {
+                        "Web servers".to_owned()
+                    } else {
+                        product.layer.to_string()
+                    },
+                );
                 detection.confidence_floor = detection.confidence_floor.max(product.confidence);
                 if product.version.is_some()
                     && (detection.version.is_none()
@@ -1060,6 +1117,7 @@ pub(super) fn detect(
                     };
                 }
                 detection.evidence.extend(product.evidence.iter().cloned());
+                detection.observations.extend(product.observations.iter().cloned());
             }
             detections
         })
@@ -1082,6 +1140,7 @@ pub(super) fn detect(
         .collect::<Vec<_>>();
     for (index, endpoint) in endpoints.iter().enumerate() {
         for response in &endpoint.http {
+            let evidence_origin = (&response.url, Some(std::net::SocketAddr::new(endpoint.ip, endpoint.port).to_string()), response.method.as_str(), response.status, response.body_truncated);
             if cancel.is_cancelled() {
                 break;
             }
@@ -1303,7 +1362,8 @@ inlined_result
                                                     key: &key,
                                                     label: &label,
                                                     url: &url,
-                                                },
+                                                    observation: pattern.observation(&label, &combined, false, &evidence_origin),
+},
                                             );
 
                                             let mut path = HashSet::new();
@@ -1496,7 +1556,8 @@ inlined_result
                                                     key: &key,
                                                     label: &label,
                                                     url: &url,
-                                                },
+                                                    observation: pattern.observation(&label, "[cookie value withheld]", false, &evidence_origin),
+},
                                             );
 
                                             let mut path = HashSet::new();
@@ -1548,7 +1609,8 @@ inlined_result
                                 key: &key,
                                 label: "external script content",
                                 url: &url,
-                            },);
+                                observation: pattern.observation("external script content", &text, true, &evidence_origin),
+},);
 
                                                 let mut path = HashSet::new();
                                                 inlined_self.add_recursive(
@@ -1835,7 +1897,8 @@ inlined_result
                                                     key: &key,
                                                     label: "script URL",
                                                     url: &url,
-                                                },
+                                                    observation: pattern.observation("script URL", &url, false, &evidence_origin),
+},
                                             );
 
                                             let mut path = HashSet::new();
@@ -2122,7 +2185,8 @@ inlined_result
                                             key: &html_key,
                                             label: "HTML signature",
                                             url: &url,
-                                        },
+                                            observation: pattern.observation("HTML signature", &text, true, &evidence_origin),
+},
                                     );
 
                                     let mut path = HashSet::new();
@@ -2550,7 +2614,8 @@ inlined_result
                                                     key: &key,
                                                     label: &label,
                                                     url: &url,
-                                                },
+                                                    observation: pattern.observation(&label, &content, false, &evidence_origin),
+},
                                             );
 
                                             let mut path = HashSet::new();
@@ -2650,7 +2715,8 @@ inlined_result
                                                     key: &key,
                                                     label: "script URL",
                                                     url: &source,
-                                                },
+                                                    observation: pattern.observation("script URL", &source, false, &evidence_origin),
+},
                                             );
 
                                             let mut path = HashSet::new();
@@ -2947,7 +3013,8 @@ inlined_result
                                                     key: &key,
                                                     label: "inline script content",
                                                     url: &url,
-                                                },
+                                                    observation: pattern.observation("inline script content", &script, true, &evidence_origin),
+},
                                             );
 
                                             let mut path = HashSet::new();
@@ -3262,6 +3329,7 @@ inlined_result
     }
     if !cancel.is_cancelled() {
         for resource in resources {
+            let evidence_origin = (&resource.url, Some(std::net::SocketAddr::new(resource.ip, resource.port).to_string()), resource.method.as_str(), resource.status, resource.truncated);
             if cancel.is_cancelled() {
                 break;
             }
@@ -3479,7 +3547,8 @@ inlined_result
                                 key: &key,
                                 label: &label,
                                 url: &url,
-                            },);
+                                observation: pattern.observation(&label, &combined, false, &evidence_origin),
+},);
 
                                                 let mut path = HashSet::new();
                                                 inlined_self.add_recursive(
@@ -3654,7 +3723,8 @@ inlined_result
                                 key: &key,
                                 label: &label,
                                 url: &url,
-                            },);
+                                observation: pattern.observation(&label, "[cookie value withheld]", false, &evidence_origin),
+},);
 
                                                 let mut path = HashSet::new();
                                                 inlined_self.add_recursive(
@@ -3706,7 +3776,8 @@ inlined_result
                                 key: &key,
                                 label: "external script content",
                                 url: &url,
-                            },);
+                                observation: pattern.observation("external script content", &text, true, &evidence_origin),
+},);
 
                                                     let mut path = HashSet::new();
                                                     inlined_self.add_recursive(
@@ -3981,7 +4052,8 @@ inlined_result
                             key: &key,
                             label: "script URL",
                             url: &url,
-                        },);
+                            observation: pattern.observation("script URL", &url, false, &evidence_origin),
+},);
 
                                                 let mut path = HashSet::new();
                                                 inlined_self.add_recursive(
@@ -4248,7 +4320,8 @@ inlined_result
                     key: &html_key,
                     label: "HTML signature",
                     url: &url,
-                },);
+                    observation: pattern.observation("HTML signature", &text, true, &evidence_origin),
+},);
 
                                         let mut path = HashSet::new();
                                         inlined_self.add_recursive(
@@ -4660,7 +4733,8 @@ inlined_result
                                 key: &key,
                                 label: &label,
                                 url: &url,
-                            },);
+                                observation: pattern.observation(&label, &content, false, &evidence_origin),
+},);
 
                                                 let mut path = HashSet::new();
                                                 inlined_self.add_recursive(
@@ -4743,7 +4817,8 @@ inlined_result
                             key: &key,
                             label: "script URL",
                             url: &source,
-                        },);
+                            observation: pattern.observation("script URL", &source, false, &evidence_origin),
+},);
 
                                                 let mut path = HashSet::new();
                                                 inlined_self.add_recursive(
@@ -5014,7 +5089,8 @@ inlined_result
                             key: &key,
                             label: "inline script content",
                             url: &url,
-                        },);
+                            observation: pattern.observation("inline script content", &script, true, &evidence_origin),
+},);
 
                                                 let mut path = HashSet::new();
                                                 inlined_self.add_recursive(
@@ -5323,6 +5399,7 @@ inlined_result
                     break 'scripts;
                 }
                 if let Some(target) = accumulated.get_mut(endpoint_index) {
+                    let evidence_origin = (&script.response.url, endpoints.get(endpoint_index).map(|endpoint| std::net::SocketAddr::new(endpoint.ip, endpoint.port).to_string()), script.response.method.as_str(), script.response.status, script.response.body_truncated);
                     for (catalog, state) in catalogs.iter().zip(&mut match_states) {
                         ({
                             let (inlined_self, detections, source_url, response, state): (
@@ -5577,7 +5654,8 @@ inlined_result
                                 key: &key,
                                 label: &label,
                                 url: &url,
-                            },);
+                                observation: pattern.observation(&label, &combined, false, &evidence_origin),
+},);
 
                                                         let mut path = HashSet::new();
                                                         inlined_self.add_recursive(
@@ -5758,7 +5836,8 @@ inlined_result
                                 key: &key,
                                 label: &label,
                                 url: &url,
-                            },);
+                                observation: pattern.observation(&label, "[cookie value withheld]", false, &evidence_origin),
+},);
 
                                                         let mut path = HashSet::new();
                                                         inlined_self.add_recursive(
@@ -5810,7 +5889,8 @@ inlined_result
                                 key: &key,
                                 label: "external script content",
                                 url: &url,
-                            },);
+                                observation: pattern.observation("external script content", &text, true, &evidence_origin),
+},);
 
                                                             let mut path = HashSet::new();
                                                             inlined_self.add_recursive(
@@ -6052,7 +6132,8 @@ inlined_result
                             key: &key,
                             label: "script URL",
                             url: &url,
-                        },);
+                            observation: pattern.observation("script URL", &url, false, &evidence_origin),
+},);
 
                                                         let mut path = HashSet::new();
                                                         inlined_self.add_recursive(
@@ -6318,7 +6399,8 @@ inlined_result
                     key: &html_key,
                     label: "HTML signature",
                     url: &url,
-                },);
+                    observation: pattern.observation("HTML signature", &text, true, &evidence_origin),
+},);
 
                                                     let mut path = HashSet::new();
                                                     inlined_self.add_recursive(
@@ -6730,7 +6812,8 @@ inlined_result
                                 key: &key,
                                 label: &label,
                                 url: &url,
-                            },);
+                                observation: pattern.observation(&label, &content, false, &evidence_origin),
+},);
 
                                                         let mut path = HashSet::new();
                                                         inlined_self.add_recursive(
@@ -6811,7 +6894,8 @@ inlined_result
                             key: &key,
                             label: "script URL",
                             url: &source,
-                        },);
+                            observation: pattern.observation("script URL", &source, false, &evidence_origin),
+},);
 
                                                         let mut path = HashSet::new();
                                                         inlined_self.add_recursive(
@@ -7079,7 +7163,8 @@ inlined_result
                             key: &key,
                             label: "inline script content",
                             url: &url,
-                        },);
+                            observation: pattern.observation("inline script content", &script, true, &evidence_origin),
+},);
 
                                                         let mut path = HashSet::new();
                                                         inlined_self.add_recursive(
@@ -7347,7 +7432,8 @@ inlined_result
                             key: &key,
                             label: "script URL",
                             url: &source,
-                        },);
+                            observation: pattern.observation("script URL", &source, false, &evidence_origin),
+},);
 
                                                 let mut path = HashSet::new();
                                                 inlined_self.add_recursive(
@@ -7670,6 +7756,7 @@ inlined_result
                         confidence,
                         evidence_urls: detection.evidence_urls.into_iter().collect(),
                         evidence: detection.evidence.into_iter().collect(),
+                        observations: detection.observations.into_iter().collect(),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -7718,8 +7805,13 @@ inlined_result
                             detection.name.as_str()
                         };
                         if let Some(existing) = products.iter_mut().find(|product| {
-                            product.layer == layer && product.name.eq_ignore_ascii_case(name)
+                            (product.layer == layer
+                                || crate::product_catalog::panel_product_name(name).is_some())
+                                && crate::product_catalog::canonical_product_name(&product.name)
+                                    .eq_ignore_ascii_case(name)
                         }) {
+                            existing.name = name.to_owned();
+                            existing.layer = layer;
                             let previous_confidence = existing.confidence;
                             if detection.version.is_some()
                                 && (existing.version.is_none()
@@ -7729,10 +7821,14 @@ inlined_result
                             }
                             existing.confidence = existing.confidence.max(detection.confidence);
                             existing.evidence.extend(evidence);
+                            existing.observations.extend(detection.observations.iter().cloned());
+                            existing.observations.sort();
+                            existing.observations.dedup();
                             existing.evidence.sort();
                             existing.evidence.dedup();
                         } else {
                             products.push(ProductDetection {
+                                observations: detection.observations.clone(),
                                 name: name.to_owned(),
                                 layer,
                                 version: detection.version.clone(),
@@ -7808,11 +7904,25 @@ impl Catalog {
         }
         let technology = &self.technologies[technology_index];
         let identity = technology.name.to_ascii_lowercase();
+        let panel = crate::product_catalog::panel_product_name(&technology.name).is_some();
+        if panel
+            && (implied_by.is_some()
+                || (!self.bundled
+                    && !detections.get(&identity).is_some_and(|detection| {
+                        detection.panel_evidence_urls.contains(&context.observation.source_url)
+                    })))
+        {
+            path.remove(&technology_index);
+            return;
+        }
         let key = implied_by.map_or_else(
             || context.key.to_owned(),
             |parent| format!("{}:implied:{parent}>{identity}", context.key),
         );
         let detection = detections.entry(identity.clone()).or_default();
+        if panel && self.bundled {
+            detection.panel_evidence_urls.insert(context.observation.source_url.clone());
+        }
         detection.name = technology.name.clone();
         detection
             .categories
@@ -7825,6 +7935,10 @@ impl Catalog {
                 .min(100);
             *signal_score = confidence;
         }
+        let mut observation = context.observation.clone();
+        observation.extracted_version = version.as_deref().map(technology_evidence::safe_value).or_else(|| context.observation.extracted_version.clone());
+        observation.supporting_detection = implied_by.map(str::to_owned);
+        detection.observations.insert(observation.clone());
         if let Some(version) = version.filter(|value| !value.is_empty())
             && (detection.version.is_none()
                 || confidence > detection.version_confidence
@@ -7842,6 +7956,7 @@ impl Catalog {
             ),
             None => format!("{} at {}", context.label, context.url),
         });
+        let context = MatchContext { observation, key: context.key, label: context.label, url: context.url };
         for implication in &technology.implies {
             if let Some(target) = self.lookup.get(&implication.target).copied() {
                 let implied_confidence =
@@ -7851,12 +7966,46 @@ impl Catalog {
                     target,
                     implied_confidence,
                     None,
-                    context,
+                    &context,
                     path,
                     Some(&technology.name),
                 );
             }
         }
         path.remove(&technology_index);
+    }
+}
+
+impl CompiledPattern {
+    fn observation(
+        &self,
+        source: &str,
+        value: &str,
+        body: bool,
+        origin: &(&String, Option<String>, &str, u16, bool),
+    ) -> TechnologyEvidence {
+        let mut record = technology_evidence::observation(source, value);
+        if body || value.len() > 512 {
+            let matched = match &self.matcher {
+                PatternMatcher::Presence => Some(0..0),
+                PatternMatcher::Standard(regex) => regex.find(value).map(|found| found.range()),
+                PatternMatcher::Compatibility(regex) => regex.find(value).ok().flatten().map(|found| found.start()..found.end()),
+            };
+            if let Some(matched) = matched {
+                let (value, shortened) = technology_evidence::excerpt(value, matched);
+                record.observed_value = Some(value);
+                record.excerpt_shortened = shortened;
+            } else {
+                record.observed_value = None;
+            }
+        }
+        if source.starts_with("header ") {
+            let header = source.trim_start_matches("header ");
+            if matches!(header, "set-cookie" | "cookie" | "authorization" | "proxy-authorization") {
+                record.observed_value = Some("[value withheld]".to_owned());
+            }
+        }
+        technology_evidence::locate(&mut record, origin.0, origin.1.clone(), Some(origin.2), Some(origin.3), origin.4);
+        record
     }
 }

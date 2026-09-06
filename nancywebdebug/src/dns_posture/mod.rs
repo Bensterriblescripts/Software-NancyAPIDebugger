@@ -1,11 +1,10 @@
 use super::*;
-use hickory_resolver::config::ProtocolConfig;
-use hickory_resolver::proto::op::{Message, MessageType, Query, ResponseCode};
+use crate::diagnostics::DnsLookupStatus;
+use crate::dns_lookup::{self, AliasPath, owned_records};
+use hickory_resolver::proto::op::Message;
 use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
 use hickory_resolver::proto::serialize::binary::BinEncodable;
-use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::net::UdpSocket;
 
 mod infrastructure;
 mod mail;
@@ -25,6 +24,7 @@ struct Collector<'a> {
     timeout: Duration,
     concurrency: usize,
     servers: Vec<(SocketAddr, bool)>,
+    attempts: Mutex<HashMap<QueryKey, Vec<crate::diagnostics::DnsAttempt>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -32,12 +32,21 @@ struct Rrset {
     owner: String,
     kind: RecordType,
     records: Vec<Record>,
-    aliases: Vec<String>,
+    aliases: Vec<(String, String)>,
     nxdomain: bool,
+    status: DnsLookupStatus,
+    attempts: Vec<crate::diagnostics::DnsAttempt>,
     error: Option<String>,
 }
 
 impl Rrset {
+    fn absent(&self) -> bool {
+        matches!(
+            self.status,
+            DnsLookupStatus::NoData | DnsLookupStatus::NxDomain
+        )
+    }
+
     fn texts(&self) -> Vec<String> {
         self.records
             .iter()
@@ -69,234 +78,81 @@ impl Rrset {
 }
 
 impl<'a> Collector<'a> {
+    fn new(
+        request: &ExposureScanRequest,
+        cancel: &'a CancellationToken,
+        limiter: &'a ConnectionRateLimiter,
+    ) -> Self {
+        let servers = hickory_resolver::system_conf::read_system_conf()
+            .map(|(config, _)| dns_lookup::transports(config.name_servers()))
+            .unwrap_or_default();
+        Self {
+            cache: Mutex::new(HashMap::new()),
+            attempts: Mutex::new(HashMap::new()),
+            used: AtomicUsize::new(0),
+            limited: AtomicUsize::new(0),
+            cancel,
+            limiter,
+            timeout: request.probe_timeout.min(Duration::from_secs(5)),
+            concurrency: request.concurrency.max(1),
+            servers,
+        }
+    }
+
     async fn rrset(&self, name: &str, kind: RecordType) -> Rrset {
+        let mut path = AliasPath::new(name);
         let mut result = Rrset {
-            owner: (name).trim_end_matches('.').to_ascii_lowercase(),
+            owner: path.owner.clone(),
             kind,
             records: Vec::new(),
             aliases: Vec::new(),
             nxdomain: false,
+            status: DnsLookupStatus::Pending,
             error: None,
+            attempts: Vec::new(),
         };
-        let mut seen = HashSet::new();
-        seen.insert(result.owner.clone());
-        loop {
-            let message = match ({
-let (inlined_self, owner, kind, direct,): (& Collector < '_ >, & str, RecordType, Option < (SocketAddr , bool) >,) = (&*self, &result.owner, kind, None,);
-async move {
-let inlined_result: QueryResult = {
-
-        if inlined_self.cancel.is_cancelled() {
-            return Err("Assessment cancelled".to_owned());
-        }
-        let key = ((owner).trim_end_matches('.').to_ascii_lowercase(), kind, direct);
-        if let Some(result) = inlined_self.cache.lock().unwrap().get(&key).cloned() {
-            return result;
-        }
-        if inlined_self.limited.load(Ordering::Relaxed) != 0 {
-            return Err("128-query assessment budget exhausted".to_owned());
-        }
-        let lookup = async {
-            let servers = direct
-                .map(|server| vec![server])
-                .unwrap_or_else(|| inlined_self.servers.clone());
-            let mut failure = "No supported system DNS resolver is configured".to_owned();
-            for (remote, tcp) in servers {
-                inlined_self.limiter
-                    .wait(inlined_self.cancel)
-                    .await
-                    .map_err(|_| "Assessment cancelled".to_owned())?;
-                if inlined_self
-                    .used
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                        (used < QUERY_LIMIT).then_some(used + 1)
-                    })
-                    .is_err()
-                {
-                    inlined_self.limited.store(1, Ordering::Relaxed);
-                    return Err("128-query assessment budget exhausted".to_owned());
-                }
-                match tokio::time::timeout(Duration::from_secs(2), {
-                    let (remote, owner, kind, tcp, recursive): (
-                        SocketAddr,
-                        &str,
-                        RecordType,
-                        bool,
-                        bool,
-                    ) = (remote, &key.0, kind, tcp, direct.is_none());
-                    async move {
-                        let mut query = Message::query();
-                        query.metadata.recursion_desired = recursive;
-                        let mut edns = hickory_resolver::proto::op::Edns::new();
-                        edns.set_max_payload(1232);
-                        edns.set_dnssec_ok(true);
-                        query.set_edns(edns);
-                        query.add_query(Query::query(
-                            Name::from_ascii(if owner.is_empty() { "." } else { owner })
-                                .map_err(|_| "Invalid DNS name".to_owned())?,
-                            kind,
-                        ));
-                        let request = query
-                            .to_vec()
-                            .map_err(|_| "Unable to encode DNS query".to_owned())?;
-                        let response = if tcp {
-                            let mut stream = TcpStream::connect(remote)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            stream
-                                .write_u16(request.len() as u16)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            stream
-                                .write_all(&request)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            let length =
-                                stream.read_u16().await.map_err(|error| error.to_string())?
-                                    as usize;
-                            let mut response = vec![0; length];
-                            stream
-                                .read_exact(&mut response)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            response
-                        } else {
-                            let bind = if remote.is_ipv4() {
-                                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-                            } else {
-                                SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-                            };
-                            let socket = UdpSocket::bind(bind)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            socket
-                                .connect(remote)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            socket
-                                .send(&request)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            let mut response = vec![0; 65535];
-                            let length = socket
-                                .recv(&mut response)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            response.truncate(length);
-                            response
-                        };
-                        let response = Message::from_vec(&response)
-                            .map_err(|_| "Malformed DNS response".to_owned())?;
-                        if response.metadata.id != query.metadata.id
-                            || response.metadata.message_type != MessageType::Response
-                            || response.queries != query.queries
-                        {
-                            return Err("DNS response does not match the question".to_owned());
-                        }
-                        Ok(response)
-                    }
-                })
-                .await
-                {
-                    Ok(Ok(message))
-                        if matches!(
-                            message.metadata.response_code,
-                            ResponseCode::NoError | ResponseCode::NXDomain
-                        ) && !message.metadata.truncation =>
-                    {
-                        return Ok(message);
-                    }
-                    Ok(Ok(message)) => {
-                        failure = format!(
-                            "{} via {} {}{}",
-                            message.metadata.response_code,
-                            remote,
-                            if tcp { "TCP" } else { "UDP" },
-                            if message.metadata.truncation {
-                                " (truncated)"
-                            } else {
-                                ""
-                            }
-                        )
-                    }
-                    Ok(Err(error)) => {
-                        failure = format!("{remote} {}: {error}", if tcp { "TCP" } else { "UDP" })
-                    }
-                    Err(_) => {
-                        failure = format!("{remote} {} timed out", if tcp { "TCP" } else { "UDP" })
-                    }
-                }
+        let outcome = loop {
+            let reply = self.query(&path.owner, kind, None).await;
+            if let Some(attempts) =
+                self.attempts
+                    .lock()
+                    .unwrap()
+                    .get(&(path.owner.clone(), kind, None))
+            {
+                result.attempts.extend(attempts.iter().cloned());
             }
-            Err(failure)
-        };
-        let result = tokio::select! {
-            _ = inlined_self.cancel.cancelled() => Err("Assessment cancelled".to_owned()),
-            result = tokio::time::timeout(inlined_self.timeout, lookup) => result.unwrap_or_else(|_| Err("Whole DNS query timed out".to_owned())),
-        };
-        inlined_self.cache.lock().unwrap().insert(key, result.clone());
-        result
-
-};
-inlined_result
-}
-}).await {
+            let message = match reply {
                 Ok(message) => message,
-                Err(error) => {
-                    result.error = Some(error);
-                    return result;
-                }
+                Err(error) => break Err(error),
             };
-            loop {
-                result.records = owned_records(&message.answers, &result.owner, kind);
-                if !result.records.is_empty() {
-                    return result;
+            match path.consume(&message, kind) {
+                Ok(Some((status, records))) => {
+                    result.records = records;
+                    break Ok(status);
                 }
-                let aliases = owned_records(&message.answers, &result.owner, RecordType::CNAME);
-                if aliases.len() > 1 {
-                    result.error = Some("Multiple CNAME destinations at one owner".to_owned());
-                    return result;
-                }
-                let Some(alias) = aliases.first() else {
-                    if message.answers.is_empty()
-                        && message
-                            .authorities
-                            .iter()
-                            .any(|record| record.record_type() == RecordType::NS)
-                    {
-                        result.error = Some("Resolver returned an unresolved referral".to_owned());
-                        return result;
-                    }
-                    result.nxdomain = message.metadata.response_code == ResponseCode::NXDomain;
-                    return result;
+                Ok(None) => {}
+                Err(error) => break Err(error),
+            }
+        };
+        result.owner = path.owner;
+        result.aliases = path.aliases;
+        match outcome {
+            Ok(status) => {
+                result.status = status;
+                result.nxdomain = status == DnsLookupStatus::NxDomain;
+            }
+            Err(error) => {
+                result.status = if self.cancel.is_cancelled() {
+                    DnsLookupStatus::Cancelled
+                } else if error.contains("limit") || error.contains("budget") {
+                    DnsLookupStatus::LimitReached
+                } else {
+                    DnsLookupStatus::Failed
                 };
-                let target = (&alias.data.to_string())
-                    .trim_end_matches('.')
-                    .to_ascii_lowercase();
-                if !seen.insert(target.clone()) {
-                    result.error = Some("Confirmed CNAME cycle".to_owned());
-                    result.aliases.push(target);
-                    return result;
-                }
-                if result.aliases.len() >= DEPTH_LIMIT {
-                    result.error = Some("CNAME depth limit (10) reached".to_owned());
-                    return result;
-                }
-                result.aliases.push(format!("{} → {target}", result.owner));
-                result.owner = target;
-                if !message.answers.iter().any(|record| {
-                    (&record.name.to_string())
-                        .trim_end_matches('.')
-                        .to_ascii_lowercase()
-                        == result.owner
-                }) {
-                    if message.metadata.response_code == ResponseCode::NXDomain {
-                        result.nxdomain = true;
-                        return result;
-                    }
-                    break;
-                }
+                result.error = Some(error);
             }
         }
+        result
     }
 
     async fn address_sets(&self, name: &str) -> (Rrset, Rrset) {
@@ -323,52 +179,104 @@ fn wire(value: &impl BinEncodable) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn owned_records(records: &[Record], owner: &str, kind: RecordType) -> Vec<Record> {
-    let mut seen = HashSet::new();
-    records
-        .iter()
-        .filter(|record| {
-            record.record_type() == kind
-                && (&record.name.to_string())
-                    .trim_end_matches('.')
-                    .to_ascii_lowercase()
-                    == (owner).trim_end_matches('.').to_ascii_lowercase()
-        })
-        .filter(|record| seen.insert(record.data.clone()))
-        .cloned()
-        .collect()
-}
-
 fn unavailable(subject: &str, check: &str, set: &Rrset) -> Option<DnsObservation> {
     set.error.as_ref().map(|error| {
-        let invalid_alias = matches!(error.as_str(), "Confirmed CNAME cycle" | "Multiple CNAME destinations at one owner");
-        {
-let (subject, check, status, summary, impact, remediation, evidence,): (& str, & str, DnsObservationStatus, & str, & str, & str, Vec < String >,) = (subject, check, if invalid_alias { DnsObservationStatus::Error } else { DnsObservationStatus::Inconclusive }, error, if invalid_alias { "The published alias configuration cannot produce a unique terminal answer." } else { "This check could not establish the DNS configuration." }, if invalid_alias { "Publish a single acyclic CNAME path to the intended destination." } else { "Retry after checking DNS reachability; increase coverage if a limit was reached." }, ({
-let (inlined_self,): (& Rrset,) = (&(set),);
-let inlined_result: Vec < String > = {
-
-        let mut evidence = vec![format!(
-            "Record owner: {}; type: {}; outcome: {}; {} matching record(s)",
-            inlined_self.owner,
-            inlined_self.kind,
-            inlined_self.error
-                .as_deref()
-                .unwrap_or(if inlined_self.nxdomain { "NXDOMAIN" } else { "NOERROR" }),
-            inlined_self.records.len()
-        )];
-        if !inlined_self.aliases.is_empty() {
-            evidence.push(format!("Alias path: {}", inlined_self.aliases.join(" → ")));
-        }
-        evidence
-
-};
-inlined_result
-}),);
-
-    DnsObservation { subject: subject.to_owned(), check: check.to_owned(), status, summary: summary.to_owned(), impact: impact.to_owned(), remediation: remediation.to_owned(), evidence }
-
-}
+        let invalid_alias = matches!(
+            error.as_str(),
+            "Confirmed CNAME cycle" | "Multiple CNAME destinations at one owner"
+        );
+        finding(
+            subject,
+            check,
+            if invalid_alias {
+                DnsObservationStatus::Error
+            } else {
+                DnsObservationStatus::Inconclusive
+            },
+            error,
+            if invalid_alias {
+                "The published alias configuration cannot produce a unique terminal answer."
+            } else {
+                "This check could not establish the DNS configuration."
+            },
+            if invalid_alias {
+                "Publish a single acyclic CNAME path to the intended destination."
+            } else {
+                "Retry after checking DNS reachability; increase coverage if a limit was reached."
+            },
+            set.evidence(),
+        )
     })
+}
+
+pub(super) async fn resolve_asset(
+    hostname: String,
+    request: &ExposureScanRequest,
+    cancel: &CancellationToken,
+    limiter: &ConnectionRateLimiter,
+) -> (DiscoveredAsset, bool) {
+    let collector = Collector::new(request, cancel, limiter);
+    let (a, aaaa) = collector.address_sets(&hostname).await;
+    let complete = [&a, &aaaa].iter().all(|set| {
+        !matches!(
+            set.status,
+            DnsLookupStatus::Pending | DnsLookupStatus::Cancelled
+        )
+    });
+    (asset_from_sets(hostname, &a, &aaaa), complete)
+}
+
+fn asset_from_sets(hostname: String, a: &Rrset, aaaa: &Rrset) -> DiscoveredAsset {
+    let mut addresses = a
+        .addresses()
+        .into_iter()
+        .chain(aaaa.addresses())
+        .collect::<Vec<_>>();
+    addresses.sort();
+    addresses.dedup();
+    let mut seen = HashSet::new();
+    let cname_chain = a
+        .aliases
+        .iter()
+        .chain(&aaaa.aliases)
+        .map(|(_, target)| target.clone())
+        .filter(|target| seen.insert(target.clone()))
+        .collect::<Vec<_>>();
+    let state = if addresses
+        .iter()
+        .any(|address| non_public_reason(*address).is_none())
+    {
+        DiscoveredAssetState::Public
+    } else if !addresses.is_empty() {
+        DiscoveredAssetState::NonPublic
+    } else if !cname_chain.is_empty() && a.absent() && aaaa.absent() {
+        DiscoveredAssetState::DanglingCname
+    } else {
+        DiscoveredAssetState::Unresolved
+    };
+    let summary = match state {
+        DiscoveredAssetState::Public => "One or more public DNS destinations resolved",
+        DiscoveredAssetState::NonPublic => "DNS resolved only non-public destinations",
+        DiscoveredAssetState::DanglingCname => {
+            "CNAME chain has no A or AAAA destination; exploitability was not tested"
+        }
+        DiscoveredAssetState::Unresolved => "No usable A or AAAA result was obtained",
+    };
+    DiscoveredAsset {
+        hostname,
+        source: "crt.sh certificate transparency".to_owned(),
+        addresses,
+        cname_chain,
+        state,
+        detail: format!(
+            "{summary}; {}",
+            a.evidence()
+                .into_iter()
+                .chain(aaaa.evidence())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    }
 }
 
 pub(crate) async fn assess_dns(
@@ -427,46 +335,7 @@ pub(crate) async fn assess_dns(
             Vec::new(),
         );
     };
-    let collector = {
-        let (request, cancel, limiter): (
-            &ExposureScanRequest,
-            &'_ CancellationToken,
-            &'_ ConnectionRateLimiter,
-        ) = (request, cancel, limiter);
-        {
-            let servers = hickory_resolver::system_conf::read_system_conf()
-                .map(|(config, _)| {
-                    config
-                        .name_servers()
-                        .iter()
-                        .flat_map(|server| {
-                            server
-                                .connections
-                                .iter()
-                                .map(|connection| match connection.protocol {
-                                    ProtocolConfig::Udp => {
-                                        (SocketAddr::new(server.ip, connection.port), false)
-                                    }
-                                    ProtocolConfig::Tcp => {
-                                        (SocketAddr::new(server.ip, connection.port), true)
-                                    }
-                                })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            Collector {
-                cache: Mutex::new(HashMap::new()),
-                used: AtomicUsize::new(0),
-                limited: AtomicUsize::new(0),
-                cancel,
-                limiter,
-                timeout: request.probe_timeout.min(Duration::from_secs(5)),
-                concurrency: request.concurrency.max(1),
-                servers,
-            }
-        }
-    };
+    let collector = Collector::new(request, cancel, limiter);
     let mut observations = infrastructure::resolution(hostname, &collector).await;
     observations.extend(policies::caa(hostname, &collector).await);
     send_phase_progress(
@@ -651,12 +520,33 @@ impl Rrset {
             self.owner,
             self.kind,
             self.error
-                .as_deref()
-                .unwrap_or(if self.nxdomain { "NXDOMAIN" } else { "NOERROR" }),
+                .clone()
+                .unwrap_or_else(|| self.status.to_string()),
             self.records.len()
         )];
+        for attempt in &self.attempts {
+            evidence.push(format!(
+                "{} {}: {}{} ({:.2} ms network time)",
+                attempt.configured_resolver,
+                attempt.transport,
+                attempt.response_code.as_deref().unwrap_or("No response"),
+                attempt
+                    .error
+                    .as_ref()
+                    .map(|error| format!("; {error}"))
+                    .unwrap_or_default(),
+                attempt.duration_ms
+            ));
+        }
         if !self.aliases.is_empty() {
-            evidence.push(format!("Alias path: {}", self.aliases.join(" → ")));
+            evidence.push(format!(
+                "Alias path: {}",
+                self.aliases
+                    .iter()
+                    .map(|(owner, target)| format!("{owner} → {target}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
         }
         evidence
     }
@@ -683,12 +573,17 @@ impl<'a> Collector<'a> {
         if self.limited.load(Ordering::Relaxed) != 0 {
             return Err("128-query assessment budget exhausted".to_owned());
         }
-        let lookup = async {
-            let servers = direct
-                .map(|server| vec![server])
-                .unwrap_or_else(|| self.servers.clone());
-            let mut failure = "No supported system DNS resolver is configured".to_owned();
-            for (remote, tcp) in servers {
+        let servers = direct
+            .map(|server| vec![server])
+            .unwrap_or_else(|| self.servers.clone());
+        let lookup = dns_lookup::query(
+            &key.0,
+            kind,
+            &servers,
+            direct.is_none(),
+            Duration::from_secs(2),
+            self.timeout,
+            || async {
                 self.limiter
                     .wait(self.cancel)
                     .await
@@ -703,122 +598,21 @@ impl<'a> Collector<'a> {
                     self.limited.store(1, Ordering::Relaxed);
                     return Err("128-query assessment budget exhausted".to_owned());
                 }
-                match tokio::time::timeout(Duration::from_secs(2), {
-                    let (remote, owner, kind, tcp, recursive): (
-                        SocketAddr,
-                        &str,
-                        RecordType,
-                        bool,
-                        bool,
-                    ) = (remote, &key.0, kind, tcp, direct.is_none());
-                    async move {
-                        let mut query = Message::query();
-                        query.metadata.recursion_desired = recursive;
-                        let mut edns = hickory_resolver::proto::op::Edns::new();
-                        edns.set_max_payload(1232);
-                        edns.set_dnssec_ok(true);
-                        query.set_edns(edns);
-                        query.add_query(Query::query(
-                            Name::from_ascii(if owner.is_empty() { "." } else { owner })
-                                .map_err(|_| "Invalid DNS name".to_owned())?,
-                            kind,
-                        ));
-                        let request = query
-                            .to_vec()
-                            .map_err(|_| "Unable to encode DNS query".to_owned())?;
-                        let response = if tcp {
-                            let mut stream = TcpStream::connect(remote)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            stream
-                                .write_u16(request.len() as u16)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            stream
-                                .write_all(&request)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            let length =
-                                stream.read_u16().await.map_err(|error| error.to_string())?
-                                    as usize;
-                            let mut response = vec![0; length];
-                            stream
-                                .read_exact(&mut response)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            response
-                        } else {
-                            let bind = if remote.is_ipv4() {
-                                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-                            } else {
-                                SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-                            };
-                            let socket = UdpSocket::bind(bind)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            socket
-                                .connect(remote)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            socket
-                                .send(&request)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            let mut response = vec![0; 65535];
-                            let length = socket
-                                .recv(&mut response)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            response.truncate(length);
-                            response
-                        };
-                        let response = Message::from_vec(&response)
-                            .map_err(|_| "Malformed DNS response".to_owned())?;
-                        if response.metadata.id != query.metadata.id
-                            || response.metadata.message_type != MessageType::Response
-                            || response.queries != query.queries
-                        {
-                            return Err("DNS response does not match the question".to_owned());
-                        }
-                        Ok(response)
-                    }
-                })
-                .await
-                {
-                    Ok(Ok(message))
-                        if matches!(
-                            message.metadata.response_code,
-                            ResponseCode::NoError | ResponseCode::NXDomain
-                        ) && !message.metadata.truncation =>
-                    {
-                        return Ok(message);
-                    }
-                    Ok(Ok(message)) => {
-                        failure = format!(
-                            "{} via {} {}{}",
-                            message.metadata.response_code,
-                            remote,
-                            if tcp { "TCP" } else { "UDP" },
-                            if message.metadata.truncation {
-                                " (truncated)"
-                            } else {
-                                ""
-                            }
-                        )
-                    }
-                    Ok(Err(error)) => {
-                        failure = format!("{remote} {}: {error}", if tcp { "TCP" } else { "UDP" })
-                    }
-                    Err(_) => {
-                        failure = format!("{remote} {} timed out", if tcp { "TCP" } else { "UDP" })
-                    }
-                }
-            }
-            Err(failure)
-        };
+                Ok(())
+            },
+            |attempt| {
+                self.attempts
+                    .lock()
+                    .unwrap()
+                    .entry(key.clone())
+                    .or_default()
+                    .push(attempt)
+            },
+        );
         let result = tokio::select! {
+            biased;
             _ = self.cancel.cancelled() => Err("Assessment cancelled".to_owned()),
-            result = tokio::time::timeout(self.timeout, lookup) => result.unwrap_or_else(|_| Err("Whole DNS query timed out".to_owned())),
+            result = lookup => result,
         };
         self.cache.lock().unwrap().insert(key, result.clone());
         result

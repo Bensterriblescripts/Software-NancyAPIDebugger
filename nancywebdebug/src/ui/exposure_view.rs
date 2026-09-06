@@ -313,7 +313,6 @@ pub(super) struct DiagnosticViewState {
     pub(super) endpoint_index: Option<usize>,
     pub(super) hop_index: usize,
     pub(super) tab: DetailTab,
-    pub(super) body_view: BodyView,
 }
 
 impl Default for DiagnosticViewState {
@@ -322,7 +321,6 @@ impl Default for DiagnosticViewState {
             endpoint_index: None,
             hop_index: 0,
             tab: DetailTab::Summary,
-            body_view: BodyView::Decoded,
         }
     }
 }
@@ -804,6 +802,9 @@ pub(super) fn show_live(ui: &mut egui::Ui, live: &ExposureLiveState) {
         }
         ui.label(&live.message);
     });
+    if live.discovery_coverage.status != crate::DiscoveryCoverageStatus::Pending {
+        ui.label(live.discovery_coverage.summary());
+    }
     let complete = live
         .phases
         .iter()
@@ -837,9 +838,9 @@ pub(super) fn show_live(ui: &mut egui::Ui, live: &ExposureLiveState) {
                 "Pending".to_owned(),
             ),
             ExposureScanPhaseState::Running => (phase.fraction, true, None, phase.text.clone()),
-            ExposureScanPhaseState::Complete => (1.0, false, None, "Complete".to_owned()),
+            ExposureScanPhaseState::Complete => (1.0, false, None, phase.text.clone()),
             ExposureScanPhaseState::Skipped => {
-                (1.0, false, Some(egui::Color32::GRAY), "Skipped".to_owned())
+                (1.0, false, Some(egui::Color32::GRAY), format!("Skipped: {}", phase.text))
             }
         };
         let mut bar = egui::ProgressBar::new(fraction)

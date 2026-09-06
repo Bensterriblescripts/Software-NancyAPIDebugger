@@ -3589,11 +3589,16 @@ let (inlined_self,): (JobProvenance,) = (job.provenance,);
 }
 
 }) || probe_reportable;
-    let detected_file_types = if process_response && (200..300).contains(&response.status) {
+    let mut detected_file_types = if process_response && (200..300).contains(&response.status) {
         technology::classify_resource(&job.url, content_type.as_deref(), &response.body)
     } else {
         Vec::new()
     };
+    for detection in &mut detected_file_types {
+        for record in &mut detection.observations {
+            super::technology_evidence::locate(record, &response.url, Some(std::net::SocketAddr::new(job.origin.ip, job.origin.port).to_string()), Some(&response.method), Some(response.status), response.body_truncated);
+        }
+    }
     report.resource_records.push(CrawlResourceRecord {
         resource: CrawledResource {
             ip: job.origin.ip,
@@ -6499,6 +6504,7 @@ let (job, response, baseline, report,): (& Job, & HttpObservation, Option < & Ht
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, issue.title, issue.description, issue.evidence,);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -6598,6 +6604,7 @@ let (path,): (& str,) = (job.url.path(),);
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, issue.title, issue.description, issue.evidence,);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -6661,12 +6668,14 @@ inlined_result
 });
         }
     }
+    report.findings.extend(super::finding_assessment::response_findings(job.origin.ip, job.origin.port, response));
     if html {
         for issue in super::browser_policy::response_issues(response, &job.origin.scheme, true) {
             ({
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, issue.title, issue.description, issue.evidence,);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -6792,6 +6801,7 @@ inlined_result
                     ),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -6950,6 +6960,7 @@ let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & s
                 ),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -7038,6 +7049,7 @@ let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & s
                     ),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -7114,6 +7126,7 @@ let (report, job, body, title, description, signatures,): (& mut CrawlReport, & 
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, title, description, format!("Signature '{signature}' detected at {}", job.url),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -7192,6 +7205,7 @@ let (report, job, body, title, description, signatures,): (& mut CrawlReport, & 
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, title, description, format!("Signature '{signature}' detected at {}", job.url),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -7264,6 +7278,7 @@ let (report, job, body, title, description, signatures,): (& mut CrawlReport, & 
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, title, description, format!("Signature '{signature}' detected at {}", job.url),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -7336,6 +7351,7 @@ let (report, job, body, title, description, signatures,): (& mut CrawlReport, & 
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, title, description, format!("Signature '{signature}' detected at {}", job.url),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -14417,61 +14433,20 @@ inlined_result
             .is_some_and(|value| value.to_ascii_lowercase().contains("xml"))
             || job.url.path().to_ascii_lowercase().contains("sitemap")
         {
-            for location in {
-let (text,): (& str,) = (&text,);
-
-    let mut reader = Reader::from_str(text);
-    reader.config_mut().trim_text(true);
-    let mut in_location = false;
-    let mut locations = Vec::new();
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                in_location = element.name().as_ref().eq_ignore_ascii_case(b"loc")
-            }
-            Ok(Event::Text(value)) if in_location => {
-                if let Ok(value) = value.decode() {
-                    locations.push({
-let (value,): (& str,) = (value.trim(),);
-{
-
-    static NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"&#(?:x([0-9A-Fa-f]{1,6})|([0-9]{1,7}));?").expect("valid entity regex")
-    });
-    let basic = value
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">");
-    NUMERIC
-        .replace_all(&basic, |captures: &regex::Captures<'_>| {
-            let number = captures
-                .get(1)
-                .and_then(|value| u32::from_str_radix(value.as_str(), 16).ok())
-                .or_else(|| captures.get(2)?.as_str().parse().ok());
-            number
-                .and_then(char::from_u32)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| captures[0].to_owned())
-        })
-        .into_owned()
-
-}
-
-});
+            let locations = match parse_sitemap(text.to_string(), cancel).await {
+                Ok(locations) => locations,
+                Err(error) => {
+                    if !cancel.is_cancelled() && report.skipped_urls.len() < SKIPPED_LIMIT {
+                        report.skipped_urls.push(CrawlSkippedUrl {
+                            source_url: None,
+                            url: job.url.to_string(),
+                            reason: error.to_string(),
+                        });
+                    }
+                    return;
                 }
-            }
-            Ok(Event::End(element)) if element.name().as_ref().eq_ignore_ascii_case(b"loc") => {
-                in_location = false
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-    }
-    locations
-
-}.into_iter().take(REFERENCE_LIMIT) {
+            };
+            for location in locations.into_iter().take(REFERENCE_LIMIT) {
                 if ({
 let (origins, queue, report, job, base_url, reference, depth, provenance, request, cancel, session,): (& mut BTreeMap < OriginKey , OriginState >, & mut VecDeque < Job >, & mut CrawlReport, & Job, & Url, & str, usize, JobProvenance, & ExposureScanRequest, & CancellationToken, & mut CrawlSession,) = (origins, queue, report, &job, &job.url, &location, job.depth.saturating_add(1), JobProvenance::DiscoveredReference, request, cancel, session,);
 async move {
@@ -17270,20 +17245,19 @@ inlined_result
             }
         }
         if html {
-            let discovery = {
-let (text,): (& str,) = (&text,);
-
-    let input = BufferQueue::default();
-    input.push_back(StrTendril::from(text));
-    let tokenizer = Tokenizer::new(
-        HtmlSink(RefCell::new(HtmlState::default())),
-        Default::default(),
-    );
-    let _ = tokenizer.feed(&input);
-    tokenizer.end();
-    tokenizer.sink.0.into_inner().result
-
-};
+            let discovery = match parse_html(text.to_string(), cancel).await {
+                Ok(discovery) => discovery,
+                Err(error) => {
+                    if !cancel.is_cancelled() && report.skipped_urls.len() < SKIPPED_LIMIT {
+                        report.skipped_urls.push(CrawlSkippedUrl {
+                            source_url: None,
+                            url: job.url.to_string(),
+                            reason: error.to_string(),
+                        });
+                    }
+                    return;
+                }
+            };
             let base_url = {
 let (document_url, candidates,): (& Url, & [String],) = (&job.url, &discovery.base_hrefs,);
 
@@ -17326,6 +17300,7 @@ let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & s
                         ),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -20195,6 +20170,11 @@ async move {
     } else {
         form.method
     };
+    if form.password && let Ok(target) = base_url.join(&action)
+        && let Some(finding) = super::finding_assessment::password_form_finding(job.origin.ip, job.origin.port, job.url.as_str(), target.as_str(), &method)
+    {
+        report.findings.push(finding);
+    }
     if !method.eq_ignore_ascii_case("GET") {
         match base_url.join(&action) {
             Ok(url) => {
@@ -23602,6 +23582,7 @@ let (name,): (& str,) = (&control.name,);
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, "Password form delivered over cleartext HTTP", "A password field is present in a document delivered without transport encryption", format!("Password form found at {}", job.url),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -23669,6 +23650,7 @@ inlined_result
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, "Password form submits with GET", "A password form places submitted fields in a URL query", format!("GET password form at {} targets {normalized}", job.url),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -47403,6 +47385,7 @@ inlined_result
                 port: job.origin.port,
                 url: displayed_url,
                 fetch_url: job.url.to_string(),
+                method: response.method.clone(),
                 status: response.status,
                 headers: response.headers,
                 body: response.body,
@@ -47745,11 +47728,16 @@ let (inlined_self,): (JobProvenance,) = (job.provenance,);
 }
 
 }) || probe_reportable;
-    let detected_file_types = if process_response && (200..300).contains(&response.status) {
+    let mut detected_file_types = if process_response && (200..300).contains(&response.status) {
         technology::classify_resource(&job.url, content_type.as_deref(), &response.body)
     } else {
         Vec::new()
     };
+    for detection in &mut detected_file_types {
+        for record in &mut detection.observations {
+            super::technology_evidence::locate(record, &response.url, Some(std::net::SocketAddr::new(job.origin.ip, job.origin.port).to_string()), Some(&response.method), Some(response.status), response.body_truncated);
+        }
+    }
     report.resource_records.push(CrawlResourceRecord {
         resource: CrawledResource {
             ip: job.origin.ip,
@@ -50655,6 +50643,7 @@ let (job, response, baseline, report,): (& Job, & HttpObservation, Option < & Ht
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, issue.title, issue.description, issue.evidence,);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -50754,6 +50743,7 @@ let (path,): (& str,) = (job.url.path(),);
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, issue.title, issue.description, issue.evidence,);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -50817,12 +50807,14 @@ inlined_result
 });
         }
     }
+    report.findings.extend(super::finding_assessment::response_findings(job.origin.ip, job.origin.port, response));
     if html {
         for issue in super::browser_policy::response_issues(response, &job.origin.scheme, true) {
             ({
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, issue.title, issue.description, issue.evidence,);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -50948,6 +50940,7 @@ inlined_result
                     ),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -51106,6 +51099,7 @@ let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & s
                 ),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -51194,6 +51188,7 @@ let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & s
                     ),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -51270,6 +51265,7 @@ let (report, job, body, title, description, signatures,): (& mut CrawlReport, & 
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, title, description, format!("Signature '{signature}' detected at {}", job.url),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -51348,6 +51344,7 @@ let (report, job, body, title, description, signatures,): (& mut CrawlReport, & 
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, title, description, format!("Signature '{signature}' detected at {}", job.url),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -51420,6 +51417,7 @@ let (report, job, body, title, description, signatures,): (& mut CrawlReport, & 
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, title, description, format!("Signature '{signature}' detected at {}", job.url),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -51492,6 +51490,7 @@ let (report, job, body, title, description, signatures,): (& mut CrawlReport, & 
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, title, description, format!("Signature '{signature}' detected at {}", job.url),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -58573,61 +58572,20 @@ inlined_result
             .is_some_and(|value| value.to_ascii_lowercase().contains("xml"))
             || job.url.path().to_ascii_lowercase().contains("sitemap")
         {
-            for location in {
-let (text,): (& str,) = (&text,);
-
-    let mut reader = Reader::from_str(text);
-    reader.config_mut().trim_text(true);
-    let mut in_location = false;
-    let mut locations = Vec::new();
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                in_location = element.name().as_ref().eq_ignore_ascii_case(b"loc")
-            }
-            Ok(Event::Text(value)) if in_location => {
-                if let Ok(value) = value.decode() {
-                    locations.push({
-let (value,): (& str,) = (value.trim(),);
-{
-
-    static NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"&#(?:x([0-9A-Fa-f]{1,6})|([0-9]{1,7}));?").expect("valid entity regex")
-    });
-    let basic = value
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">");
-    NUMERIC
-        .replace_all(&basic, |captures: &regex::Captures<'_>| {
-            let number = captures
-                .get(1)
-                .and_then(|value| u32::from_str_radix(value.as_str(), 16).ok())
-                .or_else(|| captures.get(2)?.as_str().parse().ok());
-            number
-                .and_then(char::from_u32)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| captures[0].to_owned())
-        })
-        .into_owned()
-
-}
-
-});
+            let locations = match parse_sitemap(text.to_string(), cancel).await {
+                Ok(locations) => locations,
+                Err(error) => {
+                    if !cancel.is_cancelled() && report.skipped_urls.len() < SKIPPED_LIMIT {
+                        report.skipped_urls.push(CrawlSkippedUrl {
+                            source_url: None,
+                            url: job.url.to_string(),
+                            reason: error.to_string(),
+                        });
+                    }
+                    return;
                 }
-            }
-            Ok(Event::End(element)) if element.name().as_ref().eq_ignore_ascii_case(b"loc") => {
-                in_location = false
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-    }
-    locations
-
-}.into_iter().take(REFERENCE_LIMIT) {
+            };
+            for location in locations.into_iter().take(REFERENCE_LIMIT) {
                 if ({
 let (origins, queue, report, job, base_url, reference, depth, provenance, request, cancel, session,): (& mut BTreeMap < OriginKey , OriginState >, & mut VecDeque < Job >, & mut CrawlReport, & Job, & Url, & str, usize, JobProvenance, & ExposureScanRequest, & CancellationToken, & mut CrawlSession,) = (origins, queue, report, &job, &job.url, &location, job.depth.saturating_add(1), JobProvenance::DiscoveredReference, request, cancel, session,);
 async move {
@@ -61426,20 +61384,19 @@ inlined_result
             }
         }
         if html {
-            let discovery = {
-let (text,): (& str,) = (&text,);
-
-    let input = BufferQueue::default();
-    input.push_back(StrTendril::from(text));
-    let tokenizer = Tokenizer::new(
-        HtmlSink(RefCell::new(HtmlState::default())),
-        Default::default(),
-    );
-    let _ = tokenizer.feed(&input);
-    tokenizer.end();
-    tokenizer.sink.0.into_inner().result
-
-};
+            let discovery = match parse_html(text.to_string(), cancel).await {
+                Ok(discovery) => discovery,
+                Err(error) => {
+                    if !cancel.is_cancelled() && report.skipped_urls.len() < SKIPPED_LIMIT {
+                        report.skipped_urls.push(CrawlSkippedUrl {
+                            source_url: None,
+                            url: job.url.to_string(),
+                            reason: error.to_string(),
+                        });
+                    }
+                    return;
+                }
+            };
             let base_url = {
 let (document_url, candidates,): (& Url, & [String],) = (&job.url, &discovery.base_hrefs,);
 
@@ -61482,6 +61439,7 @@ let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & s
                         ),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -64351,6 +64309,11 @@ async move {
     } else {
         form.method
     };
+    if form.password && let Ok(target) = base_url.join(&action)
+        && let Some(finding) = super::finding_assessment::password_form_finding(job.origin.ip, job.origin.port, job.url.as_str(), target.as_str(), &method)
+    {
+        report.findings.push(finding);
+    }
     if !method.eq_ignore_ascii_case("GET") {
         match base_url.join(&action) {
             Ok(url) => {
@@ -67758,6 +67721,7 @@ let (name,): (& str,) = (&control.name,);
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, "Password form delivered over cleartext HTTP", "A password field is present in a document delivered without transport encryption", format!("Password form found at {}", job.url),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -67825,6 +67789,7 @@ inlined_result
 let (report, job, title, description, evidence,): (& mut CrawlReport, & Job, & str, & str, String,) = (report, job, "Password form submits with GET", "A password form places submitted fields in a URL query", format!("GET password form at {} targets {normalized}", job.url),);
 
     report.findings.push(ExposureFinding {
+        details: Vec::new(),
         title: title.to_owned(),
         description: description.to_owned(),
         ip: job.origin.ip,
@@ -91559,6 +91524,7 @@ inlined_result
                 port: job.origin.port,
                 url: displayed_url,
                 fetch_url: job.url.to_string(),
+                method: response.method.clone(),
                 status: response.status,
                 headers: response.headers,
                 body: response.body,
@@ -91879,4 +91845,95 @@ pub(super) fn normalize_url(mut url: Url) -> Result<Url, String> {
     (url.as_str().len() <= 2048)
         .then_some(url)
         .ok_or_else(|| "URL exceeds 2,048 characters".to_owned())
+}
+
+async fn parse_html(
+    text: String,
+    cancel: &CancellationToken,
+) -> Result<HtmlDiscovery, crate::blocking::Error> {
+    crate::blocking::run(cancel, move |cancel| {
+        let input = BufferQueue::default();
+        let tokenizer = Tokenizer::new(
+            HtmlSink(RefCell::new(HtmlState::default())),
+            Default::default(),
+        );
+        let mut offset = 0;
+        while offset < text.len() {
+            if cancel.is_cancelled() {
+                return HtmlDiscovery::default();
+            }
+            let mut end = (offset + 64 * 1024).min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            input.push_back(StrTendril::from(&text[offset..end]));
+            let _ = tokenizer.feed(&input);
+            offset = end;
+        }
+        tokenizer.end();
+        tokenizer.sink.0.into_inner().result
+    })
+    .await
+}
+
+async fn parse_sitemap(
+    text: String,
+    cancel: &CancellationToken,
+) -> Result<Vec<String>, crate::blocking::Error> {
+    crate::blocking::run(cancel, move |cancel| {
+        let mut reader = Reader::from_str(&text);
+        reader.config_mut().trim_text(true);
+        let mut in_location = false;
+        let mut locations = Vec::new();
+        loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+            match reader.read_event() {
+                Ok(Event::Start(element)) => {
+                    in_location = element.name().as_ref().eq_ignore_ascii_case(b"loc")
+                }
+                Ok(Event::Text(value)) if in_location => {
+                    if let Ok(value) = value.decode() {
+                        locations.push({
+                            let (value,): (&str,) = (value.trim(),);
+                            {
+                                static NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
+                                    Regex::new(r"&#(?:x([0-9A-Fa-f]{1,6})|([0-9]{1,7}));?")
+                                        .expect("valid entity regex")
+                                });
+                                let basic = value
+                                    .replace("&amp;", "&")
+                                    .replace("&quot;", "\"")
+                                    .replace("&apos;", "'")
+                                    .replace("&lt;", "<")
+                                    .replace("&gt;", ">");
+                                NUMERIC
+                                    .replace_all(&basic, |captures: &regex::Captures<'_>| {
+                                        let number = captures
+                                            .get(1)
+                                            .and_then(|value| {
+                                                u32::from_str_radix(value.as_str(), 16).ok()
+                                            })
+                                            .or_else(|| captures.get(2)?.as_str().parse().ok());
+                                        number
+                                            .and_then(char::from_u32)
+                                            .map(|value| value.to_string())
+                                            .unwrap_or_else(|| captures[0].to_owned())
+                                    })
+                                    .into_owned()
+                            }
+                        });
+                    }
+                }
+                Ok(Event::End(element)) if element.name().as_ref().eq_ignore_ascii_case(b"loc") => {
+                    in_location = false
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+        }
+        locations
+    })
+    .await
 }

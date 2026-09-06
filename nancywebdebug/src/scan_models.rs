@@ -596,11 +596,26 @@ display_enum! {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TechnologyEvidence {
+    pub source_url: String,
+    pub endpoint: Option<String>,
+    pub method: Option<String>,
+    pub status: Option<u16>,
+    pub match_source: String,
+    pub observed_value: Option<String>,
+    pub extracted_version: Option<String>,
+    pub supporting_detection: Option<String>,
+    pub excerpt_shortened: bool,
+    pub capture_truncated: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct DetectedFileType {
     pub file_type: TechnologyFileType,
     pub confidence: Confidence,
     pub evidence: Vec<String>,
+    pub observations: Vec<TechnologyEvidence>,
 }
 
 #[derive(Debug, Clone)]
@@ -618,6 +633,7 @@ pub struct TechnologyComponent {
     pub evidence_urls: Vec<String>,
     pub evidence: Vec<String>,
     pub check_error: Option<String>,
+    pub observations: Vec<TechnologyEvidence>,
 }
 
 display_enum! {
@@ -677,6 +693,7 @@ display_enum! {
 
 #[derive(Debug, Clone)]
 pub struct ProductDetection {
+    pub observations: Vec<TechnologyEvidence>,
     pub name: String,
     pub layer: ProductLayer,
     pub version: Option<String>,
@@ -692,6 +709,7 @@ pub struct WebTechnologyDetection {
     pub confidence: Confidence,
     pub evidence_urls: Vec<String>,
     pub evidence: Vec<String>,
+    pub observations: Vec<TechnologyEvidence>,
 }
 
 #[derive(Debug, Clone)]
@@ -782,6 +800,7 @@ pub struct JavaScriptLibrary {
     pub status: TechnologyVersionStatus,
     pub evidence: Vec<String>,
     pub check_error: Option<String>,
+    pub observations: Vec<TechnologyEvidence>,
 }
 
 #[derive(Debug, Clone)]
@@ -798,8 +817,22 @@ pub struct JavaScriptSource {
     pub analysis_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FindingLocation {
+    pub url: Option<String>,
+    pub method: Option<String>,
+    pub subject: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FindingDetail {
+    pub cause: String,
+    pub location: FindingLocation,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExposureFinding {
+    pub details: Vec<FindingDetail>,
     pub title: String,
     pub description: String,
     pub ip: IpAddr,
@@ -824,17 +857,6 @@ display_enum! {
 
 display_enum! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-    pub enum FindingSeverity {
-        Informational => "Informational",
-        Low => "Low",
-        Medium => "Medium",
-        High => "High",
-        Critical => "Critical",
-    }
-}
-
-display_enum! {
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
     pub enum CheckOutcome {
         Vulnerable => "Vulnerable",
         Potential => "Potential",
@@ -852,7 +874,6 @@ pub struct SecurityCheckResult {
     pub check_id: String,
     pub class: VulnerabilityClass,
     pub title: String,
-    pub severity: FindingSeverity,
     pub confidence: Confidence,
     pub outcome: CheckOutcome,
     pub probe_url: Option<String>,
@@ -1121,6 +1142,37 @@ pub struct EndpointHealthObservation {
     pub detail: String,
 }
 
+display_enum! {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub enum DiscoveryCoverageStatus {
+        #[default]
+        Pending => "Pending",
+        Running => "Running",
+        Complete => "Selected discovery complete",
+        Limited => "Limited coverage",
+        Cancelled => "Cancelled; incomplete coverage",
+        Unavailable => "Provider unavailable; incomplete coverage",
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryCoverage {
+    pub status: DiscoveryCoverageStatus,
+    pub eligible: Option<usize>,
+    pub selected: usize,
+    pub completed: usize,
+    pub omitted: usize,
+    pub detail: String,
+}
+
+impl DiscoveryCoverage {
+    pub fn summary(&self) -> String {
+        format!("{}: {} eligible, {} selected, {} completed, {} omitted. {}", self.status,
+            self.eligible.map(|count| count.to_string()).unwrap_or_else(|| "unknown".to_owned()),
+            self.selected, self.completed, self.omitted, self.detail)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExposureScanReport {
     pub request: ExposureScanRequest,
@@ -1134,6 +1186,7 @@ pub struct ExposureScanReport {
     pub udp_endpoints: Vec<UdpEndpointScan>,
     pub service_access: Vec<ServiceAccessResult>,
     pub discovered_assets: Vec<DiscoveredAsset>,
+    pub discovery_coverage: DiscoveryCoverage,
     pub dns_observations: Vec<DnsObservation>,
     pub stream_observations: Vec<StreamObservation>,
     pub findings: Vec<ExposureFinding>,
@@ -1232,6 +1285,7 @@ pub enum ExposureScanProgress {
         total: usize,
         result: ServiceAccessResult,
     },
+    DiscoveryCoverageUpdated(DiscoveryCoverage),
     AssetDiscovered {
         completed: usize,
         total: usize,

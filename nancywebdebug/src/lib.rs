@@ -24,9 +24,11 @@ macro_rules! display_enum {
 }
 
 pub mod auth;
+mod blocking;
 pub mod diagnostics;
 mod exposure;
 mod network;
+mod dns_lookup;
 mod persistence;
 mod product_catalog;
 mod request;

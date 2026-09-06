@@ -1,9 +1,56 @@
 use super::*;
-use crate::EndpointHealthResolution;
 use crate::UdpEndpointState;
 use crate::diagnostics::TraceOutcome;
 use crate::product_catalog::inventory_product_name;
+use crate::ui::disclosure::{evidence as show_evidence, evidence_item, show as disclosure};
+use crate::ui::report_layout::{self, ITEM_SPACING, LabelValueRows, section_separator};
 use crate::{ExposureFinding, TechnologyComponentKind, TransportProtocol};
+
+fn detected_services(report: &ExposureScanReport) -> Vec<(String, BTreeSet<String>)> {
+    let mut services = BTreeMap::<String, BTreeSet<String>>::new();
+    for endpoint in &report.endpoints {
+        if endpoint.transport == TransportProtocol::Tcp
+            && endpoint.state == PortState::Open
+            && endpoint.service != crate::ServiceKind::Unknown
+        {
+            services.entry(endpoint.service.to_string()).or_default().insert(
+                format!("TCP: {} confidence", endpoint.service_confidence),
+            );
+        }
+    }
+    for endpoint in &report.udp_endpoints {
+        if endpoint.state == UdpEndpointState::Responsive
+            && endpoint.service != crate::ServiceKind::Unknown
+        {
+            services.entry(endpoint.service.to_string()).or_default().insert(
+                format!("UDP: {}", endpoint.state),
+            );
+        }
+    }
+    for access in &report.service_access {
+        if access.service != crate::ServiceKind::Unknown {
+            services.entry(access.service.to_string()).or_default().insert(
+                format!("Access: {}", access.status),
+            );
+        }
+    }
+    let mut streaming = BTreeMap::<crate::StreamKind, &crate::StreamObservation>::new();
+    for observation in &report.stream_observations {
+        streaming.entry(observation.kind).and_modify(|current| {
+            if observation.confidence > current.confidence {
+                *current = observation;
+            }
+        }).or_insert(observation);
+    }
+    for observation in streaming.values() {
+        services.entry(observation.kind.to_string()).or_default().insert(
+            format!("Streaming: {} — {} confidence", observation.status, observation.confidence),
+        );
+    }
+    let mut services = services.into_iter().collect::<Vec<_>>();
+    services.sort_by_cached_key(|(name, _)| name.to_ascii_lowercase());
+    services
+}
 
 fn show_technology_component_details(
     ui: &mut egui::Ui,
@@ -12,7 +59,10 @@ fn show_technology_component_details(
 ) {
     ui.label(format!(
         "{} — {} confidence — {}:{}",
-        component.installed_version.as_deref().unwrap_or("version not observed"),
+        component
+            .installed_version
+            .as_deref()
+            .unwrap_or("version not observed"),
         component.confidence,
         endpoint.ip,
         endpoint.port
@@ -40,29 +90,7 @@ fn show_technology_component_details(
     if let Some(source) = &component.release_source_url {
         ui.hyperlink_to("Upstream release/lifecycle source", source);
     }
-    let count = component.evidence_urls.len() + component.evidence.len();
-    if count > 0 {
-        egui::CollapsingHeader::new(format!("Evidence ({count})"))
-            .id_salt((
-                "technology-component-evidence",
-                endpoint.ip,
-                endpoint.port,
-                component.ecosystem,
-                component.kind,
-                &component.name,
-                &component.package_identifier,
-                &component.installed_version,
-            ))
-            .default_open(false)
-            .show(ui, |ui| {
-                for url in &component.evidence_urls {
-                    ui.weak(format!("Evidence URL: {url}"));
-                }
-                for item in &component.evidence {
-                    ui.weak(format!("Evidence: {item}"));
-                }
-            });
-    }
+    show_technology_evidence(ui, "technology-component-evidence", &component.observations);
     if let Some(error) = &component.check_error {
         ui.weak(format!("Version check: {error}"));
     }
@@ -74,37 +102,34 @@ pub(in crate::ui) fn show_report(
     tab: ExposureDetailTab,
     diagnostic_view: &mut DiagnosticViewState,
 ) {
-    egui::ScrollArea::vertical().show(ui, |ui| match tab {
+    ui.push_id(tab.label(), |ui| {
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+    ui.spacing_mut().item_spacing.y = ITEM_SPACING;
+    egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+        report_layout::show_status(ui, report, tab != ExposureDetailTab::Summary);
+        match tab {
         ExposureDetailTab::Summary => {
             ({
 let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
 
     ui.heading("Public Exposure Summary");
-    egui::Grid::new("exposure_summary")
-        .striped(true)
-        .show(ui, |ui| {
+    LabelValueRows::show(ui, "exposure_summary", |ui, rows| {
             ({
 let (ui, label, value,): (& mut egui :: Ui, & str, & str,) = (ui, "Target", &report.request.diagnostic_request.url,);
 
-    ui.strong(label);
-    ui.label(if value.is_empty() { "None" } else { value });
-    ui.end_row();
+    rows.row(ui, label, if value.is_empty() { "None" } else { value });
 
 });
             ({
 let (ui, label, value,): (& mut egui :: Ui, & str, & str,) = (ui, "Hostname / SNI", &report.hostname,);
 
-    ui.strong(label);
-    ui.label(if value.is_empty() { "None" } else { value });
-    ui.end_row();
+    rows.row(ui, label, if value.is_empty() { "None" } else { value });
 
 });
             ({
 let (ui, label, value,): (& mut egui :: Ui, & str, & str,) = (ui, "Status", &report.status.to_string(),);
 
-    ui.strong(label);
-    ui.label(if value.is_empty() { "None" } else { value });
-    ui.end_row();
+    rows.row(ui, label, if value.is_empty() { "None" } else { value });
 
 });
             ({
@@ -114,11 +139,9 @@ let (ui, label, value,): (& mut egui :: Ui, & str, & str,) = (ui, "Public IPv4 a
                     .filter(|address| address.is_ipv4())
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
-                    .join(", "),);
+                    .join("\n"),);
 
-    ui.strong(label);
-    ui.label(if value.is_empty() { "None" } else { value });
-    ui.end_row();
+    rows.row(ui, label, if value.is_empty() { "None" } else { value });
 
 });
             ({
@@ -128,11 +151,9 @@ let (ui, label, value,): (& mut egui :: Ui, & str, & str,) = (ui, "Public IPv6 a
                     .filter(|address| address.is_ipv6())
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
-                    .join(", "),);
+                    .join("\n"),);
 
-    ui.strong(label);
-    ui.label(if value.is_empty() { "None" } else { value });
-    ui.end_row();
+    rows.row(ui, label, if value.is_empty() { "None" } else { value });
 
 });
             ({
@@ -150,9 +171,7 @@ let inlined_result: usize = {
 inlined_result
 }).to_string(),);
 
-    ui.strong(label);
-    ui.label(if value.is_empty() { "None" } else { value });
-    ui.end_row();
+    rows.row(ui, label, if value.is_empty() { "None" } else { value });
 
 });
             ({
@@ -184,79 +203,19 @@ inlined_result
 inlined_result
 }).to_string(),);
 
-    ui.strong(label);
-    ui.label(if value.is_empty() { "None" } else { value });
-    ui.end_row();
+    rows.row(ui, label, if value.is_empty() { "None" } else { value });
 
 });
             ({
 let (ui, label, value,): (& mut egui :: Ui, & str, & str,) = (ui, "Total time", &format!("{:.2} s", report.timings.total_ms / 1_000.0),);
 
-    ui.strong(label);
-    ui.label(if value.is_empty() { "None" } else { value });
-    ui.end_row();
+    rows.row(ui, label, if value.is_empty() { "None" } else { value });
 
 });
         });
-    if let Some(error) = &report.error {
-        ui.colored_label(egui::Color32::RED, error);
-    }
-    for warning in &report.warnings {
-        ui.colored_label(egui::Color32::YELLOW, warning);
-    }
-    if !report.endpoint_health.is_empty() {
-        ui.separator();
-        ui.heading("Request blocking / availability");
-        if report
-            .endpoint_health
-            .iter()
-            .any(|observation| observation.resolution == EndpointHealthResolution::Stopped)
-        {
-            ui.colored_label(egui::Color32::YELLOW, "Partial coverage: remaining probes were skipped on affected endpoints. Other endpoints continued.");
-        }
-        for observation in &report.endpoint_health {
-            ui.add_space(6.0);
-            ui.strong(format!(
-                "{} ({})",
-                std::net::SocketAddr::new(observation.ip, observation.port),
-                observation.transport
-            ));
-            ui.label(&observation.detail);
-            ui.label(format!(
-                "From monitored attempt #{} at {:.1} s: {} timed out, {} rejected",
-                observation.request_number,
-                observation.elapsed_ms / 1000.0,
-                observation.timeouts,
-                observation.rejections,
-            ));
-            if !observation.had_baseline {
-                ui.weak(
-                    "No previously working safe baseline; a mid-scan block cannot be established.",
-                );
-            }
-            for check in &observation.connectivity {
-                ui.label(format!("{}: {}", check.label, check.detail));
-            }
-            for retry in &observation.retries {
-                ui.label(retry);
-            }
-        }
-    }
-    let attempted: Vec<_> = report
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.attempted)
-        .collect();
-    if !attempted.is_empty()
-        && attempted
-            .iter()
-            .all(|endpoint| endpoint.state == PortState::FilteredOrNoResponse)
-    {
-        ui.colored_label(egui::Color32::YELLOW, "All attempted TCP endpoints timed out or gave no response. No working baseline was established; filtering versus unavailability is inconclusive.");
-    }
 
 });
-            ui.separator();
+            section_separator(ui);
             ({
 let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
 
@@ -340,7 +299,11 @@ let (products, name, version, confidence, details,): (& mut BTreeMap < String , 
 }
 });
         }
-        for component in &endpoint.technology_components {
+        for component in endpoint
+            .technology_components
+            .iter()
+            .filter(|component| component.kind != TechnologyComponentKind::Package)
+        {
             ({
 let (products, name, version, confidence, details,): (& mut BTreeMap < String , DiagnosticProduct >, & str, Option < & str >, Confidence, _,) = (&mut products, &component.name, component.installed_version.as_deref(), component.confidence, component
                     .evidence
@@ -379,47 +342,6 @@ let (products, name, version, confidence, details,): (& mut BTreeMap < String , 
 }
 });
         }
-        for source in &endpoint.javascript_sources {
-            for library in &source.libraries {
-                ({
-let (products, name, version, confidence, details,): (& mut BTreeMap < String , DiagnosticProduct >, & str, Option < & str >, Confidence, _,) = (&mut products, &library.name, library.installed_version.as_deref(), Confidence::Medium, library
-                        .evidence
-                        .iter()
-                        .chain(std::iter::once(&source.source_url))
-                        .cloned(),);
-'inlined_add_inventory_product: {
-
-    let Some(name) = inventory_product_name(name) else {
-        break 'inlined_add_inventory_product;
-    };
-    if confidence == Confidence::None {
-        break 'inlined_add_inventory_product;
-    }
-    let product = products
-        .entry(name.to_ascii_lowercase())
-        .or_insert_with(|| DiagnosticProduct {
-            name: name.to_owned(),
-            versions: BTreeMap::new(),
-            confidence,
-            details: BTreeSet::new(),
-        });
-    if name < product.name.as_str() {
-        product.name = name.to_owned();
-    }
-    if let Some(version) = version.filter(|version| !version.trim().is_empty()) {
-        product
-            .versions
-            .entry(version.to_owned())
-            .and_modify(|current| *current = (*current).max(confidence))
-            .or_insert(confidence);
-    }
-    product.confidence = product.confidence.max(confidence);
-    product.details.extend(details);
-
-}
-});
-            }
-        }
     }
     for (language, detection) in {
 let (report,): (& ExposureScanReport,) = (report,);
@@ -441,6 +363,7 @@ let inlined_result: BTreeMap < & 'static str , LanguageDetection > = {
                 .or_insert(item.confidence);
             detection.evidence_urls.push(resource.url.clone());
             detection.evidence.extend(item.evidence.iter().cloned());
+            detection.observations.extend(item.observations.iter().cloned());
         }
     }
     for component in report
@@ -489,10 +412,13 @@ let (runtime,): (& str,) = (&component.name,);
             .evidence_urls
             .extend(component.evidence_urls.iter().cloned());
         detection.evidence.extend(component.evidence.iter().cloned());
+        detection.observations.extend(component.observations.iter().cloned());
     }
     for detection in languages.values_mut() {
         detection.evidence_urls.sort();
         detection.evidence_urls.dedup();
+        detection.observations.sort();
+        detection.observations.dedup();
         detection.evidence.sort();
         detection.evidence.dedup();
     }
@@ -717,16 +643,23 @@ let (ui, report, view,): (& mut egui :: Ui, & ExposureScanReport, & mut Diagnost
             ui.selectable_value(&mut view.tab, tab, tab.label());
         }
     });
-    ui.separator();
+    section_separator(ui);
     let trace = &endpoint.diagnostics[view.hop_index];
     let chain = endpoint.diagnostics.iter().collect::<Vec<_>>();
+    ui.push_id((endpoint_index, view.hop_index, view.tab.label()), |ui| {
     match view.tab {
         DetailTab::Summary => show_diagnostic_summary(ui, trace, &chain),
         DetailTab::Network => show_network(ui, trace),
         DetailTab::Tls => show_tls(ui, trace),
         DetailTab::Http => show_http(ui, trace),
-        DetailTab::Body => show_body(ui, trace, &mut view.body_view),
+        DetailTab::Body => {
+            let id = ui.make_persistent_id("body-view");
+            let mut body_view = ui.ctx().data_mut(|data| data.get_temp::<BodyView>(id)).unwrap_or(BodyView::Decoded);
+            show_body(ui, trace, &mut body_view);
+            ui.ctx().data_mut(|data| data.insert_temp(id, body_view));
+        },
     }
+    });
 
 }
 },
@@ -760,37 +693,21 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
         }
     }
     for endpoint in endpoints {
-        ui.separator();
-        ui.strong(format!(
-            "{}:{} / {} — {} — {}",
-            endpoint.ip, endpoint.port, endpoint.transport, endpoint.service, endpoint.state
-        ));
-        for evidence in &endpoint.evidence {
-            ui.weak(evidence);
-        }
-        if let Some(error) = &endpoint.error {
-            ui.weak(error);
-        }
-        ui.label(format!(
-            "{} confidence — {:.2} ms",
-            endpoint.service_confidence, endpoint.connect_duration_ms
-        ));
-        if endpoint.state == PortState::Open && endpoint.products.is_empty() {
-            ui.weak("Product undisclosed");
-        }
-        for product in &endpoint.products {
-            ui.label(format!(
-                "{} [{}]{} — {} confidence",
-                product.name,
-                product.layer,
-                product
-                    .version
-                    .as_ref()
-                    .map(|version| format!(" {version}"))
-                    .unwrap_or_default(),
-                product.confidence
-            ));
-        }
+        section_separator(ui);
+        disclosure(ui, (endpoint.ip, endpoint.port, endpoint.transport),
+            egui::RichText::new(format!("{} / {} — {} — {}", std::net::SocketAddr::new(endpoint.ip, endpoint.port), endpoint.transport, endpoint.service, endpoint.state) + &if endpoint.products.is_empty() { format!(" — Evidence ({})", endpoint.evidence.len()) } else { String::new() }).strong(),
+            |ui| {
+                ui.label(format!("{} confidence — {:.2} ms", endpoint.service_confidence, endpoint.connect_duration_ms));
+                if let Some(error) = &endpoint.error { ui.colored_label(egui::Color32::LIGHT_RED, error); }
+                if endpoint.state == PortState::Open && endpoint.products.is_empty() { ui.weak("Product undisclosed"); }
+            }, |ui| {
+                if endpoint.products.is_empty() {
+                    for evidence in &endpoint.evidence { ui.weak(evidence); }
+                } else { show_evidence(ui, &endpoint.evidence); }
+                for (index, product) in endpoint.products.iter().enumerate() {
+                    evidence_item(ui, ("product", index), format!("{} [{}]{} — {} confidence", product.name, product.layer, product.version.as_ref().map(|version| format!(" {version}")).unwrap_or_default(), product.confidence), |_| {}, &product.evidence);
+                }
+            });
     }
 
 }
@@ -824,17 +741,11 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
             }
         }
         let render_endpoint = |ui: &mut egui::Ui, endpoint: &crate::UdpEndpointScan| {
-            ui.separator();
-            ui.strong(format!(
-                "{}:{} / {} — {} — {}",
-                endpoint.ip, endpoint.port, endpoint.transport, endpoint.service, endpoint.state
-            ));
-            for evidence in &endpoint.evidence {
-                ui.weak(evidence);
-            }
-            if let Some(error) = &endpoint.error {
-                ui.weak(error);
-            }
+            section_separator(ui);
+            evidence_item(ui, (endpoint.ip, endpoint.port, endpoint.transport),
+                format!("{} / {} — {} — {}", std::net::SocketAddr::new(endpoint.ip, endpoint.port), endpoint.transport, endpoint.service, endpoint.state),
+                |ui| { ui.label(format!("{:.2} ms", endpoint.elapsed_ms)); if let Some(error) = &endpoint.error { ui.colored_label(egui::Color32::LIGHT_RED, error); } },
+                &endpoint.evidence);
         };
         for endpoint in endpoints
             .iter()
@@ -867,6 +778,18 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
         ExposureDetailTab::Services => {
 let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
 
+    ui.heading("Services");
+    let services = detected_services(report);
+    if services.is_empty() {
+        ui.weak("No services detected.");
+    } else {
+        LabelValueRows::show(ui, "detected_services", |ui, rows| {
+            for (name, observations) in services {
+                rows.row(ui, name, observations.into_iter().collect::<Vec<_>>().join("; "));
+            }
+        });
+    }
+    section_separator(ui);
     ui.heading("Service Access");
     ui.weak("Handshake-only checks never enumerate content, test credentials, or perform writes.");
     if !report.request.service_access_checks {
@@ -874,21 +797,17 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
     } else if report.service_access.is_empty() {
         ui.weak("No eligible service access checks were recorded.");
     } else {
-        for access in &report.service_access {
-            ui.separator();
-            ui.strong(format!(
-                "{}:{} / {} — {} — {}",
-                access.ip, access.port, access.transport, access.service, access.status
-            ));
-            ui.label(format!("{}: {}", access.method, access.summary));
-            for evidence in &access.evidence {
-                ui.weak(evidence);
-            }
+        for (index, access) in report.service_access.iter().enumerate() {
+            section_separator(ui);
+            evidence_item(ui, (index, access.ip, access.port, access.transport, &access.method),
+                format!("{} — {} / {} — {}{}", access.service, std::net::SocketAddr::new(access.ip, access.port), access.transport, access.status, if access.evidence.is_empty() { " — Evidence (0)" } else { "" }),
+                |ui| { ui.label(format!("{}: {}", access.method, access.summary)); },
+                &access.evidence);
         }
     }
 
     if !report.stream_observations.is_empty() {
-        ui.separator();
+        section_separator(ui);
         ui.heading("Streaming & Signalling Inventory");
         for status in [
             crate::StreamStatus::Confirmed,
@@ -904,19 +823,19 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
             if entries.is_empty() {
                 continue;
             }
-            ui.separator();
+            section_separator(ui);
             ui.strong(status.to_string());
-            for observation in entries {
-                ui.label(format!(
-                    "{} — {} confidence — {}",
-                    observation.kind, observation.confidence, observation.source_url
-                ));
-                for evidence in &observation.evidence {
-                    ui.weak(evidence);
-                }
-                for endpoint in &observation.endpoints {
-                    ui.weak(endpoint);
-                }
+            for (index, observation) in entries.iter().enumerate() {
+                disclosure(ui, ("stream", status.to_string(), index, &observation.source_url, observation.kind.to_string()),
+                    egui::RichText::new(format!("{} — {}", observation.kind, observation.source_url)).strong(),
+                    |ui| { ui.label(format!("{} confidence — {} endpoints", observation.confidence, observation.endpoints.len())); }, |ui| {
+                        if !observation.evidence.is_empty() {
+                            disclosure(ui, "evidence", format!("{} — Evidence ({})", observation.kind, observation.evidence.len()), |_| {}, |ui| {
+                                for item in &observation.evidence { ui.weak(item); }
+                            });
+                        }
+                        for endpoint in &observation.endpoints { ui.weak(endpoint); }
+                    });
             }
         }
     }
@@ -927,6 +846,7 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
 let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
 
     ui.heading("Discovered Assets");
+    if report.request.asset_discovery { ui.label(report.discovery_coverage.summary()); }
     ui.weak(
         "When enabled, this section queries the public crt.sh service. CT-derived hosts are inventory-only and are never port-scanned or requested over HTTP.",
     );
@@ -944,10 +864,11 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
             if assets.peek().is_none() {
                 continue;
             }
-            ui.separator();
-            ui.heading(heading);
+            section_separator(ui);
+            let assets = assets.collect::<Vec<_>>();
+            disclosure(ui, ("assets", heading), format!("{heading} assets ({})", assets.len()), |_| {}, |ui| {
             for asset in assets {
-                ui.separator();
+                section_separator(ui);
                 ui.strong(format!("{} — {}", asset.hostname, asset.state));
                 ui.label(&asset.detail);
                 if !asset.addresses.is_empty() {
@@ -965,11 +886,12 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
                     ui.weak(format!("CNAME chain: {}", asset.cname_chain.join(" → ")));
                 }
             }
+            });
         }
     }
 
 });
-            ui.separator();
+            section_separator(ui);
             ({
 let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
 'inlined_show_dns: {
@@ -997,21 +919,14 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
             ({
 let (ui, observation,): (& mut egui :: Ui, & crate :: DnsObservation,) = (ui, observation,);
 
-    ui.separator();
-    ui.strong(format!(
-        "{} — {} — {}",
-        observation.subject, observation.check, observation.status
-    ));
-    ui.label(&observation.summary);
+    section_separator(ui);
+    disclosure(ui, ("dns-check", &observation.subject, &observation.check, &observation.summary, observation.status.to_string()),
+        egui::RichText::new(format!("{} — {} — {}", observation.subject, observation.check, observation.status)).strong(),
+        |ui| { ui.label(&observation.summary); }, |ui| {
     ui.label(format!("Impact: {}", observation.impact));
     ui.label(format!("Recommended fix: {}", observation.remediation));
-    if !observation.evidence.is_empty() {
-        egui::CollapsingHeader::new("Evidence")
-            .id_salt((&observation.subject, &observation.check, &observation.summary, &observation.evidence))
-            .default_open(false).show(ui, |ui| {
-                for evidence in &observation.evidence { ui.weak(evidence); }
-            });
-    }
+    show_evidence(ui, &observation.evidence);
+    });
 
 });
         }
@@ -1024,21 +939,14 @@ let (ui, observation,): (& mut egui :: Ui, & crate :: DnsObservation,) = (ui, ob
                     ({
 let (ui, observation,): (& mut egui :: Ui, & crate :: DnsObservation,) = (ui, observation,);
 
-    ui.separator();
-    ui.strong(format!(
-        "{} — {} — {}",
-        observation.subject, observation.check, observation.status
-    ));
-    ui.label(&observation.summary);
+    section_separator(ui);
+    disclosure(ui, ("dns-check", &observation.subject, &observation.check, &observation.summary, observation.status.to_string()),
+        egui::RichText::new(format!("{} — {} — {}", observation.subject, observation.check, observation.status)).strong(),
+        |ui| { ui.label(&observation.summary); }, |ui| {
     ui.label(format!("Impact: {}", observation.impact));
     ui.label(format!("Recommended fix: {}", observation.remediation));
-    if !observation.evidence.is_empty() {
-        egui::CollapsingHeader::new("Evidence")
-            .id_salt((&observation.subject, &observation.check, &observation.summary, &observation.evidence))
-            .default_open(false).show(ui, |ui| {
-                for evidence in &observation.evidence { ui.weak(evidence); }
-            });
-    }
+    show_evidence(ui, &observation.evidence);
+    });
 
 });
                 }
@@ -1060,24 +968,22 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
         report.crawl_contacts.len(),
         report.crawl_skipped_urls.len()
     ));
+    let mut failures = BTreeMap::<&str, usize>::new();
+    for resource in &report.crawled_resources {
+        if let Some(error) = &resource.error { *failures.entry(error).or_default() += 1; }
+    }
+    for (error, count) in failures {
+        ui.colored_label(egui::Color32::LIGHT_RED, format!("{count} URL fetches failed: {error}"));
+    }
     for origin in &report.crawl_origins {
-        ui.separator();
-        ui.strong(format!(
-            "{}://{}:{} ({}) — {}/{} completed",
-            origin.scheme, origin.hostname, origin.port, origin.ip, origin.completed, origin.queued
-        ));
-        ui.weak(format!("Seed: {}", origin.seed_url));
-        for exclusion in &origin.robots_exclusions {
-            ui.weak(format!("robots.txt exclusion (informational): {exclusion}"));
-        }
-        for sitemap in &origin.sitemap_urls {
-            ui.weak(format!("Sitemap: {sitemap}"));
-        }
+        section_separator(ui);
+        ui.label(egui::RichText::new(format!("{}://{}:{} ({})", origin.scheme, origin.hostname, origin.port, origin.ip)).strong());
+        ui.label(format!("{}/{} completed", origin.completed, origin.queued));
     }
     let mut visible_resources = report.crawled_resources.iter().peekable();
     if visible_resources.peek().is_some() {
-        ui.separator();
-        ui.heading("Discovered URLs");
+        section_separator(ui);
+        disclosure(ui, "Discovered URLs", format!("Discovered URLs ({})", report.crawled_resources.len()), |_| {}, |ui| {
         for resource in visible_resources {
             let result = resource
                 .status
@@ -1111,10 +1017,11 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
                 ));
             }
         }
+        });
     }
     if !report.crawl_forms.is_empty() {
-        ui.separator();
-        ui.heading("Forms");
+        section_separator(ui);
+        disclosure(ui, "Forms", format!("Forms ({})", report.crawl_forms.len()), |_| {}, |ui| {
         for form in &report.crawl_forms {
             ui.label(format!(
                 "{} {} — source {}{}{}",
@@ -1129,13 +1036,15 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
                 if form.enqueued { " — GET queued" } else { "" }
             ));
         }
+        });
     }
     if !report.crawl_skipped_urls.is_empty() {
-        ui.separator();
-        ui.heading("Skipped URLs");
+        section_separator(ui);
+        disclosure(ui, "Skipped URLs", format!("Skipped URLs ({})", report.crawl_skipped_urls.len()), |_| {}, |ui| {
         for skipped in &report.crawl_skipped_urls {
             ui.weak(format!("{} — {}", skipped.url, skipped.reason));
         }
+        });
     }
 
 },
@@ -1160,21 +1069,20 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
         break 'inlined_show_external_sources;
     }
     ui.weak("Report-only; these URLs were not requested.");
-    egui::Grid::new("external_sources")
-        .striped(true)
-        .show(ui, |ui| {
-            ui.strong("Endpoint");
-            ui.strong("Called By");
-            ui.end_row();
-            for (endpoint, callers) in sources {
-                ui.add(egui::Label::new(endpoint).selectable(true));
-                ui.add(
-                    egui::Label::new(callers.into_iter().collect::<Vec<_>>().join(", "))
-                        .selectable(true),
-                );
-                ui.end_row();
+    ui.columns(2, |columns| {
+        columns[0].add(egui::Label::new(egui::RichText::new("External source").strong()).truncate());
+        columns[1].add(egui::Label::new(egui::RichText::new("Internal source").strong()).truncate());
+        for (endpoint, callers) in sources {
+            if let Some(caller) = callers.first() {
+                columns[0]
+                    .add(egui::Label::new(endpoint).truncate().selectable(true))
+                    .on_hover_text(endpoint);
+                columns[1]
+                    .add(egui::Label::new(*caller).truncate().selectable(true))
+                    .on_hover_text(*caller);
             }
-        });
+        }
+    });
 
 }
 },
@@ -1206,6 +1114,7 @@ let inlined_result: BTreeMap < & 'static str , LanguageDetection > = {
                 .or_insert(item.confidence);
             detection.evidence_urls.push(resource.url.clone());
             detection.evidence.extend(item.evidence.iter().cloned());
+            detection.observations.extend(item.observations.iter().cloned());
         }
     }
     for component in report
@@ -1254,10 +1163,13 @@ let (runtime,): (& str,) = (&component.name,);
             .evidence_urls
             .extend(component.evidence_urls.iter().cloned());
         detection.evidence.extend(component.evidence.iter().cloned());
+        detection.observations.extend(component.observations.iter().cloned());
     }
     for detection in languages.values_mut() {
         detection.evidence_urls.sort();
         detection.evidence_urls.dedup();
+        detection.observations.sort();
+        detection.observations.dedup();
         detection.evidence.sort();
         detection.evidence.dedup();
     }
@@ -1414,7 +1326,7 @@ inlined_result
 
 }
 });
-    ui.separator();
+    section_separator(ui);
     ui.heading("Web Technologies");
     let mut technologies =
         BTreeMap::<String, Vec<(&EndpointScan, &crate::WebTechnologyDetection)>>::new();
@@ -1439,9 +1351,14 @@ let (report,): (& ExposureScanReport,) = (report,);
     } else {
         for matches in technologies.into_values() {
             let name = &matches[0].1.name;
-            ui.separator();
-            ui.strong(name);
-            for (endpoint, technology) in matches {
+            section_separator(ui);
+            disclosure(ui, ("technology", name), egui::RichText::new(format!("{name} ({} observations)", matches.len())).strong(),
+                |ui| {
+                    let versions = matches.iter().map(|(_, technology)| technology.version.as_deref().unwrap_or("version not observed")).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(", ");
+                    ui.label(versions);
+                }, |ui| {
+            for (index, (endpoint, technology)) in matches.iter().enumerate() {
+                ui.push_id(index, |ui| {
                 ui.label(format!(
                     "{} — {} confidence — {}:{}",
                     technology
@@ -1460,39 +1377,13 @@ let (report,): (& ExposureScanReport,) = (report,);
                         technology.category_names.join(", ")
                     }
                 ));
-                ({
-let (ui, id_salt, evidence_urls, evidence,): (& mut egui :: Ui, _, & [String], & [String],) = (ui, (
-                        "web-technology-evidence",
-                        endpoint.ip,
-                        endpoint.port,
-                        &technology.name,
-                        &technology.version,
-                    ), &technology.evidence_urls, &technology.evidence,);
-'inlined_show_evidence_disclosure: {
-
-    let count = evidence_urls.len() + evidence.len();
-    if count == 0 {
-        break 'inlined_show_evidence_disclosure;
-    }
-
-    egui::CollapsingHeader::new(format!("Evidence ({count})"))
-        .id_salt(id_salt)
-        .default_open(false)
-        .show(ui, |ui| {
-            for url in evidence_urls {
-                ui.weak(format!("Evidence URL: {url}"));
+                show_technology_evidence(ui, ("web-technology-evidence", index), &technology.observations);
+                            });
             }
-            for item in evidence {
-                ui.weak(format!("Evidence: {item}"));
-            }
-        });
-
-}
-});
-            }
+            });
         }
     }
-    ui.separator();
+    section_separator(ui);
     ({
 let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
 'inlined_show_detected_language_file_types: {
@@ -1518,6 +1409,7 @@ let inlined_result: BTreeMap < & 'static str , LanguageDetection > = {
                 .or_insert(item.confidence);
             detection.evidence_urls.push(resource.url.clone());
             detection.evidence.extend(item.evidence.iter().cloned());
+            detection.observations.extend(item.observations.iter().cloned());
         }
     }
     for component in report
@@ -1566,10 +1458,13 @@ let (runtime,): (& str,) = (&component.name,);
             .evidence_urls
             .extend(component.evidence_urls.iter().cloned());
         detection.evidence.extend(component.evidence.iter().cloned());
+        detection.observations.extend(component.observations.iter().cloned());
     }
     for detection in languages.values_mut() {
         detection.evidence_urls.sort();
         detection.evidence_urls.dedup();
+        detection.observations.sort();
+        detection.observations.dedup();
         detection.evidence.sort();
         detection.evidence.dedup();
     }
@@ -1584,9 +1479,9 @@ inlined_result
     }
 
     for (language, detection) in detected {
-        ui.separator();
-        ui.strong(language);
-        ui.label(format!("{} confidence", detection.confidence));
+        section_separator(ui);
+        disclosure(ui, ("language", language), egui::RichText::new(format!("{language} ({} evidence items)", detection.observations.len())).strong(),
+            |ui| { ui.label(format!("{} confidence", detection.confidence)); }, |ui| {
         ui.weak({
 let (detection,): (& LanguageDetection,) = (&detection,);
 let inlined_result: String = {
@@ -1616,34 +1511,13 @@ let inlined_result: String = {
 };
 inlined_result
 });
-        ({
-let (ui, id_salt, evidence_urls, evidence,): (& mut egui :: Ui, _, & [String], & [String],) = (ui, ("language-file-type-evidence", language), &detection.evidence_urls, &detection.evidence,);
-'inlined_show_evidence_disclosure: {
-
-    let count = evidence_urls.len() + evidence.len();
-    if count == 0 {
-        break 'inlined_show_evidence_disclosure;
-    }
-
-    egui::CollapsingHeader::new(format!("Evidence ({count})"))
-        .id_salt(id_salt)
-        .default_open(false)
-        .show(ui, |ui| {
-            for url in evidence_urls {
-                ui.weak(format!("Evidence URL: {url}"));
-            }
-            for item in evidence {
-                ui.weak(format!("Evidence: {item}"));
-            }
+        show_technology_evidence(ui, ("language-file-type-evidence", language), &detection.observations);
         });
-
-}
-});
     }
 
 }
 });
-    ui.separator();
+    section_separator(ui);
     ui.heading("Servers, Frameworks, Plugins, Runtimes, and Packages");
     let observations = report
         .endpoints
@@ -1656,88 +1530,60 @@ let (ui, id_salt, evidence_urls, evidence,): (& mut egui :: Ui, _, & [String], &
                 .map(move |component| (endpoint, component))
         })
         .collect::<Vec<_>>();
-    let mut packages = BTreeMap::<_, BTreeMap<Option<&str>, Vec<usize>>>::new();
+    let mut components = BTreeMap::<_, Vec<usize>>::new();
     for (index, (_, component)) in observations.iter().enumerate() {
-        if component.kind == TechnologyComponentKind::Package {
-            let key = (
-                component.ecosystem,
-                component.package_identifier.as_deref().unwrap_or(&component.name),
-            );
-            packages
-                .entry(key)
-                .or_default()
-                .entry(component.installed_version.as_deref())
-                .or_default()
-                .push(index);
-        }
+        components.entry((component.ecosystem, component.kind, component.package_identifier.as_deref().unwrap_or(&component.name))).or_default().push(index);
     }
-    for (index, (endpoint, component)) in observations.iter().enumerate() {
-        let key = (
-            component.ecosystem,
-            component.package_identifier.as_deref().unwrap_or(&component.name),
-        );
-        if let Some(versions) = packages
-            .get(&key)
-            .filter(|versions| component.kind == TechnologyComponentKind::Package && versions.len() > 1)
-        {
-            if versions.values().map(|indices| indices[0]).min() != Some(index) {
-                continue;
-            }
-            let mut versions = versions.iter().collect::<Vec<_>>();
-            versions.sort_by_key(|(_, indices)| indices[0]);
-            let label = versions
-                .iter()
-                .map(|(version, _)| version.unwrap_or("version not observed"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            ui.separator();
-            egui::CollapsingHeader::new(
-                egui::RichText::new(format!("{} — {label}", component.name)).strong(),
-            )
-            .id_salt(("technology-package-versions", key))
-            .default_open(false)
-            .show(ui, |ui| {
-                for (version, indices) in versions {
-                    ui.separator();
-                    ui.strong(version.unwrap_or("version not observed"));
-                    for &observation_index in indices {
-                        let (endpoint, component) = observations[observation_index];
-                        ui.push_id(observation_index, |ui| {
-                            show_technology_component_details(ui, endpoint, component);
-                        });
-                    }
+    for (key, indices) in components {
+        let component = observations[indices[0]].1;
+        let versions = indices.iter().map(|&index| { let component = observations[index].1; format!("{} — {}", component.installed_version.as_deref().unwrap_or("version not observed"), component.status) }).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(", ");
+        section_separator(ui);
+        disclosure(ui, ("component", key), egui::RichText::new(format!("{} ({} observations)", component.name, indices.len())).strong(),
+            |ui| {
+                ui.label(&versions);
+                let errors = indices.iter().filter_map(|&index| observations[index].1.check_error.as_deref()).collect::<BTreeSet<_>>();
+                for error in errors { ui.weak(format!("Version check: {error}")); }
+            }, |ui| {
+                for &index in &indices {
+                    let (endpoint, component) = observations[index];
+                    ui.push_id(index, |ui| { show_technology_component_details(ui, endpoint, component); });
                 }
             });
-        } else {
-            ui.separator();
-            ui.strong(&component.name);
-            ui.push_id(index, |ui| {
-                show_technology_component_details(ui, endpoint, component);
-            });
-        }
     }
     if observations.is_empty() {
         ui.weak("No servers, frameworks, plugins, runtimes, or packages were identified.");
     }
-    ui.separator();
+    section_separator(ui);
     ui.heading("JavaScript Sources");
-    let mut found = false;
-    for endpoint in {
-let (report,): (& ExposureScanReport,) = (report,);
-
-    report
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.state == PortState::Open)
-
-} {
+    let mut sources = BTreeMap::<&str, Vec<_>>::new();
+    for endpoint in report.endpoints.iter().filter(|endpoint| endpoint.state == PortState::Open) {
         for source in &endpoint.javascript_sources {
-            found = true;
-            ui.separator();
-            egui::CollapsingHeader::new(egui::RichText::new(&source.source_url).strong())
-                .id_salt((endpoint.ip, endpoint.port, &source.source_url))
-                .default_open(false)
-                .show(ui, |ui| {
+            sources.entry(&source.source_url).or_default().push((endpoint, source));
+        }
+    }
+    let found = !sources.is_empty();
+    for (url, observations) in sources {
+        disclosure(ui, ("javascript-source", url), egui::RichText::new(format!("{url} ({} observations)", observations.len())).strong(),
+            |ui| {
+                let versions = observations.iter().flat_map(|(_, source)| &source.libraries).map(|library| format!("{} {} — {}", library.name, library.installed_version.as_deref().unwrap_or("version unknown"), library.status)).collect::<BTreeSet<_>>();
+                if versions.is_empty() { ui.weak("No library versions identified."); }
+                for version in versions { ui.label(version); }
+                let outcomes = observations.iter().map(|(_, source)| format!("HTTP {} — {} bytes{}", source.http_status.map(|status| status.to_string()).unwrap_or_else(|| "not captured".to_owned()), source.captured_size, if source.truncated { " (truncated)" } else { "" })).collect::<BTreeSet<_>>();
+                for outcome in outcomes { ui.weak(outcome); }
+                for (endpoint, source) in &observations {
+                    if let Some(error) = &source.retrieval_error { ui.colored_label(egui::Color32::YELLOW, format!("{}:{} — Retrieval: {error}", endpoint.ip, endpoint.port)); }
+                    if let Some(error) = &source.analysis_error { ui.colored_label(egui::Color32::YELLOW, format!("{}:{} — Analysis: {error}", endpoint.ip, endpoint.port)); }
+                }
+            }, |ui| {
+        for (endpoint, source) in &observations {
+            section_separator(ui);
+            disclosure(ui, (endpoint.ip, endpoint.port, &source.source_url), egui::RichText::new(format!("{}:{} ({} libraries)", endpoint.ip, endpoint.port, source.libraries.len())).strong(),
+                |ui| {
+                    ui.label(format!("{}:{} — {} bytes{}", endpoint.ip, endpoint.port, source.captured_size, if source.truncated { " (truncated)" } else { "" }));
+                    if let Some(status) = source.http_status { ui.label(format!("HTTP {status}")); }
+                    if let Some(error) = &source.retrieval_error { ui.colored_label(egui::Color32::YELLOW, format!("Retrieval: {error}")); }
+                    if let Some(error) = &source.analysis_error { ui.colored_label(egui::Color32::YELLOW, format!("Analysis: {error}")); }
+                }, |ui| {
                     ui.weak(format!("Endpoint: {}:{}", endpoint.ip, endpoint.port));
                     if let Some(final_url) = source
                         .final_url
@@ -1781,43 +1627,14 @@ let (report,): (& ExposureScanReport,) = (report,);
                         if let Some(package) = &library.npm_package {
                             ui.weak(format!("npm package: {package}"));
                         }
-                        ({
-let (ui, id_salt, evidence_urls, evidence,): (& mut egui :: Ui, _, & [String], & [String],) = (ui, (
-                                "javascript-library-evidence",
-                                endpoint.ip,
-                                endpoint.port,
-                                &source.source_url,
-                                &library.name,
-                                &library.npm_package,
-                                &library.installed_version,
-                            ), &[], &library.evidence,);
-'inlined_show_evidence_disclosure: {
-
-    let count = evidence_urls.len() + evidence.len();
-    if count == 0 {
-        break 'inlined_show_evidence_disclosure;
-    }
-
-    egui::CollapsingHeader::new(format!("Evidence ({count})"))
-        .id_salt(id_salt)
-        .default_open(false)
-        .show(ui, |ui| {
-            for url in evidence_urls {
-                ui.weak(format!("Evidence URL: {url}"));
-            }
-            for item in evidence {
-                ui.weak(format!("Evidence: {item}"));
-            }
-        });
-
-}
-});
+                        show_technology_evidence(ui, ("javascript-library-evidence", &library.name, &library.npm_package, &library.installed_version), &library.observations);
                         if let Some(error) = &library.check_error {
                             ui.weak(format!("Version check: {error}"));
                         }
                     }
                 });
         }
+            });
     }
     if !found {
         ui.weak("No HTTP(S) script sources were discovered on root pages or during crawling.");
@@ -1856,6 +1673,7 @@ inlined_result
             .entry(title)
             .or_insert_with(|| ConfirmedFindingGroup {
                 title,
+                members: Vec::new(),
                 description: if title == "Cookie security attributes are missing" {
                     "Session-like or security-sensitive cookies omit applicable browser protections"
                 } else {
@@ -1865,6 +1683,7 @@ inlined_result
                 collapsed,
             });
         group.collapsed &= collapsed;
+        group.members.push(finding);
         let endpoint = group.endpoints.entry(finding.ip).or_default();
         endpoint
             .ports
@@ -1876,6 +1695,7 @@ inlined_result
             .extend(finding.evidence.iter().map(String::as_str));
     }
     let mut groups = groups.into_values().collect::<Vec<_>>();
+    groups.sort_by(|left, right| left.title.cmp(right.title));
     for group in &mut groups {
         for endpoint in group.endpoints.values_mut() {
             endpoint.evidence.sort();
@@ -1895,7 +1715,7 @@ inlined_result
         .iter()
         .filter(|finding| !finding.collapsed)
         .collect::<Vec<_>>();
-    ui.separator();
+    section_separator(ui);
     ui.heading(format!("Confirmed Findings ({})", grouped_findings.len()));
     if grouped_findings.is_empty() {
         ui.weak("No confirmed security findings were observed by the bounded checks.");
@@ -1906,9 +1726,11 @@ inlined_result
             ({
 let (ui, finding, checks,): (& mut egui :: Ui, & ConfirmedFindingGroup < '_ >, & [crate :: SecurityCheckResult],) = (ui, finding, &report.security_checks,);
 
-    ui.separator();
-    ui.strong(finding.title);
-    ui.label(finding.description);
+    section_separator(ui);
+    ui.push_id(("finding", finding.title), |ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.add(egui::Label::new(finding_heading(finding)).wrap());
+        ui.indent("summary", |ui| { show_finding_summary(ui, finding); });
     let count = finding.endpoints.len();
     let endpoint_label = if count == 1 { "endpoint" } else { "endpoints" };
     egui::CollapsingHeader::new(format!("Evidence ({count} {endpoint_label})"))
@@ -1917,7 +1739,7 @@ let (ui, finding, checks,): (& mut egui :: Ui, & ConfirmedFindingGroup < '_ >, &
         .show(ui, |ui| {
             for (index, (ip, endpoint)) in finding.endpoints.iter().enumerate() {
                 if index > 0 {
-                    ui.separator();
+                    section_separator(ui);
                 }
                 ui.label({
 let (ip, endpoint,): (std :: net :: IpAddr, & ConfirmedFindingEndpoint < '_ >,) = (*ip, endpoint,);
@@ -2050,7 +1872,6 @@ let (left, right,): (& crate :: SecurityCheckResult, & crate :: SecurityCheckRes
     left.check_id == right.check_id
         && left.class == right.class
         && left.title == right.title
-        && left.severity == right.severity
         && left.confidence == right.confidence
         && left.outcome == right.outcome
         && left.probe_url == right.probe_url
@@ -2087,11 +1908,12 @@ inlined_result
 let (ui, group,): (& mut egui :: Ui, & SecurityCheckGroup < '_ >,) = (ui, &group,);
 
     let check = group.check;
-    ui.separator();
-    ui.strong(format!(
-        "{} — {} — {}",
-        check.outcome, check.title, check.class
-    ));
+    section_separator(ui);
+    disclosure(ui, ("security-check", &group.endpoints, &check.check_id, &check.title, &check.probe_url, &check.evidence, &check.reason, check.class.to_string(), check.outcome.to_string(), check.confidence.to_string(), &check.request_evidence),
+        egui::RichText::new(format!("{} — {} — {}", check.outcome, check.title, check.class)).strong(),
+        |ui| { ui.label(format!("Confidence: {}", check.confidence));
+            if let Some(reason) = &check.reason { ui.weak(reason); }
+        }, |ui| {
     if group.endpoints.len() == 1
         && group
             .endpoints
@@ -2100,8 +1922,8 @@ let (ui, group,): (& mut egui :: Ui, & SecurityCheckGroup < '_ >,) = (ui, &group
             .is_some_and(|ports| ports.len() == 1)
     {
         ui.label(format!(
-            "Endpoint: {}:{} • Severity: {} • Confidence: {} • ID: {}",
-            check.ip, check.port, check.severity, check.confidence, check.check_id
+            "Endpoint: {}:{} • Confidence: {} • ID: {}",
+            check.ip, check.port, check.confidence, check.check_id
         ));
     } else {
         ui.label(format!(
@@ -2129,34 +1951,28 @@ inlined_result
 })
         ));
         ui.label(format!(
-            "Severity: {} • Confidence: {} • ID: {}",
-            check.severity, check.confidence, check.check_id
+            "Confidence: {} • ID: {}",
+            check.confidence, check.check_id
         ));
     }
     if let Some(url) = &check.probe_url {
-        ui.label(format!("Probe URL: {url}"));
+        ui.label(format!("Probe URL: {}", crate::exposure::finding_assessment::safe_evidence(url)));
     }
     if let Some(request) = &check.request_evidence {
-        ui.weak(format!("Request: {request}"));
+        ui.weak(format!("Request: {}", crate::exposure::finding_assessment::safe_evidence(request)));
     }
-    for evidence in &check.evidence {
-        ui.weak(format!("Evidence: {evidence}"));
-    }
-    if let Some(reason) = &check.reason {
-        ui.weak(format!("Qualification: {reason}"));
-    }
+    show_evidence(ui, &check.evidence.iter().map(|value| crate::exposure::finding_assessment::safe_evidence(value)).collect::<Vec<_>>());
+    });
 
 });
             }
-            if finding.title == "TLS certificate chain or key weakness" {
-                ui.weak("Remediation: Serve a complete, correctly ordered leaf and intermediate certificate chain with server-auth usage; reissue weak certificates using SHA-256 or stronger signatures and at least RSA-2048 or ECDSA P-256 keys.");
-            }
         });
+    });
 
 });
         }
     }
-    ui.separator();
+    section_separator(ui);
     ({
 let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
 'inlined_show_dns: {
@@ -2183,21 +1999,14 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
             ({
 let (ui, observation,): (& mut egui :: Ui, & crate :: DnsObservation,) = (ui, observation,);
 
-    ui.separator();
-    ui.strong(format!(
-        "{} — {} — {}",
-        observation.subject, observation.check, observation.status
-    ));
-    ui.label(&observation.summary);
+    section_separator(ui);
+    disclosure(ui, ("dns-check", &observation.subject, &observation.check, &observation.summary, observation.status.to_string()),
+        egui::RichText::new(format!("{} — {} — {}", observation.subject, observation.check, observation.status)).strong(),
+        |ui| { ui.label(&observation.summary); }, |ui| {
     ui.label(format!("Impact: {}", observation.impact));
     ui.label(format!("Recommended fix: {}", observation.remediation));
-    if !observation.evidence.is_empty() {
-        egui::CollapsingHeader::new("Evidence")
-            .id_salt((&observation.subject, &observation.check, &observation.summary, &observation.evidence))
-            .default_open(false).show(ui, |ui| {
-                for evidence in &observation.evidence { ui.weak(evidence); }
-            });
-    }
+    show_evidence(ui, &observation.evidence);
+    });
 
 });
         }
@@ -2210,21 +2019,14 @@ let (ui, observation,): (& mut egui :: Ui, & crate :: DnsObservation,) = (ui, ob
                     ({
 let (ui, observation,): (& mut egui :: Ui, & crate :: DnsObservation,) = (ui, observation,);
 
-    ui.separator();
-    ui.strong(format!(
-        "{} — {} — {}",
-        observation.subject, observation.check, observation.status
-    ));
-    ui.label(&observation.summary);
+    section_separator(ui);
+    disclosure(ui, ("dns-check", &observation.subject, &observation.check, &observation.summary, observation.status.to_string()),
+        egui::RichText::new(format!("{} — {} — {}", observation.subject, observation.check, observation.status)).strong(),
+        |ui| { ui.label(&observation.summary); }, |ui| {
     ui.label(format!("Impact: {}", observation.impact));
     ui.label(format!("Recommended fix: {}", observation.remediation));
-    if !observation.evidence.is_empty() {
-        egui::CollapsingHeader::new("Evidence")
-            .id_salt((&observation.subject, &observation.check, &observation.summary, &observation.evidence))
-            .default_open(false).show(ui, |ui| {
-                for evidence in &observation.evidence { ui.weak(evidence); }
-            });
-    }
+    show_evidence(ui, &observation.evidence);
+    });
 
 });
                 }
@@ -2247,7 +2049,7 @@ let (report,): (& ExposureScanReport,) = (report,);
         .collect::<Vec<_>>();
     exposed_services.sort_by(|left, right| left.ip.cmp(&right.ip).then(left.port.cmp(&right.port)));
     if !exposed_services.is_empty() {
-        ui.separator();
+        section_separator(ui);
         egui::CollapsingHeader::new(format!(
             "Publicly Exposed Services ({})",
             exposed_services.len()
@@ -2320,45 +2122,44 @@ let (report,): (& ExposureScanReport,) = (report,);
         })
         .collect::<Vec<_>>();
     if !surfaces.is_empty() || !crawl_surfaces.is_empty() {
-        ui.separator();
-        ui.heading(format!(
+        section_separator(ui);
+        egui::CollapsingHeader::new(format!(
             "Observed Web Surfaces ({})",
             surfaces.len() + crawl_surfaces.len()
-        ));
-        for (endpoint, surface) in surfaces {
-            ui.strong(format!(
-                "{} {} — {} — HTTP {} — {} confidence",
-                surface.technology,
-                surface.surface_type,
-                surface.url,
-                surface.status,
-                surface.confidence
-            ));
-            ui.weak(format!(
-                "Scanned endpoint: {}:{}",
-                endpoint.ip, endpoint.port
-            ));
-            for evidence in &surface.evidence {
-                ui.weak(format!("Evidence: {evidence}"));
+        ))
+        .default_open(false)
+        .show(ui, |ui| {
+            for (endpoint, surface) in surfaces {
+                evidence_item(ui, (endpoint.ip, endpoint.port, &surface.url, surface.surface_type), format!(
+                    "{} {} — {} — HTTP {} — {} confidence",
+                    surface.technology,
+                    surface.surface_type,
+                    surface.url,
+                    surface.status,
+                    surface.confidence
+                ), |ui| {
+                ui.weak(format!(
+                    "Scanned endpoint: {}:{}",
+                    endpoint.ip, endpoint.port
+                ));
+                }, &surface.evidence);
             }
-        }
-        for surface in crawl_surfaces {
-            ui.strong(format!(
-                "{} — {} — HTTP {} — {} confidence",
-                surface.surface_type, surface.url, surface.status, surface.confidence
-            ));
-            ui.weak(format!(
-                "Scanned endpoint: {}:{} — anonymous crawl observation",
-                surface.ip, surface.port
-            ));
-            for evidence in &surface.evidence {
-                ui.weak(format!("Evidence: {evidence}"));
+            for surface in crawl_surfaces {
+                evidence_item(ui, (surface.ip, surface.port, &surface.url, surface.surface_type), format!(
+                    "{} — {} — HTTP {} — {} confidence",
+                    surface.surface_type, surface.url, surface.status, surface.confidence
+                ), |ui| {
+                ui.weak(format!(
+                    "Scanned endpoint: {}:{} — anonymous crawl observation",
+                    surface.ip, surface.port
+                ));
+                }, &surface.evidence);
             }
-        }
+        });
     }
 
     if !report.crawl_contacts.is_empty() {
-        ui.separator();
+        section_separator(ui);
         egui::CollapsingHeader::new(format!("Public Contacts ({})", report.crawl_contacts.len()))
             .default_open(false)
             .show(ui, |ui| {
@@ -2407,7 +2208,6 @@ let (left, right,): (& crate :: SecurityCheckResult, & crate :: SecurityCheckRes
     left.check_id == right.check_id
         && left.class == right.class
         && left.title == right.title
-        && left.severity == right.severity
         && left.confidence == right.confidence
         && left.outcome == right.outcome
         && left.probe_url == right.probe_url
@@ -2439,23 +2239,24 @@ inlined_result
     if grouped_checks.is_empty() {
         break 'inlined_show_checks_needing_verification;
     }
-    ui.separator();
+    section_separator(ui);
     ui.heading(format!("Needs Verification ({})", grouped_checks.len()));
     ui.weak("Potential issues that have not been confirmed.");
     egui::CollapsingHeader::new("Check details")
         .id_salt("security_checks_needing_verification")
-        .default_open(true)
+        .default_open(false)
         .show(ui, |ui| {
             for group in grouped_checks {
                 ({
 let (ui, group,): (& mut egui :: Ui, & SecurityCheckGroup < '_ >,) = (ui, &group,);
 
     let check = group.check;
-    ui.separator();
-    ui.strong(format!(
-        "{} — {} — {}",
-        check.outcome, check.title, check.class
-    ));
+    section_separator(ui);
+    disclosure(ui, ("security-check", &group.endpoints, &check.check_id, &check.title, &check.probe_url, &check.evidence, &check.reason, check.class.to_string(), check.outcome.to_string(), check.confidence.to_string(), &check.request_evidence),
+        egui::RichText::new(format!("{} — {} — {}", check.outcome, check.title, check.class)).strong(),
+        |ui| { ui.label(format!("Confidence: {}", check.confidence));
+            if let Some(reason) = &check.reason { ui.weak(reason); }
+        }, |ui| {
     if group.endpoints.len() == 1
         && group
             .endpoints
@@ -2464,8 +2265,8 @@ let (ui, group,): (& mut egui :: Ui, & SecurityCheckGroup < '_ >,) = (ui, &group
             .is_some_and(|ports| ports.len() == 1)
     {
         ui.label(format!(
-            "Endpoint: {}:{} • Severity: {} • Confidence: {} • ID: {}",
-            check.ip, check.port, check.severity, check.confidence, check.check_id
+            "Endpoint: {}:{} • Confidence: {} • ID: {}",
+            check.ip, check.port, check.confidence, check.check_id
         ));
     } else {
         ui.label(format!(
@@ -2493,22 +2294,18 @@ inlined_result
 })
         ));
         ui.label(format!(
-            "Severity: {} • Confidence: {} • ID: {}",
-            check.severity, check.confidence, check.check_id
+            "Confidence: {} • ID: {}",
+            check.confidence, check.check_id
         ));
     }
     if let Some(url) = &check.probe_url {
-        ui.label(format!("Probe URL: {url}"));
+        ui.label(format!("Probe URL: {}", crate::exposure::finding_assessment::safe_evidence(url)));
     }
     if let Some(request) = &check.request_evidence {
-        ui.weak(format!("Request: {request}"));
+        ui.weak(format!("Request: {}", crate::exposure::finding_assessment::safe_evidence(request)));
     }
-    for evidence in &check.evidence {
-        ui.weak(format!("Evidence: {evidence}"));
-    }
-    if let Some(reason) = &check.reason {
-        ui.weak(format!("Qualification: {reason}"));
-    }
+    show_evidence(ui, &check.evidence.iter().map(|value| crate::exposure::finding_assessment::safe_evidence(value)).collect::<Vec<_>>());
+    });
 
 });
             }
@@ -2518,7 +2315,7 @@ inlined_result
 });
 
     if !collapsed_findings.is_empty() {
-        ui.separator();
+        section_separator(ui);
         egui::CollapsingHeader::new(format!(
             "Outdated Components ({})",
             collapsed_findings.len()
@@ -2529,9 +2326,11 @@ inlined_result
                 ({
 let (ui, finding, checks,): (& mut egui :: Ui, & ConfirmedFindingGroup < '_ >, & [crate :: SecurityCheckResult],) = (ui, finding, &report.security_checks,);
 
-    ui.separator();
-    ui.strong(finding.title);
-    ui.label(finding.description);
+    section_separator(ui);
+    ui.push_id(("finding", finding.title), |ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.add(egui::Label::new(finding_heading(finding)).wrap());
+        ui.indent("summary", |ui| { show_finding_summary(ui, finding); });
     let count = finding.endpoints.len();
     let endpoint_label = if count == 1 { "endpoint" } else { "endpoints" };
     egui::CollapsingHeader::new(format!("Evidence ({count} {endpoint_label})"))
@@ -2540,7 +2339,7 @@ let (ui, finding, checks,): (& mut egui :: Ui, & ConfirmedFindingGroup < '_ >, &
         .show(ui, |ui| {
             for (index, (ip, endpoint)) in finding.endpoints.iter().enumerate() {
                 if index > 0 {
-                    ui.separator();
+                    section_separator(ui);
                 }
                 ui.label({
 let (ip, endpoint,): (std :: net :: IpAddr, & ConfirmedFindingEndpoint < '_ >,) = (*ip, endpoint,);
@@ -2673,7 +2472,6 @@ let (left, right,): (& crate :: SecurityCheckResult, & crate :: SecurityCheckRes
     left.check_id == right.check_id
         && left.class == right.class
         && left.title == right.title
-        && left.severity == right.severity
         && left.confidence == right.confidence
         && left.outcome == right.outcome
         && left.probe_url == right.probe_url
@@ -2710,11 +2508,12 @@ inlined_result
 let (ui, group,): (& mut egui :: Ui, & SecurityCheckGroup < '_ >,) = (ui, &group,);
 
     let check = group.check;
-    ui.separator();
-    ui.strong(format!(
-        "{} — {} — {}",
-        check.outcome, check.title, check.class
-    ));
+    section_separator(ui);
+    disclosure(ui, ("security-check", &group.endpoints, &check.check_id, &check.title, &check.probe_url, &check.evidence, &check.reason, check.class.to_string(), check.outcome.to_string(), check.confidence.to_string(), &check.request_evidence),
+        egui::RichText::new(format!("{} — {} — {}", check.outcome, check.title, check.class)).strong(),
+        |ui| { ui.label(format!("Confidence: {}", check.confidence));
+            if let Some(reason) = &check.reason { ui.weak(reason); }
+        }, |ui| {
     if group.endpoints.len() == 1
         && group
             .endpoints
@@ -2723,8 +2522,8 @@ let (ui, group,): (& mut egui :: Ui, & SecurityCheckGroup < '_ >,) = (ui, &group
             .is_some_and(|ports| ports.len() == 1)
     {
         ui.label(format!(
-            "Endpoint: {}:{} • Severity: {} • Confidence: {} • ID: {}",
-            check.ip, check.port, check.severity, check.confidence, check.check_id
+            "Endpoint: {}:{} • Confidence: {} • ID: {}",
+            check.ip, check.port, check.confidence, check.check_id
         ));
     } else {
         ui.label(format!(
@@ -2752,29 +2551,23 @@ inlined_result
 })
         ));
         ui.label(format!(
-            "Severity: {} • Confidence: {} • ID: {}",
-            check.severity, check.confidence, check.check_id
+            "Confidence: {} • ID: {}",
+            check.confidence, check.check_id
         ));
     }
     if let Some(url) = &check.probe_url {
-        ui.label(format!("Probe URL: {url}"));
+        ui.label(format!("Probe URL: {}", crate::exposure::finding_assessment::safe_evidence(url)));
     }
     if let Some(request) = &check.request_evidence {
-        ui.weak(format!("Request: {request}"));
+        ui.weak(format!("Request: {}", crate::exposure::finding_assessment::safe_evidence(request)));
     }
-    for evidence in &check.evidence {
-        ui.weak(format!("Evidence: {evidence}"));
-    }
-    if let Some(reason) = &check.reason {
-        ui.weak(format!("Qualification: {reason}"));
-    }
+    show_evidence(ui, &check.evidence.iter().map(|value| crate::exposure::finding_assessment::safe_evidence(value)).collect::<Vec<_>>());
+    });
 
 });
             }
-            if finding.title == "TLS certificate chain or key weakness" {
-                ui.weak("Remediation: Serve a complete, correctly ordered leaf and intermediate certificate chain with server-auth usage; reissue weak certificates using SHA-256 or stronger signatures and at least RSA-2048 or ECDSA P-256 keys.");
-            }
         });
+    });
 
 });
             }
@@ -2782,6 +2575,8 @@ inlined_result
     }
 
 },
+        }
+    });
     });
 }
 
@@ -2792,8 +2587,38 @@ struct DiagnosticProduct {
     details: BTreeSet<String>,
 }
 
+fn finding_heading(finding: &ConfirmedFindingGroup<'_>) -> egui::RichText {
+    egui::RichText::new(finding.title).strong()
+}
+
+fn show_finding_summary(ui: &mut egui::Ui, finding: &ConfirmedFindingGroup<'_>) {
+    let mut causes = BTreeMap::<&str, BTreeSet<String>>::new();
+    for member in &finding.members {
+        for detail in &member.details {
+            let location = &detail.location;
+            let mut label = format!("{} — {} port {}", member.ip, member.transport, member.port);
+            if let Some(url) = &location.url {
+                label.push_str(" — ");
+                if let Some(method) = &location.method { label.push_str(method); label.push(' '); }
+                label.push_str(url);
+            }
+            if let Some(subject) = &location.subject { label.push_str(" — "); label.push_str(subject); }
+            causes.entry(&detail.cause).or_default().insert(label);
+        }
+    }
+    if causes.is_empty() { ui.label(format!("Cause: {}", finding.description)); }
+    for (cause, locations) in causes {
+        ui.label(format!("Cause: {cause}"));
+        egui::CollapsingHeader::new(format!("Affected locations ({})", locations.len()))
+            .id_salt(("finding_locations", finding.title, cause))
+            .default_open(false)
+            .show(ui, |ui| { for location in locations { ui.label(location); } });
+    }
+}
+
 struct ConfirmedFindingGroup<'a> {
     title: &'a str,
+    members: Vec<&'a ExposureFinding>,
     description: &'a str,
     endpoints: BTreeMap<std::net::IpAddr, ConfirmedFindingEndpoint<'a>>,
     collapsed: bool,
@@ -2807,6 +2632,7 @@ struct ConfirmedFindingEndpoint<'a> {
 
 #[derive(Default)]
 struct LanguageDetection {
+    observations: Vec<crate::TechnologyEvidence>,
     confidence: Confidence,
     runtime_confidence: Confidence,
     file_types: BTreeMap<crate::TechnologyFileType, Confidence>,
@@ -2817,4 +2643,35 @@ struct LanguageDetection {
 struct SecurityCheckGroup<'a> {
     check: &'a crate::SecurityCheckResult,
     endpoints: BTreeMap<std::net::IpAddr, BTreeSet<u16>>,
+}
+
+fn show_technology_evidence(ui: &mut egui::Ui, id: impl std::hash::Hash, records: &[crate::TechnologyEvidence]) {
+    egui::CollapsingHeader::new(format!("Evidence ({})", records.len()))
+        .id_salt(id)
+        .show(ui, |ui| {
+            if records.is_empty() {
+                ui.weak("Detection details unavailable in this capture.");
+            }
+            for (index, record) in records.iter().enumerate() {
+                if index > 0 { section_separator(ui); }
+                ui.strong(&record.match_source);
+                let mut value = |label: &str, text: &str| {
+                    ui.label(label);
+                    ui.add(egui::Label::new(text).selectable(true).wrap());
+                };
+                value("Source URL", if record.source_url.is_empty() { "Unavailable" } else { &record.source_url });
+                value("Endpoint", record.endpoint.as_deref().unwrap_or("Unavailable"));
+                value("Request method", record.method.as_deref().unwrap_or("Unavailable"));
+                value("HTTP status", &record.status.map(|status| status.to_string()).unwrap_or_else(|| "Unavailable".to_owned()));
+                if let Some(parent) = &record.supporting_detection {
+                    value("Inferred / supported by", parent);
+                }
+                value("Observed value", record.observed_value.as_deref().unwrap_or("Match details unavailable in this capture"));
+                if let Some(version) = &record.extracted_version {
+                    value(if record.supporting_detection.is_some() { "Supporting observation version" } else { "Extracted version / manifest constraint" }, version);
+                }
+                if record.excerpt_shortened { ui.weak("Excerpt shortened; only relevant context shown."); }
+                if record.capture_truncated { ui.weak("Response capture truncated."); }
+            }
+        });
 }

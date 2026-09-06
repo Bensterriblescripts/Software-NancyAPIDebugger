@@ -5,7 +5,7 @@ use sha2::Digest;
 pub(super) async fn resolution(hostname: &str, collector: &Collector<'_>) -> Vec<DnsObservation> {
     let (a, aaaa) = collector.address_sets(hostname).await;
     let mut out = mail::destination_findings(hostname, "Resolution", &a, &aaaa);
-    if (a.nxdomain || aaaa.nxdomain) && a.addresses().is_empty() && aaaa.addresses().is_empty() {
+    if (a.nxdomain || aaaa.nxdomain) && a.absent() && aaaa.absent() {
         out.push(finding(
             hostname,
             "Resolution existence",
@@ -47,8 +47,8 @@ pub(super) async fn resolution(hostname: &str, collector: &Collector<'_>) -> Vec
     if (!a.aliases.is_empty() || !aaaa.aliases.is_empty())
         && a.addresses().is_empty()
         && aaaa.addresses().is_empty()
-        && a.error.is_none()
-        && aaaa.error.is_none()
+        && a.absent()
+        && aaaa.absent()
     {
         out.push(finding(hostname, "Broken CNAME destination", Error, "CNAME chain has no address destination", "Clients cannot reach the target through the published alias chain; takeover exploitability was not tested.", "Restore the destination or remove the obsolete CNAME.", a.evidence().into_iter().chain(aaaa.evidence()).collect()));
     }

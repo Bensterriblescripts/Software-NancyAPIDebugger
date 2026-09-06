@@ -25,7 +25,7 @@ pub(super) async fn discover_assets(
     cancel: &CancellationToken,
     limiter: Arc<ConnectionRateLimiter>,
     progress: &Option<Sender<ExposureScanProgress>>,
-) -> (Vec<DiscoveredAsset>, Vec<String>) {
+) -> (Vec<DiscoveredAsset>, Vec<String>, DiscoveryCoverage) {
     send_phase_progress(
         progress,
         ExposureScanPhase::AssetDiscovery,
@@ -41,13 +41,13 @@ pub(super) async fn discover_assets(
             1.0,
             "Asset discovery unavailable",
         );
-        return (
-            Vec::new(),
-            vec![
-                "CT asset discovery was disabled because the target has no valid registrable domain boundary"
-                    .to_owned(),
-            ],
-        );
+        let coverage = DiscoveryCoverage {
+            status: DiscoveryCoverageStatus::Unavailable,
+            detail: "Target has no valid registrable domain boundary".to_owned(),
+            ..Default::default()
+        };
+        publish_coverage(progress, &coverage);
+        return (Vec::new(), vec![coverage.summary()], coverage);
     };
     let names = match {
         let (domain, request, cancel, limiter): (
@@ -101,15 +101,7 @@ pub(super) async fn discover_assets(
                     Ok(response) if response.status == 200 && !response.body_truncated => {
                         match serde_json::from_slice::<Vec<CtEntry>>(&response.body) {
                             Ok(entries) => {
-                                let mut names = entries
-                                    .iter()
-                                    .flat_map(|entry| entry.name_value.lines())
-                                    .filter_map(normalize_ct_name)
-                                    .filter(|name| within_domain(name, domain))
-                                    .collect::<Vec<_>>();
-                                names.sort();
-                                names.dedup();
-                                names.truncate(request.ct_hostname_limit);
+                                let names = eligible_ct_names(&entries, domain);
                                 return Ok(names);
                             }
                             Err(error) => format!("returned invalid JSON: {error}"),
@@ -149,12 +141,39 @@ pub(super) async fn discover_assets(
                 1.0,
                 "CT provider unavailable",
             );
-            return (
-                Vec::new(),
-                vec![format!("CT asset discovery was nonfatal: {error}")],
-            );
+            let coverage = DiscoveryCoverage {
+                status: if cancel.is_cancelled() {
+                    DiscoveryCoverageStatus::Cancelled
+                } else {
+                    DiscoveryCoverageStatus::Unavailable
+                },
+                detail: error,
+                ..Default::default()
+            };
+            publish_coverage(progress, &coverage);
+            return (Vec::new(), vec![coverage.summary()], coverage);
         }
     };
+    resolve_names(names, request, cancel, limiter, progress).await
+}
+
+async fn resolve_names(
+    mut names: Vec<String>,
+    request: &ExposureScanRequest,
+    cancel: &CancellationToken,
+    limiter: Arc<ConnectionRateLimiter>,
+    progress: &Option<Sender<ExposureScanProgress>>,
+) -> (Vec<DiscoveredAsset>, Vec<String>, DiscoveryCoverage) {
+    let mut coverage = DiscoveryCoverage {
+        status: DiscoveryCoverageStatus::Running,
+        eligible: Some(names.len()),
+        selected: names.len().min(request.ct_hostname_limit),
+        omitted: names.len().saturating_sub(request.ct_hostname_limit),
+        completed: 0,
+        detail: "CT inventory only; not an exhaustive domain inventory".to_owned(),
+    };
+    names.truncate(request.ct_hostname_limit);
+    publish_coverage(progress, &coverage);
     let total = names.len();
     let mut pending = FuturesUnordered::new();
     let mut next = 0usize;
@@ -163,107 +182,33 @@ pub(super) async fn discover_assets(
         while next < names.len() && pending.len() < request.concurrency && !cancel.is_cancelled() {
             let name = names[next].clone();
             next += 1;
-            pending.push({
-                let (hostname, cancel, limiter): (
-                    String,
-                    &CancellationToken,
-                    Arc<ConnectionRateLimiter>,
-                ) = (name, cancel, limiter.clone());
-                async move {
-                    let mut trace = DnsTrace::default();
-                    let resolution = if limiter.wait(cancel).await.is_err() {
-                        Err("cancelled".to_owned())
-                    } else {
-                        tokio::select! {
-                            _ = cancel.cancelled() => Err("cancelled".to_owned()),
-                            result = resolve_host(&hostname, &mut trace) => result,
-                        }
-                    };
-                    let mut addresses = trace.addresses;
-                    addresses.sort();
-                    addresses.dedup();
-                    let mut cname_chain = trace
-                        .records
-                        .iter()
-                        .filter(|record| record.record_type == "CNAME")
-                        .map(|record| record.value.trim_end_matches('.').to_ascii_lowercase())
-                        .collect::<Vec<_>>();
-                    cname_chain.dedup();
-                    let final_dns_answer = trace.attempts.iter().any(|attempt| {
-                        matches!(attempt.record_type.as_str(), "A" | "AAAA")
-                            && attempt.error.is_none()
-                            && attempt.response_code.as_deref().is_some_and(|code| {
-                                let normalized = code
-                                    .chars()
-                                    .filter(|character| !character.is_ascii_whitespace())
-                                    .collect::<String>();
-                                normalized.eq_ignore_ascii_case("NoError")
-                                    || normalized.eq_ignore_ascii_case("NXDomain")
-                            })
-                    });
-                    let state = if addresses
-                        .iter()
-                        .any(|address| non_public_reason(*address).is_none())
-                    {
-                        DiscoveredAssetState::Public
-                    } else if !addresses.is_empty() {
-                        DiscoveredAssetState::NonPublic
-                    } else if !cname_chain.is_empty() && final_dns_answer {
-                        DiscoveredAssetState::DanglingCname
-                    } else {
-                        DiscoveredAssetState::Unresolved
-                    };
-                    let detail = match state {
-                        DiscoveredAssetState::Public => {
-                            "One or more public DNS destinations resolved"
-                        }
-                        DiscoveredAssetState::NonPublic => {
-                            "DNS resolved only non-public destinations"
-                        }
-                        DiscoveredAssetState::DanglingCname => {
-                            "CNAME chain has no usable destination; exploitability was not tested"
-                        }
-                        DiscoveredAssetState::Unresolved => {
-                            "No usable A or AAAA result was obtained"
-                        }
-                    }
-                    .to_owned();
-                    DiscoveredAsset {
-                        hostname,
-                        source: "crt.sh certificate transparency".to_owned(),
-                        addresses,
-                        cname_chain,
-                        state,
-                        detail: if let Err(error) = resolution {
-                            format!("{detail}: {error}")
-                        } else {
-                            detail
-                        },
-                    }
-                }
+            let limiter = limiter.clone();
+            pending.push(async move {
+                posture::resolve_asset(name, request, cancel, limiter.as_ref()).await
             });
         }
-        let Some(asset) = pending.next().await else {
+        let Some((asset, complete)) = pending.next().await else {
             break;
         };
         if let Some(progress) = progress {
             let _ = progress.send(ExposureScanProgress::AssetDiscovered {
-                completed: assets.len() + 1,
+                completed: coverage.completed + usize::from(complete),
                 total,
                 asset: asset.clone(),
             });
         }
         assets.push(asset);
+        if complete {
+            coverage.completed += 1;
+        }
+        publish_coverage(progress, &coverage);
         send_phase_progress(
             progress,
             ExposureScanPhase::AssetDiscovery,
             ExposureScanPhaseState::Running,
-            assets.len() as f32 / total.max(1) as f32,
-            format!("Resolved {} / {total} CT hostnames", assets.len()),
+            coverage.completed as f32 / total.max(1) as f32,
+            format!("Checked {} / {total} CT hostnames", coverage.completed),
         );
-        if cancel.is_cancelled() {
-            break;
-        }
     }
     assets.sort_by(|left, right| left.hostname.cmp(&right.hostname));
     if !cancel.is_cancelled() {
@@ -272,10 +217,51 @@ pub(super) async fn discover_assets(
             ExposureScanPhase::AssetDiscovery,
             ExposureScanPhaseState::Complete,
             1.0,
-            format!("{} inventory-only CT assets", assets.len()),
+            format!(
+                "{} inventory-only CT assets; {}",
+                assets.len(),
+                if coverage.omitted > 0 {
+                    "limited coverage"
+                } else {
+                    "selected discovery complete"
+                }
+            ),
         );
     }
-    (assets, Vec::new())
+    coverage.status = if cancel.is_cancelled() {
+        DiscoveryCoverageStatus::Cancelled
+    } else if coverage.omitted > 0 {
+        DiscoveryCoverageStatus::Limited
+    } else {
+        DiscoveryCoverageStatus::Complete
+    };
+    let warnings = if coverage.omitted > 0 || cancel.is_cancelled() {
+        vec![coverage.summary()]
+    } else {
+        Vec::new()
+    };
+    publish_coverage(progress, &coverage);
+    (assets, warnings, coverage)
+}
+
+fn eligible_ct_names(entries: &[CtEntry], domain: &str) -> Vec<String> {
+    let mut names = entries
+        .iter()
+        .flat_map(|entry| entry.name_value.lines())
+        .filter_map(normalize_ct_name)
+        .filter(|name| within_domain(name, domain))
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn publish_coverage(progress: &Option<Sender<ExposureScanProgress>>, coverage: &DiscoveryCoverage) {
+    if let Some(progress) = progress {
+        let _ = progress.send(ExposureScanProgress::DiscoveryCoverageUpdated(
+            coverage.clone(),
+        ));
+    }
 }
 
 fn normalize_ct_name(value: &str) -> Option<String> {

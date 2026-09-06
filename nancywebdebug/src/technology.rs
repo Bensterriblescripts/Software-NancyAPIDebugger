@@ -1,3 +1,5 @@
+use super::technology_evidence;
+use super::TechnologyEvidence;
 use super::javascript;
 use super::{
     Confidence, ConnectionRateLimiter, DetectedFileType, EndpointScan, ExposureFinding,
@@ -29,12 +31,14 @@ static PRERELEASE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid prerelease regex")
 });
 
+#[derive(Clone)]
 pub(super) struct CapturedTechnologyResource {
     pub ip: IpAddr,
     pub port: u16,
     pub url: String,
     pub fetch_url: String,
     pub status: u16,
+    pub method: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub truncated: bool,
@@ -215,21 +219,25 @@ pub(super) fn classify_resource(
         inlined_result
     };
     let mut evidence = BTreeMap::<TechnologyFileType, (u8, Vec<String>)>::new();
+    let mut observations = BTreeMap::<TechnologyFileType, Vec<TechnologyEvidence>>::new();
     if let Some(file_type) = extension {
         let item = evidence.entry(file_type).or_default();
         item.0 |= 1;
         item.1.push(format!("URL extension for {file_type}"));
+        observations.entry(file_type).or_default().push(technology_evidence::observation("URL extension", url.path()));
     }
     if let Some(file_type) = mime {
         let item = evidence.entry(file_type).or_default();
         item.0 |= 2;
         item.1.push(format!("Content-Type indicates {file_type}"));
+        observations.entry(file_type).or_default().push(technology_evidence::observation("Header Content-Type", content_type.unwrap_or_default()));
     }
     for file_type in signatures {
         let item = evidence.entry(file_type).or_default();
         item.0 |= 4;
         item.1
             .push(format!("Validated {file_type} content signature"));
+        observations.entry(file_type).or_default().extend(file_signature_evidence(file_type, &String::from_utf8_lossy(&body[..body.len().min(64 * 1024)]), "Body signature"));
     }
     if url.path().to_ascii_lowercase().ends_with(".map")
         && let Ok(map) = serde_json::from_slice::<Value>(body)
@@ -278,10 +286,11 @@ pub(super) fn classify_resource(
                 item.0 |= 4;
                 item.1
                     .push(format!("Validated source-map entry for {file_type}"));
+                observations.entry(file_type).or_default().push(technology_evidence::observation("Source map sources[]", source));
             }
         }
         if let Some(contents) = map.get("sourcesContent").and_then(Value::as_array) {
-            for content in contents.iter().filter_map(Value::as_str).take(256) {
+            for (content_index, content) in contents.iter().enumerate().filter_map(|(index, value)| value.as_str().map(|value| (index, value))).take(256) {
                 for file_type in {
                     let (body,): (&[u8],) = (content.as_bytes(),);
                     let inlined_result: Vec<TechnologyFileType> = {
@@ -375,6 +384,7 @@ pub(super) fn classify_resource(
                     item.0 |= 4;
                     item.1
                         .push(format!("Validated source-map content for {file_type}"));
+                    observations.entry(file_type).or_default().extend(file_signature_evidence(file_type, String::from_utf8_lossy(&content.as_bytes()[..content.len().min(64 * 1024)]).as_ref(), &format!("Source map sourcesContent[{content_index}]")));
                 }
             }
         }
@@ -392,7 +402,12 @@ pub(super) fn classify_resource(
             } else {
                 Confidence::Medium
             };
+            let mut observations = observations.remove(&file_type).unwrap_or_default();
+            for record in &mut observations {
+                record.source_url = super::finding_assessment::safe_url(url.as_str());
+            }
             DetectedFileType {
+                observations,
                 file_type,
                 confidence,
                 evidence,
@@ -511,6 +526,7 @@ pub(super) async fn analyze(
                         release_source_url: None,
                         evidence_urls: vec![source.source_url.clone()],
                         evidence: library.evidence.clone(),
+                        observations: library.observations.clone(),
                         check_error: library
                             .installed_version
                             .is_some()
@@ -565,6 +581,9 @@ pub(super) async fn analyze(
                         existing.confidence = existing.confidence.max(incoming.confidence);
                         existing.evidence_urls.extend(incoming.evidence_urls);
                         existing.evidence.extend(incoming.evidence);
+                        existing.observations.extend(incoming.observations);
+                        existing.observations.sort();
+                        existing.observations.dedup();
                         existing.evidence_urls.sort();
                         existing.evidence_urls.dedup();
                         existing.evidence.sort();
@@ -683,9 +702,9 @@ pub(super) async fn analyze(
                                                     Some(name),
                                                     Some(requested),
                                                     false,
-                                                    &resource.url,
+                                                    resource,
                                                     format!(
-                                                        "{manifest} {key} requests {requested}"
+                                                        "{manifest} {key}.{name} requests {requested}"
                                                     ),
                                                 ))
                                             })
@@ -729,7 +748,7 @@ pub(super) async fn analyze(
                                                 Some(name),
                                                 Some(version),
                                                 exact_version(version),
-                                                &resource.url,
+                                                resource,
                                                 format!("npm lockfile pins {version}"),
                                             ));
                                         }
@@ -809,7 +828,7 @@ pub(super) async fn analyze(
                                                 Some(&name),
                                                 Some(version),
                                                 exact_version(version),
-                                                &resource.url,
+                                                resource,
                                                 format!("yarn.lock pins {version}"),
                                             ));
                                         }
@@ -840,7 +859,7 @@ pub(super) async fn analyze(
                                                 Some(name),
                                                 Some(version),
                                                 exact_version(version),
-                                                &resource.url,
+                                                resource,
                                                 format!("composer.lock pins {version}"),
                                             ))
                                         })
@@ -876,7 +895,7 @@ pub(super) async fn analyze(
                                             Some(name),
                                             (!spec.is_empty()).then_some(spec),
                                             false,
-                                            &resource.url,
+                                            resource,
                                             if spec.is_empty() {
                                                 "Python dependency manifest entry".to_owned()
                                             } else {
@@ -946,7 +965,7 @@ pub(super) async fn analyze(
                                             Some(name),
                                             requested,
                                             false,
-                                            &resource.url,
+                                            resource,
                                             requested.map_or_else(
                                                 || "pyproject.toml dependency".to_owned(),
                                                 |value| format!("pyproject.toml requests {value}"),
@@ -968,7 +987,7 @@ pub(super) async fn analyze(
                                             Some(name),
                                             requested,
                                             false,
-                                            &resource.url,
+                                            resource,
                                             requested.map_or_else(
                                                 || "pyproject.toml dependency".to_owned(),
                                                 |value| format!("pyproject.toml requests {value}"),
@@ -1001,7 +1020,7 @@ pub(super) async fn analyze(
                                                 Some(name),
                                                 Some(version),
                                                 exact_version(version),
-                                                &resource.url,
+                                                resource,
                                                 format!("Pipfile.lock pins {version}"),
                                             ))
                                         })
@@ -1034,7 +1053,7 @@ pub(super) async fn analyze(
                                                 Some(&name),
                                                 Some(&version),
                                                 exact_version(&version),
-                                                &resource.url,
+                                                resource,
                                                 format!("lockfile pins {version}"),
                                             ));
                                         }
@@ -1077,7 +1096,7 @@ pub(super) async fn analyze(
                                             Some(name),
                                             requested,
                                             false,
-                                            &resource.url,
+                                            resource,
                                             requested.map_or_else(
                                                 || "Gemfile dependency".to_owned(),
                                                 |value| format!("Gemfile requests {value}"),
@@ -1175,7 +1194,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                 Some(&identifier),
                 version.as_deref(),
                 false,
-                &resource.url,
+                resource,
                 evidence,
             ))
         })
@@ -1242,7 +1261,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                                                 Some(identifier),
                                                 Some(version),
                                                 installed && exact_version(version),
-                                                &resource.url,
+                                                resource,
                                                 format!("{evidence} {version}"),
                                             ))
                                         })
@@ -1304,7 +1323,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                                                 Some(name),
                                                 Some(version),
                                                 installed_manifest && exact_version(version),
-                                                &resource.url,
+                                                resource,
                                                 format!("NuGet package manifest records {version}"),
                                             ))
                                         })
@@ -1367,7 +1386,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                                                 Some(name),
                                                 Some(version),
                                                 installed_manifest && exact_version(version),
-                                                &resource.url,
+                                                resource,
                                                 format!("NuGet package manifest records {version}"),
                                             ))
                                         })
@@ -1403,7 +1422,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                                                 Some(name),
                                                 Some(version),
                                                 exact_version(version),
-                                                &resource.url,
+                                                resource,
                                                 format!("packages.lock.json pins {version}"),
                                             ))
                                         })
@@ -1431,7 +1450,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                                             Some(name),
                                             Some(version),
                                             exact_version(version),
-                                            &resource.url,
+                                            resource,
                                             format!("go.sum records {version}"),
                                         ))
                                     })
@@ -1484,7 +1503,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                                         Some(name),
                                         Some(requested),
                                         false,
-                                        &resource.url,
+                                        resource,
                                         format!("Cargo.toml requests {requested}"),
                                     ));
                                 }
@@ -1516,7 +1535,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                                                 Some(&name),
                                                 Some(&version),
                                                 exact_version(&version),
-                                                &resource.url,
+                                                resource,
                                                 format!("lockfile pins {version}"),
                                             ));
                                         }
@@ -1592,6 +1611,9 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                     existing.confidence = existing.confidence.max(incoming.confidence);
                     existing.evidence_urls.extend(incoming.evidence_urls);
                     existing.evidence.extend(incoming.evidence);
+                        existing.observations.extend(incoming.observations);
+                        existing.observations.sort();
+                        existing.observations.dedup();
                     existing.evidence_urls.sort();
                     existing.evidence_urls.dedup();
                     existing.evidence.sort();
@@ -1634,7 +1656,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                                 Some(slug),
                                 version.as_deref(),
                                 version.is_some(),
-                                url,
+                                resource,
                                 if let Some(version) = &version {
                                     format!("WordPress plugin asset path exposes version {version}")
                                 } else {
@@ -1682,6 +1704,9 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                             existing.confidence = existing.confidence.max(incoming.confidence);
                             existing.evidence_urls.extend(incoming.evidence_urls);
                             existing.evidence.extend(incoming.evidence);
+                        existing.observations.extend(incoming.observations);
+                        existing.observations.sort();
+                        existing.observations.dedup();
                             existing.evidence_urls.sort();
                             existing.evidence_urls.dedup();
                             existing.evidence.sort();
@@ -1714,7 +1739,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                                     Some(package),
                                     None,
                                     false,
-                                    url,
+                                    resource,
                                     format!("Curated framework asset marker {marker}"),
                                 ),
                             );
@@ -1758,6 +1783,9 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                                 existing.confidence = existing.confidence.max(incoming.confidence);
                                 existing.evidence_urls.extend(incoming.evidence_urls);
                                 existing.evidence.extend(incoming.evidence);
+                        existing.observations.extend(incoming.observations);
+                        existing.observations.sort();
+                        existing.observations.dedup();
                                 existing.evidence_urls.sort();
                                 existing.evidence_urls.dedup();
                                 existing.evidence.sort();
@@ -1800,6 +1828,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                     crate::web_server::FingerprintConfidence::High => Confidence::High,
                     crate::web_server::FingerprintConfidence::Medium => Confidence::Medium,
                 };
+                let observations = detection.observations;
                 for evidence in detection.evidence {
                     super::add_product(
                         endpoint,
@@ -1809,6 +1838,13 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                         confidence,
                         evidence,
                     );
+                }
+                if let Some(product) = endpoint.products.iter_mut().find(|product| product.name.eq_ignore_ascii_case(detection.product) && product.layer == layer) {
+                    for mut record in observations {
+                        technology_evidence::locate(&mut record, &resource.url, Some(std::net::SocketAddr::new(resource.ip, resource.port).to_string()), Some(&resource.method), Some(resource.status), resource.truncated);
+                        product.observations.push(record);
+                    }
+                    product.observations.retain(|record| record.match_source != "Supporting product detection");
                 }
             }
             if crate::web_server::is_fastapi_branded_document(&resource.fetch_url, &resource.body) {
@@ -1823,6 +1859,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                         resource.url
                     ),
                 );
+                attach_resource_product_evidence(endpoint, "FastAPI", resource);
             }
             if lower.contains("__react_devtools_global_hook__")
                 || lower.contains("data-reactroot")
@@ -1851,7 +1888,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                             Some(package),
                             version,
                             version.is_some_and(exact_version),
-                            &resource.url,
+                            resource,
                             evidence.to_owned(),
                         )
                     };
@@ -1885,7 +1922,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                             Some(package),
                             version,
                             version.is_some_and(exact_version),
-                            &resource.url,
+                            resource,
                             evidence.to_owned(),
                         )
                     };
@@ -1934,7 +1971,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                             Some(package),
                             version,
                             version.is_some_and(exact_version),
-                            &resource.url,
+                            resource,
                             evidence.to_owned(),
                         )
                     };
@@ -1964,7 +2001,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                             Some(package),
                             version,
                             version.is_some_and(exact_version),
-                            &resource.url,
+                            resource,
                             evidence.to_owned(),
                         )
                     };
@@ -1995,7 +2032,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                             Some(package),
                             version,
                             version.is_some_and(exact_version),
-                            &resource.url,
+                            resource,
                             evidence.to_owned(),
                         )
                     };
@@ -2026,7 +2063,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                             Some(package),
                             version,
                             version.is_some_and(exact_version),
-                            &resource.url,
+                            resource,
                             evidence.to_owned(),
                         )
                     };
@@ -2047,6 +2084,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                         resource.url
                     ),
                 );
+                attach_resource_product_evidence(endpoint, "Django", resource);
                 detected.push({
                     let (name, ecosystem, package, version, resource, evidence): (
                         &str,
@@ -2070,7 +2108,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                             Some(package),
                             version,
                             version.is_some_and(exact_version),
-                            &resource.url,
+                            resource,
                             evidence.to_owned(),
                         )
                     };
@@ -2086,6 +2124,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                     Confidence::High,
                     format!("Distinctive Django CSRF failure page at {}", resource.url),
                 );
+                attach_resource_product_evidence(endpoint, "Django", resource);
             }
             if lower.contains("rails-ujs")
                 || (lower.contains("csrf-param") && lower.contains("csrf-token"))
@@ -2113,7 +2152,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                             Some(package),
                             version,
                             version.is_some_and(exact_version),
-                            &resource.url,
+                            resource,
                             evidence.to_owned(),
                         )
                     };
@@ -2144,7 +2183,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                             Some(package),
                             version,
                             version.is_some_and(exact_version),
-                            &resource.url,
+                            resource,
                             evidence.to_owned(),
                         )
                     };
@@ -2165,6 +2204,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                     release_source_url: None,
                     evidence_urls: vec![resource.url.clone()],
                     evidence: vec!["ASP.NET __VIEWSTATE field".to_owned()],
+                    observations: ComponentSource::Resource(resource).observations("ASP.NET", None, "ASP.NET __VIEWSTATE field"),
                     check_error: None,
                 });
             }
@@ -2182,6 +2222,7 @@ let (block, tag,): (& str, & str,) = (block, "version",);
                     release_source_url: None,
                     evidence_urls: vec![resource.url.clone()],
                     evidence: vec!["Blazor framework asset marker".to_owned()],
+                    observations: ComponentSource::Resource(resource).observations("Blazor", None, "Blazor framework asset marker"),
                     check_error: None,
                 });
             }
@@ -2223,7 +2264,7 @@ let (text, pattern,): (& str, & str,) = (&text, r#"(?i)<meta[^>]+content=[\"']wo
             Some("wordpress"),
             Some(&version),
             exact_version(&version),
-            &resource.url,
+            resource,
             format!("WordPress generator exposes {version}"),
         );
         item.kind = TechnologyComponentKind::Cms;
@@ -2284,7 +2325,7 @@ let (value,): (& str,) = (&version,);
             Some("moodle"),
             Some(&version),
             exact,
-            &resource.url,
+            resource,
             format!("Moodle generator exposes {version}"),
         );
         item.kind = TechnologyComponentKind::Cms;
@@ -2336,6 +2377,9 @@ let (value,): (& str,) = (&version,);
                         existing.confidence = existing.confidence.max(incoming.confidence);
                         existing.evidence_urls.extend(incoming.evidence_urls);
                         existing.evidence.extend(incoming.evidence);
+                        existing.observations.extend(incoming.observations);
+                        existing.observations.sort();
+                        existing.observations.dedup();
                         existing.evidence_urls.sort();
                         existing.evidence_urls.dedup();
                         existing.evidence.sort();
@@ -2440,6 +2484,9 @@ let (value,): (& str,) = (&version,);
                                 existing.confidence = existing.confidence.max(incoming.confidence);
                                 existing.evidence_urls.extend(incoming.evidence_urls);
                                 existing.evidence.extend(incoming.evidence);
+                        existing.observations.extend(incoming.observations);
+                        existing.observations.sort();
+                        existing.observations.dedup();
                                 existing.evidence_urls.sort();
                                 existing.evidence_urls.dedup();
                                 existing.evidence.sort();
@@ -2521,6 +2568,9 @@ let (value,): (& str,) = (&version,);
                                         existing.confidence.max(incoming.confidence);
                                     existing.evidence_urls.extend(incoming.evidence_urls);
                                     existing.evidence.extend(incoming.evidence);
+                        existing.observations.extend(incoming.observations);
+                        existing.observations.sort();
+                        existing.observations.dedup();
                                     existing.evidence_urls.sort();
                                     existing.evidence_urls.dedup();
                                     existing.evidence.sort();
@@ -2660,6 +2710,7 @@ let (text, pattern,): (& str, & str,) = (metadata, r#"(?i)^Moodle\s+([0-9]+(?:\.
                     &url,
                     format!("Product fingerprint: {}", product.evidence.join("; ")),
                 );
+                item.observations = product.observations.clone();
                 if package_identifier.is_none()
                     && let Some(version) = product.version.as_deref().filter(|_| exact)
                 {
@@ -2757,8 +2808,13 @@ let (text, pattern,): (& str, & str,) = (metadata, r#"(?i)^Moodle\s+([0-9]+(?:\.
                                 Some(&version),
                                 exact_version(&version),
                                 &response.url,
-                                format!("{header_name} header exposes {name} {version}"),
+                                format!("{header_name}: {header_value}"),
                             );
+                            item.observations = vec![technology_evidence::observation(&format!("Header {header_name}"), header_value)];
+                            for record in &mut item.observations {
+                                record.extracted_version = Some(technology_evidence::safe_value(&version));
+                                technology_evidence::locate(record, &response.url, Some(std::net::SocketAddr::new(endpoint.ip, endpoint.port).to_string()), Some(&response.method), Some(response.status), response.body_truncated);
+                            }
                             item.kind = TechnologyComponentKind::Runtime;
                             detected.push(item);
                         }
@@ -2811,6 +2867,9 @@ let (text, pattern,): (& str, & str,) = (metadata, r#"(?i)^Moodle\s+([0-9]+(?:\.
                         existing.confidence = existing.confidence.max(incoming.confidence);
                         existing.evidence_urls.extend(incoming.evidence_urls);
                         existing.evidence.extend(incoming.evidence);
+                        existing.observations.extend(incoming.observations);
+                        existing.observations.sort();
+                        existing.observations.dedup();
                         existing.evidence_urls.sort();
                         existing.evidence_urls.dedup();
                         existing.evidence.sort();
@@ -2825,6 +2884,23 @@ let (text, pattern,): (& str, & str,) = (metadata, r#"(?i)^Moodle\s+([0-9]+(?:\.
                 });
             }
         });
+        for component in &mut endpoint.technology_components {
+            for record in &mut component.observations {
+                if record.endpoint.is_none() {
+                    record.endpoint = Some(std::net::SocketAddr::new(endpoint.ip, endpoint.port).to_string());
+                }
+                if record.method.is_none() && !record.source_url.is_empty() {
+                    if let Some(source) = endpoint.javascript_sources.iter().find(|source| {
+                        super::finding_assessment::safe_url(&source.source_url) == record.source_url
+                            || source.final_url.as_deref().is_some_and(|url| super::finding_assessment::safe_url(url) == record.source_url)
+                    }) {
+                        record.method = source.http_status.map(|_| "GET".to_owned());
+                        record.status = source.http_status;
+                        record.capture_truncated = source.truncated;
+                    }
+                }
+            }
+        }
         ({
             let (endpoint,): (&mut EndpointScan,) = (endpoint,);
 
@@ -2846,6 +2922,7 @@ let (text, pattern,): (& str, & str,) = (metadata, r#"(?i)^Moodle\s+([0-9]+(?:\.
                         confidence: Confidence::High,
                         release_source_url: None,
                         evidence_urls: component.evidence_urls.clone(),
+                        observations: technology_evidence::inferred(&component.observations, &format!("{} {}", component.name, component.installed_version.as_deref().unwrap_or("version not observed"))),
                         evidence: vec![format!(
                             "{runtime_name} runtime implied by detected {} {}",
                             component.ecosystem, component.name
@@ -2900,6 +2977,9 @@ let (text, pattern,): (& str, & str,) = (metadata, r#"(?i)^Moodle\s+([0-9]+(?:\.
                         existing.confidence = existing.confidence.max(incoming.confidence);
                         existing.evidence_urls.extend(incoming.evidence_urls);
                         existing.evidence.extend(incoming.evidence);
+                        existing.observations.extend(incoming.observations);
+                        existing.observations.sort();
+                        existing.observations.dedup();
                         existing.evidence_urls.sort();
                         existing.evidence_urls.dedup();
                         existing.evidence.sort();
@@ -6863,6 +6943,7 @@ inlined_result
                             evidence.sort();
                             evidence.dedup();
                             let candidate = ExposureFinding {
+        details: Vec::new(),
                                 title,
                                 description: format!(
                                     "Upstream release metadata designates the detected {} release line as legacy, end-of-life, or outside the currently supported line",
@@ -6933,6 +7014,7 @@ inlined_result
                         evidence.sort();
                         evidence.dedup();
                         let candidate = ExposureFinding {
+        details: Vec::new(),
                             title,
                             description: format!(
                                 "Installed {} {} is behind the newest stable {} release {} ({} difference)",
@@ -6989,15 +7071,128 @@ inlined_result
     }
 }
 
-fn component(
+fn attach_resource_product_evidence(endpoint: &mut EndpointScan, name: &str, resource: &CapturedTechnologyResource) {
+    if let Some(product) = endpoint.products.iter_mut().find(|product| product.name.eq_ignore_ascii_case(name)) {
+        product.observations.retain(|record| record.match_source != "Supporting product detection");
+        product.observations.extend(ComponentSource::Resource(resource).observations(name, None, "Curated body fingerprint"));
+    }
+}
+
+enum ComponentSource<'a> {
+    Resource(&'a CapturedTechnologyResource),
+    Url(&'a str),
+}
+
+impl<'a> From<&'a CapturedTechnologyResource> for ComponentSource<'a> {
+    fn from(value: &'a CapturedTechnologyResource) -> Self { Self::Resource(value) }
+}
+
+impl<'a> From<&'a str> for ComponentSource<'a> {
+    fn from(value: &'a str) -> Self { Self::Url(value) }
+}
+
+impl<'a> From<&'a String> for ComponentSource<'a> {
+    fn from(value: &'a String) -> Self { Self::Url(value) }
+}
+
+impl ComponentSource<'_> {
+    fn url(&self) -> &str {
+        match self { Self::Resource(resource) => &resource.url, Self::Url(url) => url }
+    }
+
+    fn observations(&self, name: &str, version: Option<&str>, evidence: &str) -> Vec<TechnologyEvidence> {
+        let mut records = Vec::new();
+        if let Self::Resource(resource) = self {
+            let text = String::from_utf8_lossy(&resource.body);
+            let lower = text.to_ascii_lowercase();
+            let markers: &[&str] = match name {
+                "React" => &["__react_devtools_global_hook__", "data-reactroot", "react.production.min"],
+                "Vue.js" | "Vue" => &["__vue__", "data-v-", "vue.runtime"],
+                "Angular" => &["ng-version=", "ng-app="],
+                "Next.js" => &["__next_data__"],
+                "Nuxt" | "Nuxt.js" => &["__nuxt__"],
+                "Svelte" => &["svelte-"],
+                "Django" => &["name=\"csrfmiddlewaretoken\"", "name='csrfmiddlewaretoken'", "csrf verification failed. request aborted"],
+                "Ruby on Rails" => &["rails-ujs", "csrf-param", "csrf-token"],
+                "Spring Boot" => &["whitelabel error page"],
+                "Laravel" => &["laravel"],
+                "FastAPI" => &["fastapi", "openapi"],
+                "ASP.NET" => &["__viewstate"],
+                "Blazor" => &["_framework/blazor", "blazor.webassembly.js", "blazor.server.js"],
+                "WordPress" => &["wordpress"],
+                "Moodle" => &["moodle"],
+                _ => &[],
+            };
+            if (evidence.contains("asset") || evidence.contains("path")) && name != "Blazor" {
+                let record = technology_evidence::observation("Matched URL / asset path", &resource.url);
+                records.push(record);
+            } else if evidence.contains("generator") {
+                let tags = Regex::new(r"(?is)<meta\b[^>]*>").expect("valid metadata pattern");
+                for tag in tags.find_iter(&text) {
+                    let lower = tag.as_str().to_ascii_lowercase();
+                    if lower.contains("generator") && lower.contains(&name.to_ascii_lowercase())
+                        && version.is_none_or(|version| lower.contains(&version.to_ascii_lowercase()))
+                    {
+                        let mut record = technology_evidence::observation("Generator meta tag", tag.as_str());
+                        record.excerpt_shortened |= tag.start() > 0 || tag.end() < text.len();
+                        records.push(record);
+                    }
+                }
+            } else if evidence.contains("fingerprint") || evidence.contains("generator") || evidence.contains("field") || evidence.contains("marker") || evidence.contains("attribute") || evidence.contains("Error Page") {
+                for marker in markers {
+                    if let Some(start) = lower.find(marker) {
+                        let (value, shortened) = technology_evidence::excerpt(&text, start..start + marker.len());
+                        let mut record = technology_evidence::observation("Body signature", &value);
+                        record.excerpt_shortened = shortened;
+                        records.push(record);
+                    }
+                }
+            } else {
+                let filename = resource.url.rsplit('/').next().unwrap_or("manifest");
+                let field = if evidence.contains("requests") || evidence.contains("dependency manifest") {
+                    "dependency requirement"
+                } else {
+                    "version"
+                };
+                records.push(technology_evidence::observation(
+                    &format!("Manifest field: {filename} / {name} / {field} ({evidence})"),
+                    version.unwrap_or("Dependency name present; no version field"),
+                ));
+            }
+            if records.is_empty() {
+                records.push(TechnologyEvidence { match_source: evidence.to_owned(), ..Default::default() });
+            }
+            for record in &mut records {
+                technology_evidence::locate(record, &resource.url, Some(std::net::SocketAddr::new(resource.ip, resource.port).to_string()), Some(&resource.method), Some(resource.status), resource.truncated);
+                record.extracted_version = version.map(technology_evidence::safe_value);
+            }
+        } else {
+            let mut record = technology_evidence::observation("Supporting detection", evidence);
+            if evidence.contains("asset") || evidence.contains("path") {
+                record = technology_evidence::observation("Matched URL / asset path", self.url());
+                record.source_url = super::finding_assessment::safe_url(self.url());
+            } else {
+                record.supporting_detection = Some(name.to_owned());
+            }
+            record.extracted_version = version.map(technology_evidence::safe_value);
+            records.push(record);
+        }
+        records
+    }
+}
+
+fn component<'a>(
     name: &str,
     ecosystem: TechnologyEcosystem,
     identifier: Option<&str>,
     version: Option<&str>,
     exact: bool,
-    url: &str,
+    source: impl Into<ComponentSource<'a>>,
     evidence: String,
 ) -> TechnologyComponent {
+    let source = source.into();
+    let url = source.url();
+    let observations = source.observations(name, version, &evidence);
     TechnologyComponent {
         name: name.to_owned(),
         ecosystem,
@@ -7052,6 +7247,7 @@ fn component(
         },
         evidence_urls: vec![url.to_owned()],
         evidence: vec![evidence],
+        observations,
         check_error: None,
     }
 }
@@ -7152,7 +7348,7 @@ fn collect_npm_lock_dependencies(
                 Some(name),
                 Some(version),
                 exact_version(version),
-                &resource.url,
+                resource,
                 format!("npm lockfile pins {version}"),
             ));
         }
@@ -8358,4 +8554,29 @@ fn version_numbers(version: &str) -> Option<Vec<u64>> {
         .collect::<Result<Vec<u64>, _>>()
         .ok()?;
     (!numbers.is_empty()).then_some(numbers)
+}
+
+fn file_signature_evidence(file_type: TechnologyFileType, text: &str, source: &str) -> Vec<TechnologyEvidence> {
+    let markers: &[&str] = match file_type {
+        TechnologyFileType::Php => &["<?php"],
+        TechnologyFileType::AspNet => &["<%@", "Page"],
+        TechnologyFileType::Razor => &["@page", "@model", "@code", "@functions"],
+        TechnologyFileType::Python => &["#!", "python", "def ", "import ", ":"],
+        TechnologyFileType::Ruby => &["#!", "ruby", "require '", "def ", "\nend"],
+        TechnologyFileType::Java => &["package ", "public class ", "import java.", "class "],
+        TechnologyFileType::Kotlin => &["fun main(", "val ", "import kotlin."],
+        TechnologyFileType::CSharp => &["using System;", "namespace System", " class ", "record "],
+        TechnologyFileType::Go => &["package main", "func main("],
+        TechnologyFileType::Rust => &["fn main(", "use std::", "extern crate "],
+        TechnologyFileType::JavaScript => &["\"use strict\"", "'use strict'", "function ", "=>"],
+        TechnologyFileType::TypeScript => &["interface ", "type ", ": string", ": number"],
+        _ => &[],
+    };
+    markers.iter().filter_map(|marker| {
+        let start = text.find(marker)?;
+        let (value, shortened) = technology_evidence::excerpt(text, start..start + marker.len());
+        let mut record = technology_evidence::observation(source, &value);
+        record.excerpt_shortened = shortened;
+        Some(record)
+    }).collect()
 }

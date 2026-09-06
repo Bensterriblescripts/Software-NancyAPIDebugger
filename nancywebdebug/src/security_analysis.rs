@@ -3,132 +3,21 @@ use super::*;
 pub(super) fn build_security_summary(
     endpoints: &[EndpointScan],
     include_csp_warnings: bool,
+    cancel: &CancellationToken,
 ) -> Vec<ExposureFinding> {
     let mut findings = BTreeMap::new();
     for endpoint in endpoints {
+        if cancel.is_cancelled() {
+            break;
+        }
         for finding in &endpoint.findings {
             add_security_summary_finding(&mut findings, finding.clone());
         }
         if include_csp_warnings {
             for response in &endpoint.http {
-                for policy in {
-                    let (response, name): (&crate::HttpObservation, &str) =
-                        (response, "content-security-policy");
-                    response
-                        .headers
-                        .iter()
-                        .filter(move |(header, _)| header.eq_ignore_ascii_case(name))
-                        .map(|(_, value)| value.as_str())
-                } {
-                    ({
-                        let (findings, ip, port, policy): (
-                            &mut SecuritySummaryFindings,
-                            IpAddr,
-                            u16,
-                            &str,
-                        ) = (&mut findings, endpoint.ip, endpoint.port, policy);
-
-                        let mut default_sources = None;
-                        let mut script_sources = None;
-                        let mut script_element_sources = None;
-                        let mut script_attribute_sources = None;
-                        for directive in policy.split(';') {
-                            let mut parts = directive.split_ascii_whitespace();
-                            let Some(name) = parts.next() else {
-                                continue;
-                            };
-                            let sources = parts.collect::<Vec<_>>();
-                            match name.to_ascii_lowercase().as_str() {
-                                "default-src" if default_sources.is_none() => {
-                                    default_sources = Some(sources)
-                                }
-                                "script-src" if script_sources.is_none() => {
-                                    script_sources = Some(sources)
-                                }
-                                "script-src-elem" if script_element_sources.is_none() => {
-                                    script_element_sources = Some(sources)
-                                }
-                                "script-src-attr" if script_attribute_sources.is_none() => {
-                                    script_attribute_sources = Some(sources)
-                                }
-                                _ => {}
-                            }
-                        }
-                        let base_sources = script_sources.as_deref().or(default_sources.as_deref());
-                        let element_sources = script_element_sources.as_deref().or(base_sources);
-                        let attribute_sources =
-                            script_attribute_sources.as_deref().or(base_sources);
-                        if element_sources.is_some_and(|sources| {
-                            sources.iter().any(|source| {
-                                let (source,): (&str,) = (source,);
-                                {
-                                    let source = source.trim_end_matches(',').to_ascii_lowercase();
-                                    !source.is_empty()
-                                        && !source.starts_with('\'')
-                                        && !matches!(
-                                            source.as_str(),
-                                            "none" | "self" | "data:" | "blob:" | "filesystem:"
-                                        )
-                                }
-                            })
-                        }) {
-                            add_security_summary_finding(
-                                findings,
-                                ExposureFinding {
-                                    ip,
-                                    port,
-                                    transport: TransportProtocol::Tcp,
-                                    title: "Content-Security-Policy permits remote script sources"
-                                        .to_owned(),
-                                    description:
-                                        "The policy allows scripts to load from remote sources"
-                                            .to_owned(),
-                                    evidence: vec![format!("Content-Security-Policy: {policy}")],
-                                    component_kind: None,
-                                },
-                            );
-                        }
-                        if element_sources
-                            .into_iter()
-                            .chain(attribute_sources)
-                            .flatten()
-                            .any(|source| source.eq_ignore_ascii_case("'unsafe-inline'"))
-                        {
-                            add_security_summary_finding(
-                                findings,
-                                ExposureFinding {
-                                    ip,
-                                    port,
-                                    transport: TransportProtocol::Tcp,
-                                    title:
-                                        "Content-Security-Policy permits inline script execution"
-                                            .to_owned(),
-                                    description: "The policy allows inline script execution"
-                                        .to_owned(),
-                                    evidence: vec![format!("Content-Security-Policy: {policy}")],
-                                    component_kind: None,
-                                },
-                            );
-                        }
-                        if base_sources.is_some_and(|sources| {
-                            sources
-                                .iter()
-                                .any(|source| source.eq_ignore_ascii_case("'unsafe-eval'"))
-                        }) {
-                            add_security_summary_finding(
-            findings,
-            ExposureFinding {
-                ip,
-                port,
-                transport: TransportProtocol::Tcp,
-                title: "Content-Security-Policy permits eval-style script execution".to_owned(),
-                description: "The policy allows eval-style script execution".to_owned(),
-                evidence: vec![format!("Content-Security-Policy: {policy}")],
-                component_kind: None,
-            },
-        );
-                        }
-                    });
+                if cancel.is_cancelled() { break; }
+                for finding in super::finding_assessment::response_findings(endpoint.ip, endpoint.port, response) {
+                    add_security_summary_finding(&mut findings, finding);
                 }
             }
             ({
@@ -139,6 +28,9 @@ pub(super) fn build_security_summary(
                 let mut records = Vec::new();
                 let mut continuity = HashMap::<CookieKey, usize>::new();
                 for response in &endpoint.http {
+                if cancel.is_cancelled() {
+                    break;
+                }
                     let Ok(url) = Url::parse(&response.url) else {
                         continue;
                     };
@@ -337,6 +229,7 @@ pub(super) fn build_security_summary(
                             add_security_summary_finding(
                                 findings,
                                 ExposureFinding {
+        details: Vec::new(),
                                     title: title.to_owned(),
                                     description: description.to_owned(),
                                     ip: endpoint.ip,
@@ -381,6 +274,7 @@ pub(super) fn build_security_summary(
                             add_security_summary_finding(
                                 findings,
                                 ExposureFinding {
+        details: Vec::new(),
                                     title: title.to_owned(),
                                     description: description.to_owned(),
                                     ip: endpoint.ip,
@@ -411,6 +305,7 @@ pub(super) fn build_security_summary(
                             add_security_summary_finding(
                                 findings,
                                 ExposureFinding {
+        details: Vec::new(),
                                     title: title.to_owned(),
                                     description: description.to_owned(),
                                     ip: endpoint.ip,
@@ -441,6 +336,7 @@ pub(super) fn build_security_summary(
                             add_security_summary_finding(
                                 findings,
                                 ExposureFinding {
+        details: Vec::new(),
                                     title: title.to_owned(),
                                     description: description.to_owned(),
                                     ip: endpoint.ip,
@@ -473,6 +369,7 @@ pub(super) fn build_security_summary(
                             add_security_summary_finding(
                                 findings,
                                 ExposureFinding {
+        details: Vec::new(),
                                     title: title.to_owned(),
                                     description: description.to_owned(),
                                     ip: endpoint.ip,
@@ -508,6 +405,7 @@ pub(super) fn build_security_summary(
                             add_security_summary_finding(
                                 findings,
                                 ExposureFinding {
+        details: Vec::new(),
                                     title: title.to_owned(),
                                     description: description.to_owned(),
                                     ip: endpoint.ip,
@@ -538,6 +436,7 @@ pub(super) fn build_security_summary(
                             add_security_summary_finding(
                                 findings,
                                 ExposureFinding {
+        details: Vec::new(),
                                     title: title.to_owned(),
                                     description: description.to_owned(),
                                     ip: endpoint.ip,
@@ -589,6 +488,7 @@ pub(super) fn build_security_summary(
                             add_security_summary_finding(
                                 findings,
                                 ExposureFinding {
+        details: Vec::new(),
                                     title: title.to_owned(),
                                     description: description.to_owned(),
                                     ip: endpoint.ip,
@@ -608,6 +508,9 @@ pub(super) fn build_security_summary(
 
                 let mut seen = HashSet::new();
                 for response in &endpoint.http {
+                if cancel.is_cancelled() {
+                    break;
+                }
                     let Ok(url) = Url::parse(&response.url) else {
                         continue;
                     };
@@ -813,6 +716,7 @@ pub(super) fn build_security_summary(
                                         add_security_summary_finding(
                                             findings,
                                             ExposureFinding {
+        details: Vec::new(),
                                                 title: title.to_owned(),
                                                 description: description.to_owned(),
                                                 ip: endpoint.ip,
@@ -1024,6 +928,7 @@ pub(super) fn build_security_summary(
                                             add_security_summary_finding(
                                                 findings,
                                                 ExposureFinding {
+        details: Vec::new(),
                                                     title: title.to_owned(),
                                                     description: description.to_owned(),
                                                     ip: endpoint.ip,
@@ -1658,6 +1563,7 @@ let (value,): (& str,) = (value,);
                                     add_security_summary_finding(
                                         findings,
                                         ExposureFinding {
+        details: Vec::new(),
                                             title: title.to_owned(),
                                             description: description.to_owned(),
                                             ip: endpoint.ip,
@@ -2264,6 +2170,7 @@ let (value,): (& str,) = (value,);
                                 add_security_summary_finding(
                                     findings,
                                     ExposureFinding {
+        details: Vec::new(),
                                         title: title.to_owned(),
                                         description: description.to_owned(),
                                         ip: endpoint.ip,
@@ -2282,6 +2189,7 @@ let (value,): (& str,) = (value,);
                 add_security_summary_finding(
                     &mut findings,
                     ExposureFinding {
+        details: Vec::new(),
                         ip: endpoint.ip,
                         port: endpoint.port,
                         transport: endpoint.transport,
@@ -2320,8 +2228,9 @@ type SecuritySummaryFindings = BTreeMap<(IpAddr, u16, TransportProtocol, String)
 
 pub(super) fn add_security_summary_finding(
     findings: &mut SecuritySummaryFindings,
-    finding: ExposureFinding,
+    mut finding: ExposureFinding,
 ) {
+    super::finding_assessment::enrich_finding(&mut finding);
     let key = {
         let finding = &finding;
         (
@@ -2332,6 +2241,9 @@ pub(super) fn add_security_summary_finding(
         )
     };
     if let Some(existing) = findings.get_mut(&key) {
+        existing.details.extend(finding.details);
+        existing.details.sort();
+        existing.details.dedup();
         existing.evidence.extend(finding.evidence);
         existing.evidence.sort();
         existing.evidence.dedup();

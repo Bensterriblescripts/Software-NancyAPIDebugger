@@ -6,7 +6,6 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::body::decode_body;
 use super::http::apply_redirect_report;
 
 #[derive(Debug)]
@@ -84,9 +83,6 @@ pub(super) fn fail_trace(
     started: Instant,
     message: String,
 ) -> DiagnosticTrace {
-    if matches!(stage, StageKind::FirstByte | StageKind::Body) && !trace.body.raw.is_empty() {
-        decode_body(&mut trace);
-    }
     let detail = if stage == StageKind::Body {
         format!(
             "{message}; raw: {}; decoded: {}",

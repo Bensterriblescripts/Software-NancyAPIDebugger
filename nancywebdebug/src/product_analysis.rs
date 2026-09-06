@@ -8,6 +8,7 @@ use std::cell::RefCell;
 
 #[derive(Clone)]
 struct ProductSignal {
+    observations: Vec<TechnologyEvidence>,
     source: String,
     evidence: String,
     kind: ProductSignalKind,
@@ -23,10 +24,16 @@ enum ProductSignalKind {
     Indirect,
 }
 
-pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
-    exposure_probe::product_identification::record_captured(endpoint);
+pub(super) fn apply_product_rules(endpoint: &mut EndpointScan, cancel: &CancellationToken) {
+    exposure_probe::product_identification::record_captured(endpoint, cancel);
+    let evidence_response: Option<&HttpObservation> = None;
+    let mut web_observations = HashMap::<String, Vec<TechnologyEvidence>>::new();
     let mut signals: HashMap<(&'static str, ProductLayer), Vec<ProductSignal>> = HashMap::new();
     for response in &endpoint.http {
+        let evidence_response = Some(response);
+        if cancel.is_cancelled() {
+            return;
+        }
         let web_detections = detect_web_servers(
             response
                 .headers
@@ -37,6 +44,10 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
             Some(&response.url),
         );
         for detection in web_detections {
+            for mut record in detection.observations {
+                technology_evidence::locate(&mut record, &response.url, Some(std::net::SocketAddr::new(endpoint.ip, endpoint.port).to_string()), Some(&response.method), Some(response.status), response.body_truncated);
+                web_observations.entry(detection.product.to_ascii_lowercase()).or_default().push(record);
+            }
             let layer = match detection.role {
                 WebProductRole::Server => ProductLayer::Server,
                 WebProductRole::Proxy => ProductLayer::Proxy,
@@ -71,6 +82,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -81,6 +93,10 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
         }
     }
     for response in &endpoint.http {
+        let evidence_response = Some(response);
+        if cancel.is_cancelled() {
+            return;
+        }
         for (name, value) in &response.headers {
             let header = name.to_ascii_lowercase();
             let lower = value.to_ascii_lowercase();
@@ -144,6 +160,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -206,6 +223,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -289,6 +307,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -352,6 +371,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -415,6 +435,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -447,6 +468,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -476,6 +498,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -509,6 +532,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                     .entry((name, layer))
                     .or_default()
                     .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                         source,
                         evidence,
                         kind,
@@ -540,6 +564,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                     .entry((name, layer))
                     .or_default()
                     .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                         source,
                         evidence,
                         kind,
@@ -607,6 +632,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -641,6 +667,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -672,6 +699,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -709,6 +737,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -748,6 +777,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                     }
                 })
         }) {
+            let evidence_response = Some(baseline);
             if baseline.status != 404 || baseline.body_truncated {
                 continue;
             }
@@ -778,6 +808,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
 
             if baseline.body.is_empty() {
                 for options in root_options {
+                    let evidence_response = Some(options);
                     if options.status != 405 || options.body_truncated || !options.body.is_empty() {
                         continue;
                     }
@@ -829,6 +860,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                         .entry((name, layer))
                                         .or_default()
                                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                             source,
                                             evidence,
                                             kind,
@@ -909,6 +941,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                         .entry((name, layer))
                                         .or_default()
                                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                             source,
                                             evidence,
                                             kind,
@@ -996,6 +1029,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -1081,6 +1115,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -1228,6 +1263,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -1364,6 +1400,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -1427,6 +1464,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -1473,6 +1511,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -1556,6 +1595,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -1641,6 +1681,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -1745,6 +1786,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -1828,6 +1870,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -1840,6 +1883,9 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
         });
     });
     for tls in &endpoint.tls {
+        if cancel.is_cancelled() {
+            return;
+        }
         for certificate in &tls.certificates {
             let identity =
                 format!("{} {}", certificate.subject, certificate.issuer).to_ascii_lowercase();
@@ -1873,6 +1919,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: vec![{ let mut record = technology_evidence::observation("TLS certificate subject / issuer", &format!("{} / {}", certificate.subject, certificate.issuer)); record.endpoint = Some(std::net::SocketAddr::new(endpoint.ip, endpoint.port).to_string()); record }],
                                 source,
                                 evidence,
                                 kind,
@@ -1896,6 +1943,10 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
             .filter(|response| response.url.contains("/nancy-exposure-not-found-"))
             .collect::<Vec<_>>();
         for response in &endpoint.http {
+        let evidence_response = Some(response);
+        if cancel.is_cancelled() {
+            return;
+        }
             if !({
                 let (response, endpoint_port): (&HttpObservation, u16) = (response, endpoint.port);
                 {
@@ -2054,6 +2105,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -2127,6 +2179,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
 
                                         signals.entry((name, layer)).or_default().push(
                                             ProductSignal {
+                                                observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                                 source,
                                                 evidence,
                                                 kind,
@@ -2238,6 +2291,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                     .entry((name, layer))
                                     .or_default()
                                     .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                         source,
                                         evidence,
                                         kind,
@@ -2303,6 +2357,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -2409,6 +2464,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -2450,6 +2506,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -2537,6 +2594,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -2576,6 +2634,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -2630,6 +2689,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -2661,6 +2721,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -2692,6 +2753,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -2798,6 +2860,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -2884,6 +2947,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -2923,6 +2987,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -2985,6 +3050,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -3033,6 +3099,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -3070,6 +3137,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -3137,6 +3205,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -3171,6 +3240,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -3202,6 +3272,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -3263,6 +3334,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -3316,6 +3388,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -3404,6 +3477,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -3438,6 +3512,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -3556,6 +3631,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -3601,6 +3677,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -3637,6 +3714,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -3723,6 +3801,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -3757,6 +3836,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -3836,6 +3916,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -3895,6 +3976,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -3932,6 +4014,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -3999,6 +4082,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -4030,6 +4114,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -4116,6 +4201,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -4227,6 +4313,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -4272,6 +4359,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -4348,6 +4436,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                                 .entry((name, layer))
                                 .or_default()
                                 .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                     source,
                                     evidence,
                                     kind,
@@ -4390,6 +4479,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -4421,6 +4511,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -4465,6 +4556,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                             .entry((name, layer))
                             .or_default()
                             .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                                 source,
                                 evidence,
                                 kind,
@@ -4585,6 +4677,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: product_signal_observations(&source, &evidence, version.as_deref(), evidence_response, endpoint),
                             source,
                             evidence,
                             kind,
@@ -4625,6 +4718,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
                         .entry((name, layer))
                         .or_default()
                         .push(ProductSignal {
+                            observations: technology_evidence::inferred(&signal.observations, "Totara"),
                             source,
                             evidence,
                             kind,
@@ -4635,6 +4729,7 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
         }
     });
     for ((name, layer), mut product_signals) in signals {
+        let observations = product_signals.iter().flat_map(|signal| signal.observations.iter().cloned()).collect::<Vec<_>>();
         product_signals.sort_by(|left, right| left.evidence.cmp(&right.evidence));
         product_signals.dedup_by(|left, right| left.evidence == right.evidence);
         let strong_count = product_signals
@@ -4687,6 +4782,20 @@ pub(super) fn apply_product_rules(endpoint: &mut EndpointScan) {
         for item in evidence {
             add_product(endpoint, name, layer, version.clone(), confidence, item);
         }
+        if let Some(product) = endpoint.products.iter_mut().find(|product| product.layer == layer && product.name.eq_ignore_ascii_case(name)) {
+            product.observations.retain(|record| record.match_source != "Supporting product detection");
+            product.observations.extend(observations);
+            product.observations.sort();
+            product.observations.dedup();
+        }
+    }
+    for product in &mut endpoint.products {
+        if let Some(records) = web_observations.remove(&product.name.to_ascii_lowercase()) {
+            product.observations.retain(|record| record.match_source != "Supporting product detection");
+            product.observations.extend(records);
+            product.observations.sort();
+            product.observations.dedup();
+        }
     }
     if matches!(endpoint.service, ServiceKind::Http | ServiceKind::Https)
         && endpoint.products.is_empty()
@@ -4720,9 +4829,18 @@ const WERKZEUG_NOT_FOUND: &[u8] = b"<!doctype html>\n<html lang=en>\n<title>404 
 
 const DJANGO_NOT_FOUND: &[u8] = b"\n<!doctype html>\n<html lang=\"en\">\n<head>\n  <title>Not Found</title>\n</head>\n<body>\n  <h1>Not Found</h1><p>The requested resource was not found on this server.</p>\n</body>\n</html>\n";
 
-pub(super) fn reconcile_web_server_products(endpoints: &mut [EndpointScan]) {
+pub(super) fn reconcile_web_server_products(endpoints: &mut [EndpointScan], cancel: &CancellationToken) {
+    if cancel.is_cancelled() {
+        return;
+    }
     for endpoint in endpoints {
+        if cancel.is_cancelled() {
+            return;
+        }
         for response in &endpoint.http {
+            if cancel.is_cancelled() {
+                return;
+            }
             let detections = detect_web_servers(
                 response
                     .headers
@@ -4754,6 +4872,12 @@ pub(super) fn reconcile_web_server_products(endpoints: &mut [EndpointScan]) {
                     }
                     product.confidence = product.confidence.max(confidence);
                     product.evidence.extend(detection.evidence);
+                    for mut record in detection.observations {
+                        technology_evidence::locate(&mut record, &response.url, Some(std::net::SocketAddr::new(endpoint.ip, endpoint.port).to_string()), Some(&response.method), Some(response.status), response.body_truncated);
+                        product.observations.push(record);
+                    }
+                    product.observations.sort();
+                    product.observations.dedup();
                     product.evidence.sort();
                     product.evidence.dedup();
                 }
@@ -4788,6 +4912,127 @@ impl TokenSink for ProductHtmlSink {
         }
         TokenSinkResult::Continue
     }
+}
+
+fn product_signal_observations(
+    source: &str,
+    evidence: &str,
+    version: Option<&str>,
+    response: Option<&HttpObservation>,
+    endpoint: &EndpointScan,
+) -> Vec<TechnologyEvidence> {
+    let mut records = Vec::new();
+    if let Some(response) = response {
+        let body = String::from_utf8_lossy(&response.body);
+        let lower = body.to_ascii_lowercase();
+        if source.starts_with("header:") || source.ends_with("header") {
+            for (name, value) in &response.headers {
+                if source.strip_prefix("header:").is_some_and(|header| name.eq_ignore_ascii_case(header))
+                    || evidence.to_ascii_lowercase().contains(&name.to_ascii_lowercase())
+                {
+                    records.push(technology_evidence::observation(&format!("Header {name}"), &finding_assessment::safe_evidence(&format!("{name}: {value}"))));
+                }
+            }
+        } else if source.contains("cookie") {
+            for (name, value) in &response.headers {
+                if name.eq_ignore_ascii_case("set-cookie") {
+                    let cookie = value.split('=').next().unwrap_or_default().trim();
+                    let lower_cookie = cookie.to_ascii_lowercase();
+                    let product = source.split(':').next().unwrap_or(source);
+                    if !cookie.is_empty() && (source.contains(&lower_cookie) || evidence.to_ascii_lowercase().contains(&lower_cookie) || lower_cookie.contains(product)) {
+                        records.push(technology_evidence::observation("Set-Cookie name", &format!("{cookie}=[value withheld]")));
+                    }
+                }
+            }
+        } else if source.contains("generator") {
+            if let Some((_, value)) = evidence.split_once(": ") {
+                records.push(technology_evidence::observation("Generator metadata", value));
+            }
+        } else {
+            let markers: &[&str] = match source {
+                "body:spring-marker" => &["whitelabel error page"],
+                "body:tomcat-marker" => &["apache tomcat", "apache-tomcat"],
+                "django:csrf-form" => &["csrfmiddlewaretoken"],
+                "django:csrf-error" => &["csrf verification failed"],
+                "fastapi:branded-api-document" => &["fastapi", "openapi"],
+                "moodle:page-config" => &["m.cfg"],
+                "moodle:php-assets" => &["/theme/styles.php", "/lib/javascript.php", "/theme/javascript.php"],
+                "moodle:powered-by" | "moodle:generic-prose" => &["moodle"],
+                "totara:tui-assets" => &["/totara/tui/", "tui"],
+                "totara:core-resource" => &["totara_core", "totara/core"],
+                "totara:page-config" => &["totara"],
+                "totara:powered-by" | "totara:generic-prose" => &["totara"],
+                "wordpress:content-path" => &["wp-content/"],
+                "wordpress:includes-path" => &["wp-includes/"],
+                "wordpress:api-link" => &["api.w.org"],
+                "wordpress:validated-login" => &["user_login", "wp-submit", "wp-login.php"],
+                "wordpress:validated-api" => &["\"namespaces\"", "wp/v2"],
+                "woocommerce:assets" => &["woocommerce"],
+                "woocommerce:class" => &["woocommerce"],
+                "woocommerce:cart-script" => &["wc-cart-fragments"],
+                "woocommerce:global" => &["wc_add_to_cart_params", "woocommerce_params"],
+                "woocommerce:validated-api" => &["wc/v3", "wc/v2", "woocommerce"],
+                "magento:module" => &["magento_"],
+                "magento:mage-asset" => &["/mage/"],
+                "magento:versioned-asset" => &["/static/version"],
+                "magento:javascript" => &["mage/cookies", "mage/translate"],
+                "magento:validated-api" => &["\"base_currency_code\"", "\"website_id\""],
+                "shopify:cdn" => &["cdn.shopify.com"],
+                "shopify:asset-path" => &["/cdn/shop/"],
+                "shopify:global-theme" => &["shopify.theme"],
+                "shopify:global-routes" => &["shopify.routes"],
+                "shopify:section-markup" => &["shopify-section"],
+                "shopify:data-markup" => &["data-shopify"],
+                "shopify:validated-cart-api" => &["\"item_count\"", "\"total_price\""],
+                "silverstripe:resource" => &["/resources/vendor/silverstripe/"],
+                "silverstripe:global" => &["silverstripe"],
+                "silverstripe:validated-login" => &["memberloginform", "security/login"],
+                "bigcommerce:stencil" => &["stencil"],
+                "bigcommerce:cdn" => &["cdn.bigcommerce.com"],
+                "bigcommerce:global" => &["bcdata"],
+                "bigcommerce:validated-api" => &["\"cartamount\"", "\"lineitems\""],
+                "prestashop:global" => &["prestashop"],
+                "prestashop:module" => &["prestashop"],
+                "prestashop:module-path" => &["/modules/"],
+                "prestashop:theme-path" => &["/themes/"],
+                "opencart:theme" => &["catalog/view/theme/"],
+                "opencart:route" => &["route=common/home"],
+                "opencart:validated-login" => &["route=account/login"],
+                _ => &[],
+            };
+            for marker in markers {
+                if let Some(start) = lower.find(marker) {
+                    let (value, shortened) = technology_evidence::excerpt(&body, start..start + marker.len());
+                    let mut record = technology_evidence::observation(&format!("Body signature: {source}"), &value);
+                    record.excerpt_shortened = shortened;
+                    records.push(record);
+                }
+            }
+            if records.is_empty() && source.starts_with("behavior:") {
+                records.push(technology_evidence::observation("Matched default / error response", &body));
+            }
+            if records.is_empty() && (evidence.contains("route:") || evidence.contains("reference:")) {
+                if let Some((_, value)) = evidence.split_once(": ") {
+                    records.push(technology_evidence::observation("Matched asset reference", value));
+                }
+            }
+        }
+    }
+    if records.is_empty() {
+        records.push(TechnologyEvidence {
+            match_source: source.to_owned(),
+            supporting_detection: Some(technology_evidence::safe_value(evidence)),
+            ..Default::default()
+        });
+    }
+    for record in &mut records {
+        record.extracted_version = version.map(technology_evidence::safe_value);
+        record.endpoint = Some(std::net::SocketAddr::new(endpoint.ip, endpoint.port).to_string());
+        if let Some(response) = response {
+            technology_evidence::locate(record, &response.url, record.endpoint.clone(), Some(&response.method), Some(response.status), response.body_truncated);
+        }
+    }
+    records
 }
 
 fn product_html_tags(body: &str) -> Vec<Tag> {

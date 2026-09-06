@@ -333,7 +333,10 @@ fn http_identity(response: &HttpObservation, name: &str) -> Option<Option<String
     }
 }
 
-pub(in crate::exposure) fn record_captured(endpoint: &mut EndpointScan) {
+pub(in crate::exposure) fn record_captured(endpoint: &mut EndpointScan, cancel: &CancellationToken) {
+    if cancel.is_cancelled() {
+        return;
+    }
     record_text(
         endpoint,
         &String::from_utf8_lossy(&endpoint.banner).into_owned(),
@@ -370,6 +373,9 @@ pub(in crate::exposure) fn record_captured(endpoint: &mut EndpointScan) {
         );
     }
     for response in endpoint.http.clone() {
+        if cancel.is_cancelled() {
+            return;
+        }
         if Url::parse(&response.url)
             .ok()
             .and_then(|url| url.port_or_known_default())
@@ -411,7 +417,7 @@ pub(in crate::exposure) fn record_captured(endpoint: &mut EndpointScan) {
 }
 
 pub(super) async fn probe(endpoint: &mut EndpointScan, context: ProbeContext<'_>) {
-    record_captured(endpoint);
+    record_captured_async(endpoint, context.scan.cancel).await;
     let mut remaining = IDENTIFICATION_LIMIT;
     if endpoint.state != PortState::Open || endpoint.transport != TransportProtocol::Tcp {
         return;
@@ -1061,7 +1067,7 @@ let (endpoint, name, reason,): (& mut EndpointScan, & str, _,) = (endpoint, "Mon
                 };
                 let matched = http_identity(&response, name).is_some();
                 endpoint.http.push(response);
-                record_captured(endpoint);
+                record_captured_async(endpoint, context.scan.cancel).await;
                 if !matched || reason.is_some() {
                     let reason = reason.unwrap_or_else(|| {
                         format!(
@@ -1306,3 +1312,21 @@ fn bson_document(bytes: &[u8], depth: usize) -> Option<serde_json::Value> {
     }
     (offset == bytes.len() - 1).then_some(serde_json::Value::Object(fields))
 }
+
+async fn record_captured_async(endpoint: &mut EndpointScan, cancel: &CancellationToken) {
+    if cancel.is_cancelled() {
+        return;
+    }
+    let mut input = endpoint.clone();
+    match crate::blocking::run(cancel, move |cancel| {
+        record_captured(&mut input, cancel);
+        input
+    })
+    .await
+    {
+        Ok(processed) => *endpoint = processed,
+        Err(crate::blocking::Error::Cancelled) => {}
+        Err(error) => endpoint.evidence.push(error.to_string()),
+    }
+}
+

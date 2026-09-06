@@ -21,6 +21,7 @@ struct ActiveScan {
 
 pub(super) struct ExposureLiveState {
     pub(super) message: String,
+    pub(super) discovery_coverage: crate::DiscoveryCoverage,
     pub(super) resolving: bool,
     pub(super) completed: usize,
     pub(super) total: usize,
@@ -38,7 +39,6 @@ pub(super) struct ExposureLivePhase {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WorkerKind {
-    Scan,
     SignIn,
     CookieCapture,
     Fingerprints,
@@ -101,7 +101,6 @@ impl App {
             return Err("Another scan is already running".to_owned());
         }
         request.validate()?;
-        self.clear_worker_error(WorkerKind::Scan);
         self.latest_report = None;
         let scan_number = self.next_scan_number;
         self.next_scan_number += 1;
@@ -114,6 +113,7 @@ impl App {
         self.diagnostic_view = DiagnosticViewState::default();
         self.exposure_live = Some(ExposureLiveState {
             message: "Starting public exposure scan...".to_owned(),
+            discovery_coverage: crate::DiscoveryCoverage::default(),
             resolving: true,
             completed: 0,
             total: 0,
@@ -193,20 +193,13 @@ impl App {
                     if self.active.as_ref().map(|scan| scan.scan_number) != Some(scan_number) {
                         continue;
                     }
-                    if report.status == ExposureScanStatus::Failed {
-                        if let Some(error) = &report.error {
-                            self.set_worker_error(
-                                WorkerKind::Scan,
-                                format!("Scan {scan_number}: {error}"),
-                            );
-                        }
-                    }
                     self.history.insert(
                         0,
                         history::HistoryEntry {
                             scan_number,
                             request: report.request.clone(),
                             error: report.error.clone(),
+                            warnings: report.warnings.clone(),
                         },
                     );
                     self.latest_report = Some(*report);
@@ -419,6 +412,12 @@ impl eframe::App for App {
                             );
                         }
                     }
+                    ExposureScanProgress::DiscoveryCoverageUpdated(coverage) => {
+                        if let Some(live) = &mut inlined_self.exposure_live {
+                            live.message = coverage.summary();
+                            live.discovery_coverage = coverage;
+                        }
+                    }
                     ExposureScanProgress::AssetDiscovered {
                         completed,
                         total,
@@ -560,12 +559,14 @@ impl eframe::App for App {
                     }
                 });
                 ui.separator();
+                ui.push_id(("scan-report", self.next_scan_number), |ui| {
                 exposure_view::show_report(
                     ui,
                     report,
                     self.exposure_detail_tab,
                     &mut self.diagnostic_view,
                 );
+                });
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.weak("Configure an advanced public exposure scan to begin.");
@@ -606,6 +607,7 @@ fn failed_scan_report(request: ExposureScanRequest, error: String) -> ExposureSc
         udp_endpoints: Vec::new(),
         service_access: Vec::new(),
         discovered_assets: Vec::new(),
+        discovery_coverage: crate::DiscoveryCoverage::default(),
         dns_observations: Vec::new(),
         stream_observations: Vec::new(),
         findings: Vec::new(),

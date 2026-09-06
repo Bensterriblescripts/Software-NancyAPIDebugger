@@ -671,7 +671,7 @@ pub(super) fn destination_findings(
         .into_iter()
         .chain(aaaa.addresses())
         .collect::<Vec<_>>();
-    if addresses.is_empty() && a.error.is_none() && aaaa.error.is_none() {
+    if a.absent() && aaaa.absent() {
         out.push(finding(
             subject,
             check,
@@ -683,7 +683,12 @@ pub(super) fn destination_findings(
         ));
     }
     for set in [a, aaaa] {
-        if let Some(item) = unavailable(subject, check, set) {
+        let coverage_check = if addresses.is_empty() {
+            check.to_owned()
+        } else {
+            format!("{check} {} coverage", set.kind)
+        };
+        if let Some(item) = unavailable(subject, &coverage_check, set) {
             out.push(item);
         }
     }
@@ -691,10 +696,11 @@ pub(super) fn destination_findings(
         .iter()
         .filter_map(|ip| non_public_reason(*ip).map(|reason| format!("{ip}: {reason}")))
         .collect::<Vec<_>>();
-    if !non_public.is_empty() {
+    let has_non_public = !non_public.is_empty();
+    if has_non_public {
         out.push(finding(subject, check, Warning, "Destination includes non-public addresses", "Public clients may be unable to reach some or all advertised destinations; split-horizon DNS may be intentional.", "Publish publicly reachable addresses for public services or confirm the private DNS view is intentional.", non_public));
     }
-    if !addresses.is_empty() && out.is_empty() {
+    if !addresses.is_empty() && !has_non_public {
         out.push(finding(
             subject,
             check,
@@ -702,7 +708,8 @@ pub(super) fn destination_findings(
             "Public address destinations were resolved",
             "Address publication was checked; service availability is assessed separately.",
             "Keep destination records synchronized with the service.",
-            addresses.iter().map(ToString::to_string).collect(),
+            addresses.iter().map(ToString::to_string)
+                .chain(a.evidence()).chain(aaaa.evidence()).collect(),
         ));
     }
     out
