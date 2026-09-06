@@ -81,8 +81,6 @@ pub(super) struct ProbeContext<'a> {
     pub(super) scan: ScanContext<'a>,
 }
 
-}
-
 async fn limited_connect(context: ProbeContext<'_>) -> TcpCandidate {
     if context
         .scan
