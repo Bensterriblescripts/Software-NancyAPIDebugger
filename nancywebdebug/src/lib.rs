@@ -25,6 +25,7 @@ macro_rules! display_enum {
 
 pub mod auth;
 mod blocking;
+mod cloudflare;
 pub mod diagnostics;
 mod exposure;
 mod network;

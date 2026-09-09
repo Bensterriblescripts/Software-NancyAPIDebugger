@@ -6,10 +6,19 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn data_directory() -> Result<PathBuf, String> {
-    let base = std::env::var_os("LOCALAPPDATA")
+    #[cfg(target_os = "linux")]
+    let directory = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "LOCALAPPDATA is unavailable".to_owned())?;
-    let directory = PathBuf::from(base).join("nancywebdebug");
+        .map(PathBuf::from)
+        .map(|path| path.join(".local").join("nancywebdebug"))
+        .ok_or_else(|| "HOME is unavailable".to_owned())?;
+    #[cfg(not(target_os = "linux"))]
+    let directory = {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "LOCALAPPDATA is unavailable".to_owned())?;
+        PathBuf::from(base).join("nancywebdebug")
+    };
     fs::create_dir_all(&directory)
         .map_err(|error| format!("unable to create {}: {error}", directory.display()))?;
     Ok(directory)

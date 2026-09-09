@@ -677,6 +677,21 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
         ui.weak("No TCP endpoints were tested.");
         break 'inlined_show_ports;
     }
+    let open_ports = endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint.transport == TransportProtocol::Tcp && endpoint.state == PortState::Open
+        })
+        .map(|endpoint| endpoint.port)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|port| port.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    ui.label(format!(
+        "Open ports: {}",
+        if open_ports.is_empty() { "None" } else { &open_ports }
+    ));
     for state in [
         PortState::Open,
         PortState::Closed,
@@ -726,6 +741,19 @@ let (ui, report,): (& mut egui :: Ui, & ExposureScanReport,) = (ui, report,);
     } else if endpoints.is_empty() {
         ui.weak("No UDP endpoints were tested.");
     } else {
+        let open_ports = endpoints
+            .iter()
+            .filter(|endpoint| endpoint.state == UdpEndpointState::Responsive)
+            .map(|endpoint| endpoint.port)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|port| port.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui.label(format!(
+            "Open ports: {}",
+            if open_ports.is_empty() { "None" } else { &open_ports }
+        ));
         for state in [
             UdpEndpointState::Responsive,
             UdpEndpointState::Closed,
@@ -2036,50 +2064,65 @@ let (ui, observation,): (& mut egui :: Ui, & crate :: DnsObservation,) = (ui, ob
 }
 });
 
-    let mut exposed_services = ({
-let (report,): (& ExposureScanReport,) = (report,);
-
-    report
+    let tcp_services = report
         .endpoints
         .iter()
-        .filter(|endpoint| endpoint.state == PortState::Open)
-
-})
-        .filter(|endpoint| !matches!(endpoint.service, ServiceKind::Http | ServiceKind::Https))
-        .collect::<Vec<_>>();
-    exposed_services.sort_by(|left, right| left.ip.cmp(&right.ip).then(left.port.cmp(&right.port)));
-    if !exposed_services.is_empty() {
+        .filter(|endpoint| endpoint.state == PortState::Open && endpoint.port != 443)
+        .map(|endpoint| {
+            let service = if endpoint.service != ServiceKind::Unknown {
+                endpoint.service.to_string()
+            } else if endpoint.service_confidence == Confidence::Low
+                && let Some(metadata) = curated_tcp_port_metadata(endpoint.port)
+            {
+                format!("{} (unconfirmed)", metadata.service_name)
+            } else {
+                "Unknown service".to_owned()
+            };
+            ((endpoint.ip, endpoint.transport, endpoint.port), service)
+        });
+    let udp_services = report
+        .udp_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.state == UdpEndpointState::Responsive && endpoint.port != 443)
+        .map(|endpoint| {
+            let service = if endpoint.service == ServiceKind::Unknown {
+                "Unknown service".to_owned()
+            } else {
+                endpoint.service.to_string()
+            };
+            ((endpoint.ip, endpoint.transport, endpoint.port), service)
+        });
+    let mut exposed_services = tcp_services.chain(udp_services).collect::<BTreeMap<_, _>>();
+    let mut excluded_services = 0usize;
+    exposed_services.retain(|(ip, _, _), _| {
+        if crate::cloudflare::is_cloudflare_address(*ip) {
+            excluded_services += 1;
+            false
+        } else {
+            true
+        }
+    });
+    if !exposed_services.is_empty() || excluded_services > 0 {
         section_separator(ui);
+        if excluded_services > 0 {
+            ui.weak(format!(
+                "Excluded {excluded_services} Cloudflare shared-infrastructure port entries. \
+                 Raw observations remain in endpoint details; security findings are unchanged."
+            ));
+        }
         egui::CollapsingHeader::new(format!(
             "Publicly Exposed Services ({})",
             exposed_services.len()
         ))
         .default_open(false)
         .show(ui, |ui| {
-            for endpoint in exposed_services {
+            if exposed_services.is_empty() {
+                ui.weak("No other publicly exposed services were observed outside port 443.");
+            }
+            for ((ip, transport, port), service) in exposed_services {
                 ui.label(format!(
-                    "{}:{} — {}",
-                    endpoint.ip,
-                    endpoint.port,
-                    ({
-let (endpoint,): (& EndpointScan,) = (endpoint,);
-let inlined_result: String = {
-'inlined_exposed_service_label: {
-
-    if endpoint.service != ServiceKind::Unknown {
-        break 'inlined_exposed_service_label endpoint.service.to_string();
-    }
-    if endpoint.service_confidence == Confidence::Low
-        && let Some(metadata) = curated_tcp_port_metadata(endpoint.port)
-    {
-        break 'inlined_exposed_service_label format!("{} (unconfirmed)", metadata.service_name);
-    }
-    "Unknown service".to_owned()
-
-}
-};
-inlined_result
-})
+                    "{} / {transport} — {service}",
+                    std::net::SocketAddr::new(ip, port)
                 ));
             }
         });
